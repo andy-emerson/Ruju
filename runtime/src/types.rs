@@ -845,27 +845,49 @@ fn is_inline_field(ft: Offset) -> bool {
     nfields_of(ft) > 0 && layout_npointers(ft) == 0 || instance_of(ft) != NULL
 }
 
+/// Alignment of an inline value of type `t` (`jl_datatype_align`): a
+/// primitive aligns to its size (capped at 8, our `MAX_ALIGN`); a struct to
+/// the max of its fields' alignments — **not** its size; a singleton to 1.
+fn type_alignment(t: Offset) -> u32 {
+    if is_primitive(t) {
+        return size_of(t).clamp(1, 8);
+    }
+    let nf = nfields_of(t);
+    if nf == 0 {
+        return 1;
+    }
+    (0..nf)
+        .map(|i| if field_isptr(t, i) { 4 } else { type_alignment(field_type(t, i)) })
+        .max()
+        .unwrap_or(1)
+}
+
 /// Compute offsets, sizes, pointer slots, and total size for the given field
-/// types (`jl_compute_field_offsets`). Alignment is each inline field's size
-/// capped at 8; references are 4-byte offsets.
+/// types (`jl_compute_field_offsets`, `datatype.c:735–833`): each field is
+/// placed at its type's alignment (`LLT_ALIGN(sz, al)`); references are
+/// 4-byte offsets; the total size is padded to the struct's own alignment
+/// (the max field alignment, `datatype.c:831`), so a nested inline copy of
+/// `size_of` bytes is exact.
 fn compute_field_offsets(field_types: &[Offset]) -> (u32, Vec<u32>, Vec<FieldDesc>) {
     let mut descs = Vec::with_capacity(field_types.len());
     let mut ptrs = Vec::new();
     let mut off: u32 = 0;
+    let mut alignm: u32 = 1;
     for &ft in field_types {
-        if is_inline_field(ft) {
-            let fsz = size_of(ft);
-            let align = fsz.clamp(1, 8).next_power_of_two();
-            off = (off + align - 1) & !(align - 1);
-            descs.push(FieldDesc { offset: off, size: fsz, isptr: false });
-            off += fsz;
+        let (fsz, al, isptr) = if is_inline_field(ft) {
+            (size_of(ft), type_alignment(ft), false)
         } else {
-            off = (off + 3) & !3;
+            (4, 4, true)
+        };
+        off = (off + al - 1) & !(al - 1);
+        alignm = alignm.max(al);
+        if isptr {
             ptrs.push(off);
-            descs.push(FieldDesc { offset: off, size: 4, isptr: true });
-            off += 4;
         }
+        descs.push(FieldDesc { offset: off, size: fsz, isptr });
+        off += fsz;
     }
+    off = (off + alignm - 1) & !(alignm - 1);
     (off, ptrs, descs)
 }
 

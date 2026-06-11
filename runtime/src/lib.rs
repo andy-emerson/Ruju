@@ -1233,6 +1233,45 @@ mod tests {
 
         drop(m);
         drop(c_root);
+
+        // Reference-verified alignment cases (datatype.c:735–833): a nested
+        // struct aligns to its *fields'* max alignment, not its size — and
+        // the total size pads to the struct alignment.
+        let inner = types::define_struct(
+            "Inner32x2",
+            t(id::ANY),
+            &[("a", t(id::INT32)), ("b", t(id::INT32))],
+            false,
+        );
+        assert_eq!(types::size_of(inner), 8);
+        let outer = types::define_struct(
+            "OuterI8Inner",
+            t(id::ANY),
+            &[("tag", t(id::INT8)), ("inner", inner)],
+            false,
+        );
+        // Inner{Int32,Int32} has alignment 4 (not 8): it sits at offset 4.
+        assert_eq!(types::field_offset(outer, 1), 4);
+        assert_eq!(types::size_of(outer), 12);
+        // {Int64, Bool} is 9 bytes of fields, 16 bytes of struct.
+        let padded = types::define_struct(
+            "PaddedI64B",
+            t(id::ANY),
+            &[("n", t(id::INT64)), ("flag", t(id::BOOL))],
+            false,
+        );
+        assert_eq!(types::size_of(padded), 16);
+        // Nested inline construction round-trips through the exact copy size.
+        let iv = types::new_struct(inner, &[value::box_int32(11), value::box_int32(22)]).unwrap();
+        let ov_root = gc::Rooted::new(
+            types::new_struct(outer, &[value::box_int8(1), iv]).unwrap(),
+        );
+        let got_inner = types::get_nth_field(ov_root.get(), 1).unwrap();
+        assert_eq!(type_of(got_inner), inner);
+        assert_eq!(value::unbox_int32(types::get_nth_field(got_inner, 0).unwrap()), 11);
+        assert_eq!(value::unbox_int32(types::get_nth_field(got_inner, 1).unwrap()), 22);
+
+        drop(ov_root);
         assert_eq!(gc::root_count(), 0, "roots balanced");
     }
 
