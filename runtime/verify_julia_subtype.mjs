@@ -217,8 +217,8 @@ const cases = [
 ];
 
 // Known divergences from the local union backtracking (vs Julia's global
-// Lunions/Runions decision machine — design/fidelity-audit.md finding 11/15,
-// design/ledger.md "Union backtracking"). Run and reported, not failed; if one
+// Lunions/Runions decision machine — design/implementation.md, subtyping
+// findings 11/15 and "Union backtracking"). Run and reported, not failed; if one
 // starts passing, the machine has improved — promote it to `cases`.
 const knownDivergences = [
   ["L371 isequal_type(Tuple{Union{Int,Int8},Int16}, Union{Tuple{Int,Int16},Tuple{Int8,Int16}})", "equal", () =>

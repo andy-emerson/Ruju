@@ -5,7 +5,8 @@
 //! boxing ([`value`]), and shadow-stack GC rooting ([`gc`]), and exposes an
 //! `rj_`-prefixed C ABI for a JavaScript host. Garbage collection is not yet
 //! implemented; values are real tagged heap objects whose headers point at
-//! their DataType, per `src/julia.h` and `design/runtime-aot-and-gc.md`.
+//! their DataType, per `src/julia.h` and the GC-rooting decision in
+//! `design/strategy.md`.
 
 mod dispatch;
 mod frontend;

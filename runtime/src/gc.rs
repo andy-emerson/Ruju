@@ -4,7 +4,8 @@
 //! Rooting uses an explicit shadow stack — WebAssembly exposes no way to scan
 //! the call stack, so every root is tracked explicitly, the WASM-mandatory form
 //! of Julia's `JL_GC_PUSH`/`JL_GC_POP` gcframe mechanism, here expressed through
-//! a [`Rooted`] RAII guard (see `design/runtime-aot-and-gc.md`).
+//! a [`Rooted`] RAII guard (see the GC-rooting decision in
+//! `design/strategy.md`).
 //!
 //! Collection is mark-and-sweep over the bounded region, after `gc-stock.c`'s
 //! algorithm (non-moving). The mark roots are the shadow stack plus the pinned

@@ -68,8 +68,8 @@ A working runtime exists and runs via WebAssembly:
 - a hand-written bootstrap front-end that runs a subset of real Julia source.
 
 The AOT compiler that will turn the Julia-written layers into WASM is the next
-major phase and is not yet built. See `design/roadmap.md` for the plan and
-`design/ledger.md` for per-subsystem status and fidelity.
+major phase and is not yet built. See `design/strategy.md` for the plan and
+`design/implementation.md` for per-subsystem status and fidelity.
 
 ## Repository layout
 
@@ -80,7 +80,7 @@ tests against is vendored under `reference/`.
 | - | - |
 | `runtime/` | the Rust runtime (object model, GC, types, subtyping, dispatch, interpreter, the `rj_` WASM ABI) |
 | `intrinsics/` | pure arithmetic/comparison intrinsics |
-| `design/` | `architecture.md` (the current implementation), `roadmap.md` (the plan), `ledger.md` (per-subsystem status) |
+| `design/` | `strategy.md` (where we are going), `implementation.md` (where we are), `methodology.md` (how we get there) — see `design/README.md` |
 | `reference/julia/` | a pinned, verbatim subset of JuliaLang/julia used as the porting reference and oracle: `src/` (the C runtime we reimplement) plus `base/`, `stdlib/`, `Compiler/`, `JuliaSyntax/`, `JuliaLowering/`, and `test/` |
 
 `reference/README.md` records the pinned upstream commit and version.

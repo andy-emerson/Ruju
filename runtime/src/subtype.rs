@@ -13,7 +13,7 @@
 //! `var_lt`/`var_gt` (narrowing a variable's bounds via `simple_meet` /
 //! `simple_join`), and the universal-vs-existential dispatch in `subtype`.
 //!
-//! Deliberately omitted for now (tracked in `design/ledger.md`): the diagonal
+//! Deliberately omitted for now (tracked in `design/implementation.md`): the diagonal
 //! rule (a covariant variable occurring twice is constrained to concrete
 //! types), `Type{T}` kinds, varargs, type intersection, and the depth-ordered
 //! handling of two interacting existentials. Union backtracking uses a simple
@@ -167,7 +167,7 @@ fn subtype_unionall(t: Offset, u: Offset, e: &mut Env, r: bool, param: Param) ->
     // A typevar lower bound does not reject: each value of the referenced
     // (universal) variable is a single type, so the diagonal is satisfied.
     // Julia additionally propagates `concrete = 1` to that variable's binding —
-    // the cross-var propagation the ledger records as missing.
+    // the cross-var propagation `design/implementation.md` records as missing.
     if ans && diagonal && is_leaf_typevar(var) && !types::is_typevar(vb.lb) && !is_leaf_bound(vb.lb) {
         ans = false;
     }

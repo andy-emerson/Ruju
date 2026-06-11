@@ -10,23 +10,26 @@ the human holds design authority, decides, and is responsible for what merges.
 Propose designs and surface trade-offs freely, then build what the human
 decides.
 
-The conventions in `CONTRIBUTING.md` bind every contributor, including you.
-The two that matter most day to day: the **faithfulness bar** (port the
-*design* of the C reference; record divergences in the ledger; Done · Faithful
-means *verified against the reference*, not "tests pass") and **small,
-single-subsystem increments**.
+The conventions in `CONTRIBUTING.md` bind every contributor, including you,
+and `design/methodology.md` governs the engineering process — the claim
+ladder and the increment loop. The two rules that matter most day to day:
+the **faithfulness bar** (port the *design* of the C reference; record
+divergences in `design/implementation.md`; Done · Faithful means
+*reference-verified*, not "tests pass") and **small, single-subsystem
+increments**.
 
-Start by reading `README.md`, then `design/roadmap.md` (the plan) and
-`design/ledger.md` (the per-subsystem status map). Those two documents are the
-source of truth for *what to do next* and *how faithful each piece is* — keep
-them current as you work.
+Start by reading `README.md`, then `design/strategy.md` (the dependency
+frontier — what can be worked on now) and `design/implementation.md` (the
+per-module status and fidelity evidence). Those two documents are the source
+of truth for *what to do next* and *how faithful each piece is* — keep them
+current as you work.
 
 ## Repository layout
 
 | Path | Owner | What it is |
 | - | - | - |
 | `runtime/`, `intrinsics/` | **ours** | the Rust runtime + a pure-intrinsics crate, plus `runtime/harness.mjs` (JS host) and `runtime/verify_julia_subtype.mjs` (the oracle) |
-| `design/` | **ours** | `architecture.md`, `roadmap.md`, `ledger.md`, `fidelity-audit.md` |
+| `design/` | **ours** | `strategy.md`, `implementation.md`, `methodology.md` (see `design/README.md`) |
 | `reference/julia/` | **Julia (MIT)** | a pinned, verbatim subset of JuliaLang/julia (incl. `test/`, the oracle source) — see `reference/README.md`; licensing in `LICENSE.md` |
 
 We port from `reference/julia/src/` (the C/C++ runtime). `reference/julia/`'s

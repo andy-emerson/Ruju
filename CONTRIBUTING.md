@@ -38,8 +38,8 @@ repository is deliberately structured to provide them. What works here:
 - **Design first; let the agent build.** Decide the design and the increment
   yourself, then hand the agent one subsystem slice at a time. Point it at
   `CLAUDE.md`, which carries the agent-facing instructions, and at
-  `design/roadmap.md` and `design/ledger.md` for what to do and where it
-  stands.
+  `design/strategy.md` and `design/implementation.md` for what to do and
+  where it stands.
 - **Ground it in the reference.** The C runtime being ported is vendored at
   `reference/julia/src/` precisely so an agent can read it. Have the agent
   port from the named C file, not from its general recollection of how
@@ -49,9 +49,9 @@ repository is deliberately structured to provide them. What works here:
   own fidelity — audits here have caught over-claims more than once. Run the
   test suite and the oracle yourself; treat "tests pass" as the beginning of
   your review, not the end of it.
-- **Make it keep the ledger.** Have the agent record divergences and partial
-  coverage in `design/ledger.md` as it works, then check that the entries
-  understate rather than oversell.
+- **Make it keep the record.** Have the agent record divergences and partial
+  coverage in `design/implementation.md` as it works, then check that the
+  entries understate rather than oversell.
 
 ## The faithfulness bar
 
@@ -59,9 +59,9 @@ Ruju ports the *design* of Julia's C runtime, not a guess at it. The reference
 is vendored at `reference/julia/src/`; when in doubt, read the C.
 
 - A deliberate departure (for WASM or the composable-memory model) is a
-  **divergence** and must be recorded in `design/ledger.md`. A simplification
-  is **faithful + partial** — same shape, less of it.
-- In the ledger, **Done · Faithful means verified against the reference**, not
+  **divergence** and must be recorded in `design/implementation.md`. A
+  simplification is **faithful + partial** — same shape, less of it.
+- In the status tables, **Done · Faithful means verified against the reference**, not
   "tests pass." Our own tests can encode the same misunderstanding as the
   code; the reliable check is `runtime/verify_julia_subtype.mjs`, whose
   expected answers come from Julia's own test suite.
@@ -70,7 +70,8 @@ is vendored at `reference/julia/src/`; when in doubt, read the C.
 ## Scope and mechanics
 
 - **Small, verifiable increments.** One subsystem slice per pull request:
-  implement, test, update the ledger, commit. Don't batch unrelated changes.
+  implement, test, update `design/implementation.md`, commit. Don't batch
+  unrelated changes.
 - **`reference/julia/` is vendored verbatim** and is never edited; see
   `reference/README.md` for how the pin is advanced.
 - **Before committing**, run the checks (see the README for setup):
