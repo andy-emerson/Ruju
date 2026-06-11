@@ -1308,24 +1308,35 @@ mod tests {
         assert_eq!(object::gc_bits(c.get()), OLD_MARKED, "promotion-completion scan");
         let x_now = types::get_nth_field(c.get(), 0).unwrap();
         assert_eq!(object::gc_bits(x_now), OLD, "child survived the minor and promoted");
+        // The promotion scan saw a young x, so c was pushed for the next cycle
+        // (gc_mark_push_remset: nptr == 0x3) even though x promoted at sweep.
+        assert_eq!(gc::remset_len(), 1, "scan rebuilt the remset conservatively");
 
-        // A store into an OLD_MARKED parent fires the barrier exactly once:
-        // queue_root re-tags 3 → 1, which is itself the refire guard.
+        // A store into an OLD_MARKED parent fires the barrier exactly once
+        // per 3-state visit: queue_root re-tags 3 → 1, the refire guard. The
+        // scan-pushed entry coexists — the remset is a tolerated multiset, as
+        // in Julia (remset_nptr is "conservative"; dup entries re-scan).
         let y = types::new_struct(cell, &[value::nothing()]).unwrap();
         types::set_nth_field(c.get(), 0, y).unwrap();
-        assert_eq!(gc::remset_len(), 1);
+        assert_eq!(gc::remset_len(), 2, "barrier push joins the scan push");
         assert_eq!(object::gc_bits(c.get()), MARKED, "queue_root cleared the OLD bit");
         let z = types::new_struct(cell, &[value::nothing()]).unwrap();
         types::set_nth_field(c.get(), 0, z).unwrap();
-        assert_eq!(gc::remset_len(), 1, "barrier must not refire while in the remset");
+        assert_eq!(gc::remset_len(), 2, "barrier must not refire while in the remset");
 
-        // The minor collection restores the remset entry to OLD_MARKED and
-        // traces it, keeping a child reachable only through the old parent.
+        // The minor collection restores the remset entries to OLD_MARKED and
+        // traces them, keeping a child reachable only through the old parent.
+        // Both duplicate entries re-scan and both re-push (z young at scan).
         gc::collect();
         assert_eq!(object::gc_bits(c.get()), OLD_MARKED, "remset entry restored");
-        assert_eq!(gc::remset_len(), 0);
+        assert_eq!(gc::remset_len(), 2, "rebuilt: child was young at scan time");
         let z_now = types::get_nth_field(c.get(), 0).unwrap();
         assert_eq!(object::gc_bits(z_now), OLD);
+        // Next cycle the child is old at scan time: the conservative entries
+        // (duplicates included) all drop.
+        gc::collect();
+        assert_eq!(gc::remset_len(), 0, "entries dropped once the child is old");
+        assert_eq!(object::gc_bits(c.get()), OLD_MARKED);
 
         // Old garbage at OLD_MARKED: quick sweeps never touch it; the first
         // full cycle demotes it (3 → 2, kept); the second frees it — the

@@ -310,21 +310,42 @@ fn push_roots(work: &mut Vec<Value>) {
     crate::types::each_registered_struct(|t| work.push(Value(t))); // source-defined types
 }
 
-/// Push the objects that `v` references onto the work list.
-fn trace_fields(v: Value, work: &mut Vec<Value>) {
+/// Visit every reference embedded in `v` (its type, then svec elements or
+/// the layout's pointer fields).
+fn each_ref(v: Value, mut f: impl FnMut(Value)) {
     let t = object::type_of(v);
     if t != region::NULL {
-        work.push(Value(t)); // the type is itself a heap object
+        f(Value(t)); // the type is itself a heap object
     }
     if types::is_svec(t) {
         for i in 0..types::svec_len(v.raw()) {
-            work.push(Value(types::svec_ref(v.raw(), i)));
+            f(Value(types::svec_ref(v.raw(), i)));
         }
     } else {
         for i in 0..types::layout_npointers(t) {
-            work.push(object::get_ref(v, types::layout_ptr_offset(t, i)));
+            f(object::get_ref(v, types::layout_ptr_offset(t, i)));
         }
     }
+}
+
+/// Push the objects that `v` references onto the work list.
+fn trace_fields(v: Value, work: &mut Vec<Value>) {
+    each_ref(v, |r| work.push(r));
+}
+
+/// Whether `v` references any young object (OLD bit clear) — the `nptr`
+/// young-ref bit computed while scanning an old object
+/// (`gc_mark_outrefs`; a young child seen at scan time may promote at the
+/// coming sweep, in which case the conservative remset entry is dropped at
+/// the next mark, as in Julia).
+fn has_young_ref(v: Value) -> bool {
+    let mut young = false;
+    each_ref(v, |r| {
+        if !r.is_null() && object::gc_bits(r) & BIT_OLD == 0 {
+            young = true;
+        }
+    });
+    young
 }
 
 /// Mark reachable objects — the same rule for minor and full collections
@@ -341,10 +362,16 @@ fn mark() {
     // Remset entries sit at MARKED (queue_root left them there): restore each
     // to OLD_MARKED and trace its fields (`gc-stock.c:2834`). This runs for
     // full collections too — the entries' young children must be reached.
+    // The remset is *rebuilt*, not cleared (`gc_mark_push_remset`,
+    // `gc-stock.c:1613`): any old object scanned this cycle that still
+    // references a young object is pushed for the next cycle.
     let remset: Vec<Value> = core::mem::take(remembered());
     for p in remset {
         object::set_gc_bits(p, BIT_OLD | BIT_MARKED);
         trace_fields(p, &mut work);
+        if has_young_ref(p) {
+            remembered().push(p);
+        }
     }
     while let Some(v) = work.pop() {
         if v.is_null() {
@@ -356,6 +383,9 @@ fn mark() {
         }
         object::set_gc_bits(v, bits | BIT_MARKED); // 0 → 1, 2 → 3
         trace_fields(v, &mut work);
+        if bits & BIT_OLD != 0 && has_young_ref(v) {
+            remembered().push(v); // promotion scan found old → young edges
+        }
     }
 }
 
@@ -404,11 +434,6 @@ fn sweep(full: bool) -> usize {
 }
 
 fn collect_inner(full: bool) -> u32 {
-    // `mark` consumes the remset (entries restored to OLD_MARKED). Clearing it
-    // across the collection is sound *only* under the one-survival promotion
-    // placeholder: every survivor is old after the sweep, so no old → young
-    // edge can outlive the cycle. Julia's `PROMOTE_AGE` (slice 2) breaks that
-    // invariant and brings the remset-rebuild machinery with it.
     mark();
     let before = HEAP.live.get();
     let survivors = sweep(full);

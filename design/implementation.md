@@ -457,7 +457,7 @@ flowchart LR
         direction TB
         CGS["pools: per-page freelists + newpages,<br/>~50-entry size-class table, 16 KiB pages"]
         CWB["jl_gc_wb: parent == OLD_MARKED(3)<br/>&& child unMARKED → queue_root (re-tags)"]
-        CMK["layout-driven precise mark,<br/>lazy/quick page sweep, age-based promotion"]
+        CMK["layout-driven precise mark,<br/>lazy/quick page sweep, promote-marked-young<br/>at sweep (ages removed upstream)"]
         CST["GC_CLEAN=0 MARKED=1 OLD=2<br/>OLD_MARKED=3"]
     end
     subgraph R["Ruju Rust"]
@@ -497,17 +497,17 @@ strategy's "GC exactness & tuning" frontier item).**
 | Pool allocation (size classes, pages, free lists) | Partial | Faithful | `jl_gc_pool_t` design (freelist threads the header word = `jl_taggedvalue_t.next`); but 12-entry geometric size table vs Julia's ~50-entry table, 4 KiB pages vs default 16 KiB, one global freelist per class vs per-page freelists + `newpages` + `pagemeta` (audit 2026-06) |
 | Big-object path | Planned | Faithful | large objects use a pool for now |
 | Precise marking | Done | Faithful | type-layout driven |
-| Sweeping (page walk, free-list rebuild) | Partial | Faithful | eager every-page walk; Julia's lazy/quick-sweep page machinery (`pagemeta` has_marked/has_young) absent (audit 2026-06). **Verification obligation:** the full-sweep state transitions (3→2 demotion, the one-full-cycle lag) are verified against the state diagram and `gc_setmark_tag`, not a line-read of the full-sweep body — `premark` and `mark_reset_age` paths unread; verify in GC slice 2, which touches those functions for `PROMOTE_AGE` |
+| Sweeping (page walk, free-list rebuild) | Partial | Faithful | the state transitions are now **verified against the sweep body** (`gc-stock.c:925–941`; obligation discharged, GC slice 2) — "premark" is the timing label around `gc_queue_remset`, our remset-restore equivalent. Remaining gap: Julia's lazy/quick-sweep page machinery (`pagemeta` has_marked/has_young) is absent — the pin's quick sweep frees unmarked old objects on the (has_young) pages it visits and skips the rest; ours visits every page but keeps unmarked old objects until a full sweep. Conservative; old garbage waits longer |
 | Non-moving collection | Done | Faithful | the stock GC is non-moving too |
 | Generational state encodings | Done | Faithful | `GC_CLEAN/MARKED/OLD/OLD_MARKED`, verified |
-| Promotion policy | Partial | Faithful | one-survival placeholder; Julia uses `PROMOTE_AGE` + per-object age. **Coupling:** clearing the remset per collection is sound only under this placeholder (every survivor is old post-sweep); `PROMOTE_AGE` must land together with the remset-rebuild machinery |
-| Write barrier + remembered set | Done | Faithful | exact `jl_gc_wb` (`gc-wb-stock.h:14`) + `jl_gc_queue_root` (`gc-stock.c:1493`): fires on parent `== GC_OLD_MARKED` with child unMARKED; re-tag 3→1 is the at-most-once guard; remset entries restored to 3 and traced at mark start (`gc-stock.c:2834`). Fixed, GC exactness slice 1, 2026-06 |
+| Promotion policy | Done | Faithful | promote-marked-young at sweep **is the pin's design** (`gc-stock.c:935–937`: `current_sweep_full \|\| bits == GC_MARKED → GC_OLD`) — the pin removed `PROMOTE_AGE` and the per-object age arrays; only the stale comment at `:196` describes the old design. The previous row note ("Julia uses `PROMOTE_AGE` + per-object age") was ported from memory of older Julia, not the pin — corrected, GC slice 2, 2026-06 |
+| Write barrier + remembered set | Done | Faithful | exact `jl_gc_wb` (`gc-wb-stock.h:14`) + `jl_gc_queue_root` (`gc-stock.c:1493`): fires on parent `== GC_OLD_MARKED` with child unMARKED; re-tag 3→1 is the at-most-once guard; remset cleared at mark start with entries restored to 3 and traced (`gc_queue_remset`, `:2828`), then **rebuilt** during marking — any scanned old object with a young-at-scan-time reference is re-pushed (`gc_mark_push_remset`, `:1613`, the `nptr == 0x3` rule); duplicates are tolerated, as in the pin. Slices 1–2, 2026-06 |
 | Collection trigger | Partial | Faithful | exhaustion-only placeholder; Julia is proactive at a heap-target |
 | Full-vs-quick policy | Partial | Faithful | escalation placeholder; Julia uses a growth heuristic |
 | Shadow-stack rooting (`gcframe`) | Done | Faithful | — |
 | Machine-stack scanning | n/a | **Divergence** | impossible in WASM; the shadow stack is *mandatory* instead |
 | Safepoints | Partial | Faithful | trivial (single-threaded); multithreaded protocol later |
-| Finalizers | Planned | Faithful | — |
+| Finalizers | Planned | Faithful | includes `mark_reset_age` (`gc-stock.c:3165–3172`): objects reachable only from `to_finalize` are reset as-if-new — finalizer-only machinery, lands here |
 | Weak references | Planned | Faithful | — |
 | Heap snapshot / alloc profiler | Planned | Faithful | tooling |
 
