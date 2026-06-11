@@ -1275,6 +1275,71 @@ mod tests {
         assert_eq!(gc::root_count(), 0, "roots balanced");
     }
 
+    // The exact generational state machine (gc-stock.c:164–191): the
+    // promotion-completion scan, the OLD_MARKED-only barrier with
+    // queue_root's refire guard, and the full-sweep demotion lag.
+    #[test]
+    fn gc_exact_state_machine() {
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+        let cell = types::define_struct("GCCell", t(id::ANY), &[("v", t(id::ANY))], true);
+        const CLEAN: u32 = 0;
+        const MARKED: u32 = 1;
+        const OLD: u32 = 2;
+        const OLD_MARKED: u32 = 3;
+
+        let c = Rooted::new(types::new_struct(cell, &[value::nothing()]).unwrap());
+        assert_eq!(object::gc_bits(c.get()), CLEAN);
+        gc::collect();
+        assert_eq!(object::gc_bits(c.get()), OLD, "young survivor promotes");
+
+        // A store into a merely-OLD parent does not fire the barrier — its
+        // promotion-completion scan at the next mark covers the child.
+        let x = types::new_struct(cell, &[value::nothing()]).unwrap(); // young
+        types::set_nth_field(c.get(), 0, x).unwrap();
+        assert_eq!(gc::remset_len(), 0, "no barrier for an OLD(2) parent");
+        // The next minor mark performs that scan: 2 → 3, child traced and
+        // kept. (The old machine skipped OLD parents in minor marks entirely
+        // — this child would have been freed under it.)
+        gc::collect();
+        assert_eq!(object::gc_bits(c.get()), OLD_MARKED, "promotion-completion scan");
+        let x_now = types::get_nth_field(c.get(), 0).unwrap();
+        assert_eq!(object::gc_bits(x_now), OLD, "child survived the minor and promoted");
+
+        // A store into an OLD_MARKED parent fires the barrier exactly once:
+        // queue_root re-tags 3 → 1, which is itself the refire guard.
+        let y = types::new_struct(cell, &[value::nothing()]).unwrap();
+        types::set_nth_field(c.get(), 0, y).unwrap();
+        assert_eq!(gc::remset_len(), 1);
+        assert_eq!(object::gc_bits(c.get()), MARKED, "queue_root cleared the OLD bit");
+        let z = types::new_struct(cell, &[value::nothing()]).unwrap();
+        types::set_nth_field(c.get(), 0, z).unwrap();
+        assert_eq!(gc::remset_len(), 1, "barrier must not refire while in the remset");
+
+        // The minor collection restores the remset entry to OLD_MARKED and
+        // traces it, keeping a child reachable only through the old parent.
+        gc::collect();
+        assert_eq!(object::gc_bits(c.get()), OLD_MARKED, "remset entry restored");
+        assert_eq!(gc::remset_len(), 0);
+        let z_now = types::get_nth_field(c.get(), 0).unwrap();
+        assert_eq!(object::gc_bits(z_now), OLD);
+
+        // Old garbage at OLD_MARKED: quick sweeps never touch it; the first
+        // full cycle demotes it (3 → 2, kept); the second frees it — the
+        // documented one-cycle lag, as in Julia.
+        drop(c);
+        let live0 = gc::live_objects();
+        gc::collect();
+        assert_eq!(gc::live_objects(), live0, "quick sweep keeps OLD_MARKED garbage");
+        gc::collect_full(); // demotes the unreached 3 to 2 (kept); frees unreached 2s
+        let live1 = gc::live_objects();
+        gc::collect_full(); // the demoted 2 is unmarked now: freed
+        assert!(gc::live_objects() < live1, "second full cycle frees demoted old garbage");
+
+        assert_eq!(gc::root_count(), 0, "roots balanced");
+    }
+
     // Struct slice 2: `struct` syntax, constructor calls, and field access
     // from real Julia source through the front-end and interpreter.
     #[test]

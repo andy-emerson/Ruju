@@ -463,8 +463,8 @@ flowchart LR
     subgraph R["Ruju Rust"]
         direction TB
         RGS["pools: one global freelist per class,<br/>12-entry geometric table, 4 KiB pages"]
-        RWB["write_barrier: parent any-OLD<br/>&& child not-OLD → push (no re-tag)"]
-        RMK["layout-driven precise mark,<br/>eager all-page sweep, promote-on-1st-survival"]
+        RWB["write_barrier: parent == OLD_MARKED(3)<br/>&& child unMARKED → queue_root (re-tags 3→1)"]
+        RMK["layout-driven precise mark with<br/>promotion-completion scan (2→3+trace),<br/>eager all-page sweep, promote-on-1st-survival"]
         RST["same encoding: MARKED=1, OLD=2"]
     end
     CST -.->|verified| RST
@@ -476,12 +476,16 @@ exactly; precise layout-driven marking; non-moving design; shadow-stack
 rooting as the mandatory `JL_GC_PUSH`/`JL_GC_PUSHARGS` analog; freelist
 threaded through the header word = `jl_taggedvalue_t.next`.
 
-**Audit findings (three Done·Faithful rows downgraded; all open, =
+**Audit findings (three Done·Faithful rows downgraded; 18–19 open, =
 strategy's "GC exactness & tuning" frontier item).**
-17. **Write barrier condition differs in both halves.** `jl_gc_wb` fires on
-    parent `== GC_OLD_MARKED` with child not-MARKED and re-tags via
-    `jl_gc_queue_root`; Ruju fires on parent any-old with child not-old and
-    never re-tags. Conservative, but not `jl_gc_wb`.
+17. ~~Write barrier condition differed in both halves~~ — **fixed (GC
+    exactness slice 1, 2026-06)**: the exact four-state machine of
+    `gc-stock.c:164–191` — barrier on parent `== 3` with child unMARKED,
+    `queue_root` re-tag (3→1, the at-most-once guard), remset restore to 3
+    with trace at mark start, promotion-completion scan (2→3+trace) in every
+    mark, quick sweeps leaving 2/3 untouched, full sweeps demoting 3→2 with
+    the one-full-cycle lag for old garbage. A state-machine test pins every
+    transition.
 18. **Pool allocation constants and structure are placeholders.** 16 KiB
     default pages vs 4 KiB; ~50-entry size-class table vs 12-entry
     geometric; per-page freelists + `newpages` + `pagemeta` vs one global
@@ -496,8 +500,8 @@ strategy's "GC exactness & tuning" frontier item).**
 | Sweeping (page walk, free-list rebuild) | Partial | Faithful | eager every-page walk; Julia's lazy/quick-sweep page machinery (`pagemeta` has_marked/has_young) absent (audit 2026-06) |
 | Non-moving collection | Done | Faithful | the stock GC is non-moving too |
 | Generational state encodings | Done | Faithful | `GC_CLEAN/MARKED/OLD/OLD_MARKED`, verified |
-| Promotion policy | Partial | Faithful | one-survival placeholder; Julia uses `PROMOTE_AGE` + per-object age |
-| Write barrier + remembered set | Partial | Faithful | `jl_gc_wb`'s condition differs in both halves: Julia fires on parent `== GC_OLD_MARKED` with child unMARKED and re-tags via `jl_gc_queue_root`; ours fires on any old parent with child not-old, never re-tags (duplicates possible). Conservative-correct (audit 2026-06) |
+| Promotion policy | Partial | Faithful | one-survival placeholder; Julia uses `PROMOTE_AGE` + per-object age. **Coupling:** clearing the remset per collection is sound only under this placeholder (every survivor is old post-sweep); `PROMOTE_AGE` must land together with the remset-rebuild machinery |
+| Write barrier + remembered set | Done | Faithful | exact `jl_gc_wb` (`gc-wb-stock.h:14`) + `jl_gc_queue_root` (`gc-stock.c:1493`): fires on parent `== GC_OLD_MARKED` with child unMARKED; re-tag 3→1 is the at-most-once guard; remset entries restored to 3 and traced at mark start (`gc-stock.c:2834`). Fixed, GC exactness slice 1, 2026-06 |
 | Collection trigger | Partial | Faithful | exhaustion-only placeholder; Julia is proactive at a heap-target |
 | Full-vs-quick policy | Partial | Faithful | escalation placeholder; Julia uses a growth heuristic |
 | Shadow-stack rooting (`gcframe`) | Done | Faithful | — |

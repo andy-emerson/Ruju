@@ -256,16 +256,33 @@ pub fn alloc_chunk(total: u32) -> Offset {
 
 // --- write barrier ----------------------------------------------------------
 
-/// Record an old → young store so a minor collection still finds the young
-/// object. Must be called before any mutation that stores a reference into a
-/// possibly-old heap object (the analog of `jl_gc_wb`).
+/// The write barrier (`jl_gc_wb`, `gc-wb-stock.h:14`): fires only when the
+/// parent is `GC_OLD_MARKED` (3 — old *and* already scanned, so its young
+/// references would otherwise be missed) and the child's mark bit is clear.
+/// A merely-`OLD` (2) parent needs no barrier: it gets its promotion-
+/// completion scan at the next mark regardless.
 pub fn write_barrier(parent: Value, child: Value) {
     if !child.is_null()
-        && object::gc_bits(parent) & BIT_OLD != 0
-        && object::gc_bits(child) & BIT_OLD == 0
+        && object::gc_bits(parent) == (BIT_OLD | BIT_MARKED)
+        && object::gc_bits(child) & BIT_MARKED == 0
     {
-        remembered().push(parent);
+        queue_root(parent);
     }
+}
+
+/// `jl_gc_queue_root` (`gc-stock.c:1493`): clear the parent's OLD bit — the
+/// `OLD_MARKED` parent becomes `MARKED` ("in remset"), which is itself the
+/// at-most-once guard (a second store sees bits ≠ 3 and does not refire) —
+/// then push it on the remset.
+fn queue_root(parent: Value) {
+    object::set_gc_bits(parent, BIT_MARKED);
+    remembered().push(parent);
+}
+
+/// Number of remset entries (introspection for tests).
+#[allow(dead_code)]
+pub fn remset_len() -> usize {
+    remembered().len()
 }
 
 /// Whether `v` is in the old generation.
@@ -310,31 +327,34 @@ fn trace_fields(v: Value, work: &mut Vec<Value>) {
     }
 }
 
-/// Mark reachable objects. A minor mark does not trace into the old generation
-/// (old objects are assumed live) except via the remembered set, which is where
-/// any old → young edges are recorded; a full mark traces everything.
-fn mark(full: bool) {
+/// Mark reachable objects — the same rule for minor and full collections
+/// (`gc_setmark_tag`, `gc-stock.c:245`): an object whose mark bit is set
+/// (1 or 3) is skipped; an unmarked `OLD` (2) object gets its
+/// promotion-completion scan (2 → 3 **and trace** — the one scan that finds
+/// a newly promoted object's young references); `CLEAN` becomes `MARKED`.
+/// The generational win is that steady-state old objects sit at 3 and are
+/// skipped; old → young edges created after that scan are exactly what the
+/// remset carries.
+fn mark() {
     let mut work: Vec<Value> = Vec::new();
     push_roots(&mut work);
-    if !full {
-        // Old objects with young children: trace them to reach those children.
-        let remembered: Vec<Value> = remembered().clone();
-        for p in remembered {
-            trace_fields(p, &mut work);
-        }
+    // Remset entries sit at MARKED (queue_root left them there): restore each
+    // to OLD_MARKED and trace its fields (`gc-stock.c:2834`). This runs for
+    // full collections too — the entries' young children must be reached.
+    let remset: Vec<Value> = core::mem::take(remembered());
+    for p in remset {
+        object::set_gc_bits(p, BIT_OLD | BIT_MARKED);
+        trace_fields(p, &mut work);
     }
     while let Some(v) = work.pop() {
         if v.is_null() {
             continue;
         }
         let bits = object::gc_bits(v);
-        if !full && bits & BIT_OLD != 0 {
-            continue; // minor: old objects are live and not retraced
-        }
         if bits & BIT_MARKED != 0 {
-            continue; // already marked
+            continue; // marked this cycle (or restored from the remset)
         }
-        object::set_gc_bits(v, bits | BIT_MARKED);
+        object::set_gc_bits(v, bits | BIT_MARKED); // 0 → 1, 2 → 3
         trace_fields(v, &mut work);
     }
 }
@@ -344,10 +364,14 @@ fn free_slot(slot: Offset, pool: usize) {
     pools()[pool].freelist = slot;
 }
 
-/// Sweep by walking the pages. A minor sweep frees only dead young objects and
-/// promotes the survivors to the old generation; a full sweep frees every
-/// unmarked object (young or old). Survivors end up old and clean. Returns the
-/// number of live objects. Mirrors `gc-stock.c`'s page sweep.
+/// Sweep by walking the pages (the state transitions of `gc-stock.c:164–191`).
+/// Quick sweep: `CLEAN` is freed; `MARKED` young survivors promote (the
+/// one-survival placeholder for Julia's `PROMOTE_AGE`); `OLD` and
+/// `OLD_MARKED` are untouched — old garbage waits for a full collection.
+/// Full sweep: anything with the mark bit clear (`CLEAN` *or* `OLD`) is
+/// freed; survivors promote; `OLD_MARKED` demotes to `OLD`, so the *next*
+/// full cycle re-proves its liveness — old garbage at 3 takes one extra full
+/// cycle to free, as in Julia. Returns the number of live objects.
 fn sweep(full: bool) -> usize {
     for p in pools().iter_mut() {
         p.freelist = region::NULL;
@@ -362,14 +386,14 @@ fn sweep(full: bool) -> usize {
             let slot = start + (k * osize) as u32;
             let v = Value(slot + HEADER_SIZE as u32);
             let bits = object::gc_bits(v);
-            let live = if full {
-                bits & BIT_MARKED != 0
-            } else {
-                // Minor: old objects always survive; young ones only if marked.
-                bits & BIT_OLD != 0 || bits & BIT_MARKED != 0
-            };
+            let live = bits & BIT_MARKED != 0 || (!full && bits & BIT_OLD != 0);
             if live {
-                object::set_gc_bits(v, BIT_OLD); // promote/keep as old, clean
+                if bits == BIT_MARKED {
+                    object::set_gc_bits(v, BIT_OLD); // promote young survivor
+                } else if full && bits == (BIT_OLD | BIT_MARKED) {
+                    object::set_gc_bits(v, BIT_OLD); // demote: re-prove next full cycle
+                }
+                // quick sweep leaves OLD and OLD_MARKED untouched
                 survivors += 1;
             } else {
                 free_slot(slot, pi);
@@ -380,10 +404,14 @@ fn sweep(full: bool) -> usize {
 }
 
 fn collect_inner(full: bool) -> u32 {
-    mark(full);
+    // `mark` consumes the remset (entries restored to OLD_MARKED). Clearing it
+    // across the collection is sound *only* under the one-survival promotion
+    // placeholder: every survivor is old after the sweep, so no old → young
+    // edge can outlive the cycle. Julia's `PROMOTE_AGE` (slice 2) breaks that
+    // invariant and brings the remset-rebuild machinery with it.
+    mark();
     let before = HEAP.live.get();
     let survivors = sweep(full);
-    remembered().clear();
     HEAP.live.set(survivors);
     (before - survivors) as u32
 }
