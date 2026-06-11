@@ -24,12 +24,12 @@ const x = instance.exports;
 x.rj_init();
 
 // Builtin type ids (match runtime/src/types.rs `id`).
-const ID = { Any: 0, Number: 1, Real: 2, Integer: 3, Signed: 4, Float64: 21, Bool: 8, Int8: 9, Int16: 10, Int64: 12, Char: 22, Bottom: 26 };
+const ID = { Any: 0, Number: 1, Real: 2, Integer: 3, Signed: 4, Float64: 21, Bool: 8, Int8: 9, Int16: 10, Int32: 11, Int64: 12, Char: 22, Bottom: 26 };
 const ty = (id) => x.rj_builtin_type(id);
 
 // Julia type constructors mapped onto the runtime ABI.
 const Int = ty(ID.Int64), Integer = ty(ID.Integer), Real = ty(ID.Real), Number = ty(ID.Number);
-const Int8 = ty(ID.Int8), Int16 = ty(ID.Int16), Any = ty(ID.Any), Bottom = ty(ID.Bottom);
+const Int8 = ty(ID.Int8), Int16 = ty(ID.Int16), Int32 = ty(ID.Int32), Any = ty(ID.Any), Bottom = ty(ID.Bottom);
 const Ref = (t) => x.rj_box_type(t);
 const Tuple = (...ts) => (ts.length === 1 ? x.rj_tuple_type1(ts[0]) : x.rj_tuple_type2(ts[0], ts[1]));
 const Union = (a, b) => x.rj_union_type(a, b);
@@ -133,6 +133,96 @@ const cases = [
     const T1 = tvar(0, Int); const T2 = tvar(Int, 0);
     return [where(T1, Tuple(T1, T1)), where(T2, Tuple(T2, T2))];
   }],
+
+  // --- level 1: reflexivity, arity, Any (test_1) ---
+  ["L25 isequal_type(Int, Int)", "equal", () => [Int, Int]],
+  ["L26 isequal_type(Integer, Integer)", "equal", () => [Integer, Integer]],
+  ["L33 isequal_type(Tuple{Integer,Integer}, Tuple{Integer,Integer})", "equal", () =>
+    [Tuple(Integer, Integer), Tuple(Integer, Integer)]],
+  ["L36 !issub(Tuple{Int}, Tuple{Integer,Integer})", "notsub", () => [Tuple(Int), Tuple(Integer, Integer)]],
+  ["L50 issub_strict(Tuple{Int}, Tuple{Any})", "strict", () => [Tuple(Int), Tuple(Any)]],
+  ["L53 isequal_type(Tuple{Int}, Tuple{Int})", "equal", () => [Tuple(Int), Tuple(Int)]],
+
+  // --- level 3: universal/existential combinations (test_3) ---
+  ["L97 issub(Tuple{Integer,Int}, @UnionAll T @UnionAll T<:S<:T Tuple{T,S})", "sub", () => {
+    const T = tvar(); const S = tvar(T, T);
+    return [Tuple(Integer, Int), where(T, where(S, Tuple(T, S)))];
+  }],
+  ["L102 issub_strict(@UnionAll R Tuple{R,R}, @UnionAll T @UnionAll S<:T Tuple{T,S})", "strict", () => {
+    const R = tvar(); const T = tvar(); const S = tvar(0, T);
+    return [where(R, Tuple(R, R)), where(T, where(S, Tuple(T, S)))];
+  }],
+  ["L104 issub_strict(@UnionAll R Tuple{R,R}, @UnionAll T @UnionAll T<:S<:T Tuple{T,S})", "strict", () => {
+    const R = tvar(); const T = tvar(); const S = tvar(T, T);
+    return [where(R, Tuple(R, R)), where(T, where(S, Tuple(T, S)))];
+  }],
+  ["L106 issub_strict(@UnionAll R Tuple{R,R}, @UnionAll T @UnionAll S>:T Tuple{T,S})", "strict", () => {
+    const R = tvar(); const T = tvar(); const S = tvar(T, 0);
+    return [where(R, Tuple(R, R)), where(T, where(S, Tuple(T, S)))];
+  }],
+
+  // --- level 5: UnionAll equivalence and bounds (test_5) ---
+  ["L210 !issub(@UnionAll T<:Real T, @UnionAll T<:Integer T)", "notsub", () => {
+    const T1 = tvar(0, Real); const T2 = tvar(0, Integer);
+    return [where(T1, T1), where(T2, T2)];
+  }],
+  ["L212 isequal_type(@UnionAll T Tuple{T,T}, @UnionAll R Tuple{R,R})", "equal", () => {
+    const T = tvar(); const R = tvar();
+    return [where(T, Tuple(T, T)), where(R, Tuple(R, R))];
+  }],
+  ["L227 issub_strict(@UnionAll T Int, @UnionAll T<:Integer Integer)", "strict", () => {
+    const T1 = tvar(); const T2 = tvar(0, Integer);
+    return [where(T1, Int), where(T2, Integer)];
+  }],
+  ["L229 isequal_type(@UnionAll T @UnionAll S Tuple{T,Tuple{S}}, @UnionAll R @UnionAll V Tuple{R,Tuple{V}})", "equal", () => {
+    const T = tvar(); const S = tvar(); const R = tvar(); const V = tvar();
+    return [where(T, where(S, Tuple(T, Tuple(S)))), where(R, where(V, Tuple(R, Tuple(V))))];
+  }],
+  ["L235 isequal_type(@UnionAll T Tuple{T}, Tuple{Any})", "equal", () => {
+    const T = tvar(); return [where(T, Tuple(T)), Tuple(Any)];
+  }],
+  ["L236 isequal_type(@UnionAll T<:Real Tuple{T}, Tuple{Real})", "equal", () => {
+    const T = tvar(0, Real); return [where(T, Tuple(T)), Tuple(Real)];
+  }],
+  ["L274 !issub(Tuple{Integer,Int}, @UnionAll T<:Int @UnionAll S<:T Tuple{T,S})", "notsub", () => {
+    const T = tvar(0, Int); const S = tvar(0, T);
+    return [Tuple(Integer, Int), where(T, where(S, Tuple(T, S)))];
+  }],
+  ["L289 issub(@UnionAll Int<:T<:Integer T, @UnionAll T<:Real T)", "sub", () => {
+    const T1 = tvar(Int, Integer); const T2 = tvar(0, Real);
+    return [where(T1, T1), where(T2, T2)];
+  }],
+
+  // --- level 4: Union normalization & subsumption (test_4; A=Int64 B=Int8 C=Int16 D=Int32) ---
+  ["L362 isequal_type(Union{Bottom,Bottom}, Bottom)", "equal", () => [Union(Bottom, Bottom), Bottom]],
+  ["L365 issub_strict(Union{Int,Int8}, Integer)", "strict", () => [Union(Int, Int8), Integer]],
+  ["L367 isequal_type(Union{Int,Int8}, Union{Int,Int8})", "equal", () => [Union(Int, Int8), Union(Int, Int8)]],
+  ["L369 isequal_type(Union{Int,Integer}, Integer)", "equal", () => [Union(Int, Integer), Integer]],
+  ["L381 issub(Union{Union{A,Union{A,Union{B,C}}},Union{D,Bottom}}, Union{Union{A,B},Union{C,Union{B,D}}})", "sub", () =>
+    [Union(Union(Int, Union(Int, Union(Int8, Int16))), Union(Int32, Bottom)),
+     Union(Union(Int, Int8), Union(Int16, Union(Int8, Int32)))]],
+  ["L383 !issub(Union{Union{A,Union{A,Union{B,C}}},Union{D,Bottom}}, Union{Union{A,B},Union{C,Union{B,A}}})", "notsub", () =>
+    [Union(Union(Int, Union(Int, Union(Int8, Int16))), Union(Int32, Bottom)),
+     Union(Union(Int, Int8), Union(Int16, Union(Int8, Int)))]],
+  ["L386 isequal_type(Union{Union{A,B,C},Union{D}}, Union{A,B,C,D})", "equal", () =>
+    [Union(Union(Int, Union(Int8, Int16)), Int32), Union(Union(Int, Int8), Union(Int16, Int32))]],
+  ["L387 isequal_type(Union{Union{A,B,C},Union{D}}, Union{A,Union{B,C},D})", "equal", () =>
+    [Union(Union(Int, Union(Int8, Int16)), Int32), Union(Int, Union(Union(Int8, Int16), Int32))]],
+  ["L388 isequal_type(Union{Union{Union{Union{A}},B,C},Union{D}}, Union{A,Union{B,C},D})", "equal", () =>
+    [Union(Union(Int, Union(Int8, Int16)), Int32), Union(Union(Int, Union(Int8, Int16)), Int32)]],
+  ["L391 issub_strict(Union{Union{A,C},Union{D}}, Union{A,B,C,D})", "strict", () =>
+    [Union(Union(Int, Int16), Int32), Union(Union(Int, Int8), Union(Int16, Int32))]],
+  ["L393 !issub(Union{Union{A,B,C},Union{D}}, Union{A,C,D})", "notsub", () =>
+    [Union(Union(Int, Union(Int8, Int16)), Int32), Union(Int, Union(Int16, Int32))]],
+];
+
+// Known divergences from the local union backtracking (vs Julia's global
+// Lunions/Runions decision machine — design/fidelity-audit.md finding 11/15,
+// design/ledger.md "Union backtracking"). Run and reported, not failed; if one
+// starts passing, the machine has improved — promote it to `cases`.
+const knownDivergences = [
+  ["L371 isequal_type(Tuple{Union{Int,Int8},Int16}, Union{Tuple{Int,Int16},Tuple{Int8,Int16}})", "equal", () =>
+    [Tuple(Union(Int, Int8), Int16), Union(Tuple(Int, Int16), Tuple(Int8, Int16))]],
 ];
 
 const pred = { strict, equal, sub: (a, b) => sub(a, b), notsub: (a, b) => !sub(a, b), noteq: (a, b) => !equal(a, b) };
@@ -143,5 +233,11 @@ for (const [src, kind, build] of cases) {
   const ok = pred[kind](a, b);
   if (ok) { pass++; } else { fail++; console.log(`MISMATCH  ${src}`); }
 }
-console.log(`\n${pass}/${cases.length} match JuliaLang/julia (test/subtype.jl); ${fail} mismatch`);
+let healed = 0;
+for (const [src, kind, build] of knownDivergences) {
+  const [a, b] = build();
+  if (pred[kind](a, b)) { healed++; console.log(`FIXED (promote to cases)  ${src}`); }
+  else { console.log(`known divergence  ${src}`); }
+}
+console.log(`\n${pass}/${cases.length} match JuliaLang/julia (test/subtype.jl); ${fail} mismatch; ${knownDivergences.length - healed} known divergence(s)`);
 process.exitCode = fail ? 1 : 0;

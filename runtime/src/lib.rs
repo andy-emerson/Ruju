@@ -834,6 +834,14 @@ mod tests {
         };
         assert!(!types::issubtype(lhs_tn, rhs_si));
 
+        // Two distinct *free* type variables are never subtypes, regardless of
+        // how permissive their declared bounds are (subtype.c returns 0
+        // unconditionally when both sides are free singletons; audit finding 10).
+        let free_x = var(bottom, t(id::INT64)); // ub would satisfy lb below
+        let free_y = var(t(id::NUMBER), any);
+        assert!(!types::issubtype(free_x, free_y));
+        assert!(!types::issubtype(var(bottom, any), var(bottom, any)));
+
         // Covariant tuple under a `where`: Tuple{Int,Float64} <: (Tuple{T,S} where S where T).
         let tv = var(bottom, any);
         let sv = var(bottom, any);

@@ -164,7 +164,11 @@ fn subtype_unionall(t: Offset, u: Offset, e: &mut Env, r: bool, param: Param) ->
     let body_occurs_inv = var_occurs_invariant(body, var, false);
     let cov = vb.occurs_cov.max(vb.cov_diag); // cov_count
     let diagonal = cov > 1 && !body_occurs_inv;
-    if ans && diagonal && is_leaf_typevar(var) && !is_leaf_bound(vb.lb) {
+    // A typevar lower bound does not reject: each value of the referenced
+    // (universal) variable is a single type, so the diagonal is satisfied.
+    // Julia additionally propagates `concrete = 1` to that variable's binding —
+    // the cross-var propagation the ledger records as missing.
+    if ans && diagonal && is_leaf_typevar(var) && !types::is_typevar(vb.lb) && !is_leaf_bound(vb.lb) {
         ans = false;
     }
 
@@ -208,7 +212,7 @@ fn var_lt(a: Offset, e: &mut Env, idx: usize, param: Param) -> bool {
     if bb.ub == a {
         return true;
     }
-    if !ccheck(bb.lb, a, e, param) {
+    if !ccheck(bb.lb, a, e) {
         return false; // lower bound must already satisfy the constraint
     }
     e.vars[idx].ub = simple_meet(e.vars[idx].ub, a);
@@ -227,7 +231,7 @@ fn var_gt(a: Offset, e: &mut Env, idx: usize, param: Param) -> bool {
     if bb.lb == a {
         return true;
     }
-    if !ccheck(a, bb.ub, e, param) {
+    if !ccheck(a, bb.ub, e) {
         return false; // upper bound must already admit the constraint
     }
     e.vars[idx].lb = simple_join(e.vars[idx].lb, a);
@@ -239,12 +243,14 @@ fn var_gt(a: Offset, e: &mut Env, idx: usize, param: Param) -> bool {
 /// occurrences recorded inside fold into each variable's `cov_diag` (via max)
 /// rather than accumulating in the outer `occurs_cov`. Without this, checking
 /// one variable's bound would falsely make another variable diagonal.
-fn ccheck(a: Offset, b: Offset, e: &mut Env, param: Param) -> bool {
+/// The check enters at `Param::None`, as `subtype_ccheck` does — a top-level
+/// variable occurrence inside a bound check is not a covariant occurrence.
+fn ccheck(a: Offset, b: Offset, e: &mut Env) -> bool {
     let saved: Vec<i8> = e.vars.iter().map(|v| v.occurs_cov).collect();
     for v in e.vars.iter_mut() {
         v.occurs_cov = 0;
     }
-    let ok = sub(a, b, e, param);
+    let ok = sub(a, b, e, Param::None);
     // Bindings pushed inside `sub` are balanced out by now; fold the survivors.
     for (i, v) in e.vars.iter_mut().enumerate() {
         if i < saved.len() {
@@ -266,6 +272,11 @@ fn subtype_two_vars(x: Offset, y: Offset, e: &mut Env, param: Param) -> bool {
     }
     let xi = e.lookup(x);
     let yi = e.lookup(y);
+    // Two distinct free variables are never subtypes, regardless of their
+    // declared bounds (`xfree_singleton && yfree_singleton` in subtype.c).
+    if xi.is_none() && yi.is_none() {
+        return false;
+    }
     let xr = xi.map_or(false, |i| e.vars[i].existential);
     let yr = yi.map_or(false, |i| e.vars[i].existential);
     if xr {
@@ -431,18 +442,32 @@ fn tuple_subtype(x: Offset, y: Offset, e: &mut Env) -> bool {
 }
 
 /// Invariant equality of two type parameters (`forall_exists_equal`): subtype in
-/// both directions under invariant position. The environment is restored if the
-/// first direction narrows it but the second fails.
+/// both directions. The forward direction runs at `Invariant`; the reverse runs
+/// at `Param::None`, as in the C — the occurrences were already recorded going
+/// forward. The environment is restored if the first direction narrows it but
+/// the second fails.
 fn forall_exists_equal(x: Offset, y: Offset, e: &mut Env) -> bool {
     if x == y {
         return true;
+    }
+    // Same-name nested constructor fast path: distinct constructors can never
+    // be invariant-equal, and for a same-name non-tuple constructor the
+    // parameter comparison forwards to `forall_exists_equal` pairwise, which
+    // is symmetric — a single subtype call suffices.
+    if types::is_datatype(x) && types::is_datatype(y) {
+        if types::name_of(x) != types::name_of(y) {
+            return false;
+        }
+        if !types::is_tuple(x) {
+            return sub(x, y, e, Param::Invariant);
+        }
     }
     let saved = e.vars.clone();
     if !sub(x, y, e, Param::Invariant) {
         e.vars = saved;
         return false;
     }
-    sub(y, x, e, Param::Invariant)
+    sub(y, x, e, Param::None)
 }
 
 /// Greatest lower bound (`simple_meet`). For ground operands the GLB is the

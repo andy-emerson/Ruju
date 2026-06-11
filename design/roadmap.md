@@ -101,6 +101,23 @@ hard ones (as subtyping and the GC were).
 7. **Phase-1 AOT backend** — the IR→WASM compiler (the cold-path decision's
    Phase 1, above). Then: threading, finalizers, big-object GC, a moving
    collector.
+8. **Numerical kernels (BLAS/LAPACK replacement)** — Julia's `LinearAlgebra`
+   reaches BLAS/LAPACK through `libblastrampoline` via `ccall`; those Fortran
+   libraries have no realistic WASM story, and Ruju's `ccall` is already a
+   recorded divergence. Phased:
+   - **Phase A — pure-Julia fallbacks.** Julia ships generic implementations
+     (generic matmul, generic factorizations) that run without BLAS; they
+     arrive free with the AOT-compiled `base`/`stdlib` (item 7). Correct but
+     slow — this makes BLAS replacement a performance problem, not a
+     correctness one, so nothing blocks on this item.
+   - **Phase B — Rust kernels behind the LBT surface.** Implement the subset
+     of the BLAS/LAPACK ABI `LinearAlgebra` actually calls (`gemm`, `gemv`,
+     `getrf`, `potrf`, `geqrf`, `syevr`/`gesdd`) in Rust inside the same
+     `.wasm` module, registered where `libblastrampoline` would forward.
+     *Open decision:* hand-rolled kernels (small, owned) vs vendoring
+     `faer-rs` (mature, OpenBLAS-competitive, large dependency).
+   - **Phase C — WebGPU offload** for large matrices behind the same
+     interface. Much later.
 
 **Recommended next:** either start (1) `TypeVar`/`UnionAll` (the deep correctness
 path, hardest), or do the breadth first — (2) structs and (3) `Float64`+

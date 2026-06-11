@@ -55,14 +55,15 @@ departure *beyond* them.
 
 Oracle-verified: `runtime/verify_julia_subtype.mjs` runs a curated set of
 assertions copied verbatim from JuliaLang/julia's own `test/subtype.jl` (mapping
-`Ref{T}`→`Box{T}`, `Int`→`Int64`) and checks our answers match Julia's —
-currently 24/24.
+`Ref{T}`→`Box{T}`, `Int`→`Int64`) — currently 53/53, plus 1 tracked known
+divergence (tuple-over-union distributivity, which needs Julia's global
+union-decision machine; it self-reports if a fix makes it pass).
 
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
-| `jl_subtype` structural core | Partial | Faithful | reflexive/`Any`/`Bottom`, Union forall–exists, covariant tuples, nominal, invariant parametrics, `UnionAll`/`TypeVar` via the env. Known divergences (audit 2026-06): free-vs-free typevars consult bounds (Julia: unconditionally false); unions split before typevar/UnionAll handling (Julia prioritizes the latter); `forall_exists_equal` reverse check runs Invariant (Julia: `PARAM_NONE`) and lacks the same-name-datatype and two-union fast paths |
+| `jl_subtype` structural core | Partial | Faithful | reflexive/`Any`/`Bottom`, Union forall–exists, covariant tuples, nominal, invariant parametrics, `UnionAll`/`TypeVar` via the env. Audit 2026-06 fixes landed: free-vs-free typevars now unconditionally false; `forall_exists_equal` reverse check at `PARAM_NONE` + same-name-datatype fast path. Remaining divergences: unions split before typevar/UnionAll handling (Julia prioritizes the latter); no two-union greedy path; local union backtracking vs the global decision machine (see oracle's known divergence) |
 | Existential env (`jl_stenv_t`) | Partial | Faithful | `var_lt`/`var_gt` narrow per-var `lb`/`ub`; ∀/∃ via the `existential` flag; `invdepth`/`depth0` order interacting existentials (`var_outside`, ∀∃-vs-∃∀). No `where`-var renaming or `innervars` leak handling |
-| Diagonal rule | Partial | Faithful | `occurs_cov` + `cov_diag` consistency-scope folding (`subtype_ccheck`), static `var_occurs_invariant`, `is_leaf_bound`; no cross-var `concrete` propagation; `ccheck` enters at the caller's param (Julia: `PARAM_NONE`); pinned C has newer machinery the port predates (`Intersect` #61917, `push_forall_bound_scope`, `Loffset`) |
+| Diagonal rule | Partial | Faithful | `occurs_cov` + `cov_diag` consistency-scope folding (`subtype_ccheck`), static `var_occurs_invariant`, `is_leaf_bound`; `ccheck` enters at `PARAM_NONE` (fixed, audit 2026-06); typevar lower bounds accepted (fixed — Julia also propagates `concrete=1` to that var, which we still don't); pinned C has newer machinery the port predates (`Intersect` #61917, `push_forall_bound_scope`, `Loffset`) |
 | Union backtracking | Partial | Faithful | env save/restore on the exists branch; not Julia's `Lunions`/`Runions` bit-stack iterator |
 | `simple_meet` / `simple_join` | Partial | Faithful | join defers to the normalized `union_type` (keeps free vars, so `S>:T` survives); meet over-estimates to `b` for typevar operands (no `Intersect` node) |
 | `jl_type_intersection` | Planned | Faithful | — |
