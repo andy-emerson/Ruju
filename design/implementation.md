@@ -226,8 +226,8 @@ freelist threaded through the header word exactly mirrors
 | Piece | Status | Fidelity | Notes (Julia → ours) |
 | - | - | - | - |
 | Tagged header (tag-before-object, GC bits) | Done | Faithful | `jl_taggedvalue_t` |
-| `DataType` struct | Partial | Faithful | ~7 of `jl_datatype_t`'s ~17 fields (incl. `instance`) |
-| Field layout | Partial | Faithful | pointer bitmap only; no field-type/offset table |
+| `DataType` struct | Partial | Faithful | ~8 of `jl_datatype_t`'s ~17 fields (incl. `types`, `instance`); `TypeName` gains `names` + `mutabl` (structs 2026-06) |
+| Field layout | Partial | Faithful | `jl_compute_field_offsets` core (structs 2026-06): per-field offset/size/isptr descriptors after the GC's `[npointers, offsets]` prefix; inline pointer-free isbits fields, references otherwise. Omitted: inline isbits unions (selector bytes), inline immutables containing pointers (`first_ptr`/`hasptr`), atomics, `n_uninitialized` |
 | Boxing | Partial | Faithful | every primitive width except `Int128`/`UInt128`/`Float16` (intrinsics 2026-06); `Bool` boxes are the `jl_true`/`jl_false` permboxes (fixed, audit 2026-06); no permbox caches for ints/chars |
 | `SimpleVector` | Done | Faithful | `jl_svec_t` |
 | Singletons | Done | Faithful | `jl_datatype_t.instance`: `nothing` lives in `Nothing.instance`; zero-size pointer-free structs get an eager instance (`jl_compute_field_offsets`) |
@@ -431,7 +431,7 @@ front-end lexes `===` to the egal builtin (any values, no unboxing).
 | `typeof`, `<:` | Partial | Faithful | via the ABI |
 | `===` (`jl_egal`), `jl_types_egal` | Partial | Faithful | implemented for every value kind that exists (primitives by bits — NaN egal, ±0.0 not; identity-only kinds; svec; types; `where` alpha-equivalence). Omitted with the values that don't exist yet: strings, struct fields (`compare_fields`), `Vararg`, `TypeEq`, modules, `object_id`; the concrete-DataType fast path is skipped (uniquing reaches the same answer through parameters) |
 | `isa` | Planned | Faithful | — |
-| `getfield`/`setfield!`/`nfields`/`fieldtype` | Planned | Faithful | needs struct support |
+| `getfield`/`setfield!`/`nfields`/`fieldtype` | Partial | Faithful | runtime core landed (structs 2026-06): `new_struct` (`jl_new_structv`, `datatype.c:1675` — arity + `isa` checks, singleton return), `get_nth_field` (`datatype.c:1854` — inline bits re-boxed via `jl_new_bits`), `set_nth_field` (`datatype.c:1912` — barrier on references; immutability error per `get_checked_fieldindex`, `builtins.c:1031`), field lookup by interned name. Errors travel the eval `Result` channel. Interpreter/front-end wiring is slice 2; egal on struct values (`compare_fields`) still absent |
 | `tuple`, `apply`, `invoke`, array builtins | Planned | Faithful | `invoke`-like dispatch exists |
 
 ## Intrinsics — `runtime_intrinsics.c` vs `intrinsics` crate

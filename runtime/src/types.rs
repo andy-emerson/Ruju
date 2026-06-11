@@ -32,10 +32,14 @@ pub struct DataType {
     /// Type parameters (a `SimpleVector` reference, or `NULL` for non-parametric
     /// types). For tuple types these are the element types.
     pub parameters: Offset,
+    /// Field types (`jl_datatype_t.types`): a `SimpleVector`, or `NULL` for
+    /// types without declared fields.
+    pub types: Offset,
     /// The singleton instance for singleton types (`jl_datatype_t.instance`),
     /// or `NULL`. `Nothing`'s instance is `nothing`.
     pub instance: Offset,
-    /// Raw layout metadata (offset, or `NULL`): the embedded-pointer bitmap.
+    /// Raw layout metadata (offset, or `NULL`): the pointer bitmap, followed
+    /// by per-field descriptors for struct types (see [`field_offset`]).
     pub layout: Offset,
     /// Size in bytes of an instance's data (`layout->size`).
     pub size: u32,
@@ -151,6 +155,7 @@ fn write_dt(
         (*p).name = name;
         (*p).super_ = super_;
         (*p).parameters = parameters;
+        (*p).types = NULL;
         (*p).instance = NULL;
         (*p).layout = layout;
         (*p).size = size;
@@ -161,7 +166,7 @@ fn write_dt(
 
 /// Byte offset of the `instance` field within a DataType body (see the GC
 /// pointer bitmap in [`bootstrap`]).
-const DT_INSTANCE: u32 = 12;
+const DT_INSTANCE: u32 = 16;
 
 /// The singleton instance of `t` (`jl_datatype_t.instance`), or `NULL`.
 pub fn instance_of(t: Offset) -> Offset {
@@ -258,11 +263,12 @@ pub fn bootstrap() {
     let tn = |s: &str| make_typename(typename, sym(s));
 
     // 3. Patch the bootstrap bodies. DataType instances embed name@0, super@4,
-    //    parameters@8, instance@12; TypeName instances embed name@0 (Symbol)
-    //    and cache@4.
-    write_dt(datatype, tn("DataType"), any, NULL, make_layout(&[0, 4, 8, 12]), DT_SIZE as u32, 0);
+    //    parameters@8, types@12, instance@16; TypeName instances embed name@0
+    //    (Symbol), cache@4, and field names@8 (the `mutabl` byte at 12 is not
+    //    a reference).
+    write_dt(datatype, tn("DataType"), any, NULL, make_layout(&[0, 4, 8, 12, 16]), DT_SIZE as u32, 0);
     write_dt(symbol, tn("Symbol"), any, NULL, NULL, 0, 0);
-    write_dt(typename, tn("TypeName"), any, NULL, make_layout(&[0, 4]), 8, 0);
+    write_dt(typename, tn("TypeName"), any, NULL, make_layout(&[0, 4, 8]), 16, 0);
     write_dt(any, tn("Any"), any, NULL, NULL, 0, FLAG_ABSTRACT);
 
     // 4. The remaining hierarchy and primitive tower, in dependency order.
@@ -319,13 +325,34 @@ pub fn bootstrap() {
     }));
 }
 
-/// Allocate a `TypeName` object: `[name (Symbol) @0 | cache @4]`. The cache slot
-/// is reserved for hash-consed type uniquing and is `NULL` for now.
+/// Allocate a `TypeName` object (`jl_typename_t` subset):
+/// `[name (Symbol) @0 | cache @4 | field names (svec) @8 | mutabl (u8) @12]`.
 fn make_typename(typename_type: Offset, name_sym: Offset) -> Offset {
-    let v = object::alloc(typename_type, 8).raw();
+    let v = object::alloc(typename_type, 16).raw();
     write_ref(v, 0, name_sym);
     write_ref(v, 4, NULL);
+    write_ref(v, 8, NULL);
+    unsafe {
+        *region::ptr_mut::<u32>(v + 12) = 0;
+    }
     v
+}
+
+/// Byte offsets within a TypeName.
+const TN_NAMES: u32 = 8;
+const TN_MUTABL: u32 = 12;
+
+/// Whether `t`'s TypeName declares it `mutable struct` (`tn->mutabl`).
+#[allow(dead_code)] // consumers arrive with struct slice 2 (front-end + interpreter)
+pub fn is_mutable(t: Offset) -> bool {
+    unsafe { *region::ptr_mut::<u32>(name_of(t) + TN_MUTABL) != 0 }
+}
+
+/// The field-name Symbols of `t` (a svec on its TypeName, `tn->names`), or
+/// `NULL`.
+#[allow(dead_code)] // consumers arrive with struct slice 2 (front-end + interpreter)
+pub fn field_names(t: Offset) -> Offset {
+    read_ref(name_of(t), TN_NAMES)
 }
 
 // --- queries ----------------------------------------------------------------
@@ -785,20 +812,289 @@ pub fn layout_ptr_offset(t: Offset, i: u32) -> u32 {
     unsafe { *region::ptr_mut::<u32>(l).add(1 + i as usize) }
 }
 
-/// Define a composite struct type with the given name, supertype, instance
-/// size, and embedded reference-field byte offsets (its GC pointer bitmap).
-/// A zero-size, pointer-free struct is a singleton: its sole instance is
-/// allocated eagerly into the type's `instance` field, as
-/// `jl_compute_field_offsets` does.
-#[allow(dead_code)] // used by tests and forthcoming user-defined types
-pub fn define_struct(name: &str, super_: Offset, size: u32, ptr_offsets: &[u32]) -> Offset {
+// --- struct types: field layout, construction, field access ------------------
+//
+// A faithful core of `jl_compute_field_offsets` (`datatype.c:636`),
+// `jl_new_structv` (`datatype.c:1675`), `jl_get_nth_field` (`datatype.c:1854`),
+// and `set_nth_field` (`datatype.c:1912`). A field whose declared type is a
+// concrete, immutable, pointer-free type is stored **inline** (unboxed bits,
+// re-boxed on read); every other field is a reference. Omitted relative to the
+// C: inline isbits-union fields (selector bytes), inline immutables that
+// themselves contain pointers (`first_ptr`/`hasptr`), atomics and field locks,
+// `n_uninitialized`, and `#undef` checking — each arrives with the values that
+// need it.
+
+/// Per-field descriptor (a `jl_fielddesc32_t` without the bitfield packing).
+struct FieldDesc {
+    offset: u32,
+    size: u32,
+    isptr: bool,
+}
+
+/// Whether a field of declared type `ft` is stored inline
+/// (pointer-free isbits: a concrete primitive or an immutable struct whose
+/// own fields are all inline).
+fn is_inline_field(ft: Offset) -> bool {
+    if !is_datatype(ft) || is_abstract(ft) || is_mutable(ft) {
+        return false;
+    }
+    if is_primitive(ft) {
+        return true;
+    }
+    // An immutable struct is inlinable when it has a layout with no pointers.
+    nfields_of(ft) > 0 && layout_npointers(ft) == 0 || instance_of(ft) != NULL
+}
+
+/// Compute offsets, sizes, pointer slots, and total size for the given field
+/// types (`jl_compute_field_offsets`). Alignment is each inline field's size
+/// capped at 8; references are 4-byte offsets.
+fn compute_field_offsets(field_types: &[Offset]) -> (u32, Vec<u32>, Vec<FieldDesc>) {
+    let mut descs = Vec::with_capacity(field_types.len());
+    let mut ptrs = Vec::new();
+    let mut off: u32 = 0;
+    for &ft in field_types {
+        if is_inline_field(ft) {
+            let fsz = size_of(ft);
+            let align = fsz.clamp(1, 8).next_power_of_two();
+            off = (off + align - 1) & !(align - 1);
+            descs.push(FieldDesc { offset: off, size: fsz, isptr: false });
+            off += fsz;
+        } else {
+            off = (off + 3) & !3;
+            ptrs.push(off);
+            descs.push(FieldDesc { offset: off, size: 4, isptr: true });
+            off += 4;
+        }
+    }
+    (off, ptrs, descs)
+}
+
+/// Allocate a struct layout blob: the GC's `[npointers, ptr offsets...]`
+/// prefix (unchanged shape — the collector reads only this), followed by
+/// `nfields` descriptor triples `[offset, size, isptr]`.
+fn make_struct_layout(ptrs: &[u32], descs: &[FieldDesc]) -> Offset {
+    let words = 1 + ptrs.len() + 3 * descs.len();
+    let off = region::alloc(4 * words);
+    unsafe {
+        let p = region::ptr_mut::<u32>(off);
+        *p = ptrs.len() as u32;
+        for (i, &po) in ptrs.iter().enumerate() {
+            *p.add(1 + i) = po;
+        }
+        let base = 1 + ptrs.len();
+        for (i, d) in descs.iter().enumerate() {
+            *p.add(base + 3 * i) = d.offset;
+            *p.add(base + 3 * i + 1) = d.size;
+            *p.add(base + 3 * i + 2) = d.isptr as u32;
+        }
+    }
+    off
+}
+
+/// Number of declared fields of `t`.
+#[allow(dead_code)] // consumers arrive with struct slice 2 (front-end + interpreter)
+pub fn nfields_of(t: Offset) -> u32 {
+    unsafe { (*dt(t)).nfields }
+}
+
+/// The declared type of field `i` (`jl_field_type`).
+#[allow(dead_code)] // consumers arrive with struct slice 2 (front-end + interpreter)
+pub fn field_type(t: Offset, i: u32) -> Offset {
+    svec_ref(unsafe { (*dt(t)).types }, i)
+}
+
+/// Read the `i`-th field descriptor word triple from the layout blob.
+#[allow(dead_code)] // consumers arrive with struct slice 2 (front-end + interpreter)
+fn field_desc(t: Offset, i: u32) -> (u32, u32, bool) {
+    let l = unsafe { (*dt(t)).layout };
+    let base = 1 + layout_npointers(t) + 3 * i;
+    unsafe {
+        let p = region::ptr_mut::<u32>(l);
+        (*p.add(base as usize), *p.add(base as usize + 1), *p.add(base as usize + 2) != 0)
+    }
+}
+
+/// Byte offset of field `i` (`jl_field_offset`).
+#[allow(dead_code)] // consumers arrive with struct slice 2 (front-end + interpreter)
+pub fn field_offset(t: Offset, i: u32) -> u32 {
+    field_desc(t, i).0
+}
+
+/// Whether field `i` is a reference (`jl_field_isptr`).
+#[allow(dead_code)] // consumers arrive with struct slice 2 (front-end + interpreter)
+pub fn field_isptr(t: Offset, i: u32) -> bool {
+    field_desc(t, i).2
+}
+
+/// Index of the field named `name_sym`, by interned-symbol identity.
+#[allow(dead_code)] // consumers arrive with struct slice 2 (front-end + interpreter)
+pub fn field_index(t: Offset, name_sym: Offset) -> Option<u32> {
+    let names = field_names(t);
+    if names == NULL {
+        return None;
+    }
+    (0..svec_len(names)).find(|&i| svec_ref(names, i) == name_sym)
+}
+
+/// `isa(v, t)` for our value universe: `typeof(v) <: t`.
+#[allow(dead_code)] // consumers arrive with struct slice 2 (front-end + interpreter)
+pub fn is_a(v: object::Value, t: Offset) -> bool {
+    issubtype(object::type_of(v), t)
+}
+
+/// Construct an instance of struct type `t` from `args` (`jl_new_structv`):
+/// arity and per-field `isa` checks, singleton return, inline fields stored
+/// as bits, reference fields stored through [`set_nth_field`]'s barrier path,
+/// uncovered tail zeroed by the allocator.
+#[allow(dead_code)] // consumers arrive with struct slice 2 (front-end + interpreter)
+pub fn new_struct(t: Offset, args: &[object::Value]) -> Result<object::Value, String> {
+    if !is_datatype(t) || is_abstract(t) {
+        return Err("new: not a concrete struct type".to_string());
+    }
+    let nf = nfields_of(t);
+    if args.len() as u32 != nf {
+        return Err(format!("invalid struct allocation: {} of {} fields", args.len(), nf));
+    }
+    for (i, &a) in args.iter().enumerate() {
+        let ft = field_type(t, i as u32);
+        if !is_a(a, ft) {
+            return Err(format!("TypeError: new: expected field {} to match its declared type", i + 1));
+        }
+    }
+    let inst = instance_of(t);
+    if inst != NULL {
+        return Ok(object::Value(inst));
+    }
+    // Root the arguments and the new object across allocation.
+    let v = object::alloc(t, size_of(t) as usize);
+    if v.is_null() {
+        return Err("out of memory".to_string());
+    }
+    let v_root = Rooted::new(v);
+    for (i, &a) in args.iter().enumerate() {
+        set_field_raw(v_root.get(), t, i as u32, a);
+    }
+    Ok(v_root.get())
+}
+
+/// The unchecked store shared by construction and `setfield!`
+/// (`set_nth_field`): references go through the write barrier; inline fields
+/// copy payload bits.
+#[allow(dead_code)] // consumers arrive with struct slice 2 (front-end + interpreter)
+fn set_field_raw(v: object::Value, t: Offset, i: u32, rhs: object::Value) {
+    let (offs, fsz, isptr) = field_desc(t, i);
+    if isptr {
+        object::set_ref(v, offs, rhs);
+    } else {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                region::ptr_mut::<u8>(rhs.raw()),
+                region::ptr_mut::<u8>(v.raw() + offs),
+                fsz as usize,
+            );
+        }
+    }
+}
+
+/// Read field `i` of `v` (`jl_get_nth_field`): reference fields load the
+/// reference; inline fields re-box the bits as the field's declared type
+/// (`jl_new_bits`).
+#[allow(dead_code)] // consumers arrive with struct slice 2 (front-end + interpreter)
+pub fn get_nth_field(v: object::Value, i: u32) -> Result<object::Value, String> {
+    let t = object::type_of(v);
+    if i >= nfields_of(t) {
+        return Err(format!("BoundsError: field index {}", i + 1));
+    }
+    let (offs, fsz, isptr) = field_desc(t, i);
+    if isptr {
+        return Ok(object::get_ref(v, offs));
+    }
+    let ft = field_type(t, i);
+    let inst = instance_of(ft);
+    if inst != NULL {
+        return Ok(object::Value(inst)); // inline singleton field
+    }
+    // jl_new_bits: allocate a fresh box of the field type and copy the bits.
+    let v_root = Rooted::new(v);
+    let b = object::alloc(ft, fsz as usize);
+    if b.is_null() {
+        return Err("out of memory".to_string());
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            region::ptr_mut::<u8>(v_root.get().raw() + offs),
+            region::ptr_mut::<u8>(b.raw()),
+            fsz as usize,
+        );
+    }
+    Ok(b)
+}
+
+/// `setfield!` (`jl_f_setfield` + `get_checked_fieldindex`): only mutable
+/// structs may be assigned; the value must match the declared field type.
+#[allow(dead_code)] // consumers arrive with struct slice 2 (front-end + interpreter)
+pub fn set_nth_field(v: object::Value, i: u32, rhs: object::Value) -> Result<(), String> {
+    let t = object::type_of(v);
+    if !is_mutable(t) {
+        return Err(format!(
+            "setfield!: immutable struct of type {} cannot be changed",
+            symbol::as_str(type_sym(t))
+        ));
+    }
+    if i >= nfields_of(t) {
+        return Err(format!("BoundsError: field index {}", i + 1));
+    }
+    let ft = field_type(t, i);
+    if !is_a(rhs, ft) {
+        return Err("TypeError: setfield!: value does not match the field type".to_string());
+    }
+    set_field_raw(v, t, i, rhs);
+    Ok(())
+}
+
+/// Define a struct type (`jl_new_datatype` + `jl_compute_field_offsets`):
+/// field names and types determine the inline/reference layout and the GC
+/// pointer bitmap. A zero-field immutable struct is a singleton with an eager
+/// `instance`.
+#[allow(dead_code)] // used by tests; the front-end wires in with slice 2
+pub fn define_struct(
+    name: &str,
+    super_: Offset,
+    fields: &[(&str, Offset)],
+    mutabl: bool,
+) -> Offset {
     let b = builtins();
     let name_sym = symbol::intern(b.types[id::SYMBOL as usize], name);
-    // Root the TypeName across the DataType allocation.
     let tname = Rooted::new(object::Value(make_typename(b.types[id::TYPENAME as usize], name_sym)));
-    let t = new_type(b.types[id::DATATYPE as usize], tname.get().raw(), super_, size, 0, ptr_offsets);
-    if size == 0 && ptr_offsets.is_empty() {
-        // Root the type across the instance allocation.
+    unsafe {
+        *region::ptr_mut::<u32>(tname.get().raw() + TN_MUTABL) = mutabl as u32;
+    }
+
+    let ftypes: Vec<Offset> = fields.iter().map(|&(_, ft)| ft).collect();
+    let (size, ptrs, descs) = compute_field_offsets(&ftypes);
+
+    // Field-name symbols (interned, immortal) and the field-type svec.
+    let name_syms: Vec<Offset> = fields
+        .iter()
+        .map(|&(fname, _)| symbol::intern(b.types[id::SYMBOL as usize], fname))
+        .collect();
+    let names_svec = Rooted::new(object::Value(make_svec(&name_syms)));
+    object::set_ref(tname.get(), TN_NAMES, names_svec.get());
+    let types_svec = Rooted::new(object::Value(make_svec(&ftypes)));
+
+    let layout = if descs.is_empty() && ptrs.is_empty() {
+        NULL
+    } else {
+        make_struct_layout(&ptrs, &descs)
+    };
+    let v = object::alloc(b.types[id::DATATYPE as usize], DT_SIZE);
+    let t = v.raw();
+    write_dt(t, tname.get().raw(), super_, NULL, layout, size, 0);
+    unsafe {
+        (*dt(t)).types = types_svec.get().raw();
+        (*dt(t)).nfields = fields.len() as u32;
+    }
+    if fields.is_empty() && !mutabl {
         let t_root = Rooted::new(object::Value(t));
         let inst = object::alloc(t, 0).raw();
         set_instance(t_root.get().raw(), inst);

@@ -516,7 +516,7 @@ mod tests {
         rj_init();
 
         // A struct with two reference fields at byte offsets 0 and 4.
-        let pair = types::define_struct("IntPair", types::builtin(id::ANY), 8, &[0, 4]);
+        let pair = types::define_struct("IntPair", types::builtin(id::ANY), &[("a", types::builtin(id::ANY)), ("b", types::builtin(id::ANY))], true);
         assert_eq!(types::layout_npointers(pair), 2);
         assert_eq!(types::layout_ptr_offset(pair, 0), 0);
         assert_eq!(types::layout_ptr_offset(pair, 1), 4);
@@ -615,7 +615,7 @@ mod tests {
         let _g = serial();
         rj_init();
         // An old mutable cell with two reference fields.
-        let cty = types::define_struct("Cell2", types::builtin(id::ANY), 8, &[0, 4]);
+        let cty = types::define_struct("Cell2", types::builtin(id::ANY), &[("a", types::builtin(id::ANY)), ("b", types::builtin(id::ANY))], true);
         let cell = Rooted::new(object::alloc(cty, 8));
         object::set_ref(cell.get(), 0, Value(types::nothing_instance()));
         object::set_ref(cell.get(), 4, Value(types::nothing_instance()));
@@ -901,8 +901,8 @@ mod tests {
         assert!(!value::unbox_bool(value::box_bool(false)));
         assert_eq!(type_of(value::box_bool(true)), t(id::BOOL));
 
-        // A zero-size, pointer-free struct is a singleton with an eager instance.
-        let unit = types::define_struct("UnitLike", t(id::ANY), 0, &[]);
+        // A zero-field immutable struct is a singleton with an eager instance.
+        let unit = types::define_struct("UnitLike", t(id::ANY), &[], false);
         assert!(types::is_datatype_singleton(unit));
         assert_eq!(type_of(object::Value(types::instance_of(unit))), unit);
 
@@ -1161,6 +1161,79 @@ mod tests {
         // DivideError surfaces as an eval error (no exceptions yet).
         assert!(frontend::eval_source("1 \u{f7} 0").is_err());
         assert!(frontend::eval_source("x = 5\nx % 0").is_err());
+    }
+
+    // Struct slice 1: computed field layout (inline isbits vs references),
+    // new/getfield/setfield!, mutability, and the GC pointer bitmap.
+    #[test]
+    fn structs_layout_construction_and_field_access() {
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+
+        // Immutable Point{Int64, Int64}: both fields inline, no GC pointers.
+        let point = types::define_struct(
+            "PointII",
+            t(id::ANY),
+            &[("x", t(id::INT64)), ("y", t(id::INT64))],
+            false,
+        );
+        assert_eq!(types::nfields_of(point), 2);
+        assert_eq!(types::size_of(point), 16); // two inline 8-byte fields
+        assert_eq!(types::layout_npointers(point), 0);
+        assert!(!types::field_isptr(point, 0) && !types::field_isptr(point, 1));
+        assert_eq!(types::field_offset(point, 1), 8);
+
+        let p = types::new_struct(point, &[box_int(3), box_int(4)]).unwrap();
+        assert_eq!(type_of(p), point);
+        // getfield re-boxes the inline bits as the declared field type.
+        assert_eq!(unbox_int(types::get_nth_field(p, 0).unwrap()), 3);
+        assert_eq!(unbox_int(types::get_nth_field(p, 1).unwrap()), 4);
+        assert_eq!(type_of(types::get_nth_field(p, 0).unwrap()), t(id::INT64));
+        // Field lookup by name (interned-symbol identity).
+        let ysym = symbol::intern(t(id::SYMBOL), "y");
+        assert_eq!(types::field_index(point, ysym), Some(1));
+        // setfield! on an immutable struct is an error.
+        assert!(types::set_nth_field(p, 0, box_int(9)).is_err());
+
+        // Mutable struct with an abstract-typed field: stored as a reference,
+        // visible in the GC bitmap, and assignable through the barrier.
+        let cell = types::define_struct("CellLike", t(id::ANY), &[("v", t(id::INTEGER))], true);
+        assert_eq!(types::layout_npointers(cell), 1);
+        assert!(types::field_isptr(cell, 0));
+        let c_root = gc::Rooted::new(types::new_struct(cell, &[box_int(7)]).unwrap());
+        assert_eq!(unbox_int(types::get_nth_field(c_root.get(), 0).unwrap()), 7);
+        types::set_nth_field(c_root.get(), 0, box_int(8)).unwrap();
+        assert_eq!(unbox_int(types::get_nth_field(c_root.get(), 0).unwrap()), 8);
+        // The declared type is enforced: a Float64 is not an Integer.
+        assert!(types::set_nth_field(c_root.get(), 0, value::box_float64(1.0)).is_err());
+        // The reference field survives a collection (bitmap-driven tracing).
+        gc::collect();
+        assert_eq!(unbox_int(types::get_nth_field(c_root.get(), 0).unwrap()), 8);
+
+        // Arity and isa checks at construction.
+        assert!(types::new_struct(point, &[box_int(1)]).is_err());
+        assert!(types::new_struct(point, &[box_int(1), value::box_float64(2.0)]).is_err());
+
+        // Mixed layout: inline Bool (1 byte) then a reference — alignment puts
+        // the reference at offset 4.
+        let mixed = types::define_struct(
+            "MixedBF",
+            t(id::ANY),
+            &[("flag", t(id::BOOL)), ("val", t(id::NUMBER))],
+            true,
+        );
+        assert_eq!(types::field_offset(mixed, 0), 0);
+        assert_eq!(types::field_offset(mixed, 1), 4);
+        let m = gc::Rooted::new(
+            types::new_struct(mixed, &[value::box_bool(true), value::box_float64(2.5)]).unwrap(),
+        );
+        assert!(value::unbox_bool(types::get_nth_field(m.get(), 0).unwrap()));
+        assert_eq!(value::unbox_float64(types::get_nth_field(m.get(), 1).unwrap()), 2.5);
+
+        drop(m);
+        drop(c_root);
+        assert_eq!(gc::root_count(), 0, "roots balanced");
     }
 
     // The remaining primitive boxings round-trip, carry their type, and egal
