@@ -97,12 +97,13 @@ flowchart TD
     STRUCTS["struct support [done: phase-0 subset]"]
     INTRIN["intrinsics & boxing breadth [done: phase-0 subset]"]
     GCX("GC exactness & tuning (frontier)")
-    SUBX("subtype hardening (frontier)")
+    SUBXE("subtype expressibility: varargs,<br/>Type{T}, UnionAll instantiation (frontier)")
     EXC("exceptions: enter/leave (frontier)")
 
+    ORACLE("oracle capacity: test/subtype.jl<br/>tranches unlocked by expressibility")
+    SUBXM{"subtype engine: union decision machine,<br/>Intersect/Loffset, concrete propagation"}
     ISECT{"type intersection"}
     MORESPEC{"type_morespecific"}
-    VARARG{"varargs & Type{T} kinds"}
     DISPX{"dispatch hardening: cache, ambiguity, MethodError"}
     ARRAYS("arrays & GenericMemory (frontier)")
     MODULES("modules & bindings, toplevel (frontier)")
@@ -116,12 +117,13 @@ flowchart TD
     TYPES --> STRUCTS
     OBJ --> EGAL
     TYPES --> EGAL
-    SUB0 --> SUBX
-    SUBX --> ISECT
-    SUBX --> VARARG
+    SUB0 --> SUBXE
+    SUBXE --> ORACLE
+    ORACLE --> SUBXM
+    SUBXM --> ISECT
     ISECT --> MORESPEC
     MORESPEC --> DISPX
-    VARARG --> DISPX
+    SUBXE --> DISPX
     DISP0 --> DISPX
     STRUCTS --> ARRAYS
     STRUCTS --> MODULES
@@ -148,7 +150,7 @@ Unblocked now, in no required order — pick by the selection principles below.
 | **arrays & GenericMemory** | `GenericMemory`/`Array` (`genericmemory.c`, `array.c`): the buffer type, `arrayref`/`arrayset`, length, growth | most real Julia programs; `base/` code |
 | **modules & bindings** | `module.c`/`toplevel.c`: globals, bindings, top-level eval beyond expressions | `base/` code; method definitions from source |
 | **GC exactness & tuning** | write-barrier exact condition + `queue_root` re-tag, promotion age, heap-target trigger, full-vs-quick (audit findings 17–19) | phase-1 AOT (GC must be trustworthy under real load) |
-| **subtype hardening** | remaining audit divergences: the global union-decision machine (heals the oracle's known divergence), union-split priority order, cross-var `concrete` propagation, `Intersect`/`Loffset` from the newer pin | intersection, then `type_morespecific`, then dispatch hardening |
+| **subtype expressibility** | varargs in tuples, `Type{T}` kinds, `UnionAll` instantiation in `apply_type` — bounded slices, each unlocking a tranche of `test/subtype.jl` for the oracle | grows the oracle from 53 toward the coverage the **engine slice** needs to be measurable; varargs also feeds dispatch |
 | **exceptions** | `enter`/`leave` in the interpreter (`interpreter.c`), error throwing (`rtutils.c`) | real lowering; `base/` code throws |
 
 ## Selection principles
@@ -169,7 +171,16 @@ When several frontier items are available:
 
 ## Later phases (blocked, in dependency order)
 
-Type intersection → `type_morespecific` → dispatch hardening (typemap cache,
+**The subtype engine** (the global union-decision machine that heals the
+oracle's known divergence, `Intersect`/`Loffset` from the newer pin,
+cross-var `concrete` propagation) deliberately waits for the expressibility
+slices: an engine rewrite verified against today's 53 oracle cases would be
+unverified exactly where engines go wrong — the measuring instrument is
+built first. The working cadence interleaves hardening slices between other
+frontier items (GC exactness → varargs → arrays → `Type{T}`/`UnionAll`
+instantiation → engine), so the type vocabulary and the engine grow together
+and no retrofit cliff accumulates. Then: type intersection →
+`type_morespecific` → dispatch hardening (typemap cache,
 world age, ambiguity, `MethodError`). Arrays and modules behind structs. Real
 lowering (replacing `frontend.rs`) once structs, intrinsics breadth, and
 exceptions hold. The phase-1 AOT backend once dispatch and GC are hardened.
