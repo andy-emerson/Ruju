@@ -35,6 +35,12 @@ where verification starts, not where it ends. **Done · Faithful in the status
 tables requires Reference-verified**, with the evidence (citations, side-by-
 side comparison) recorded in `implementation.md`. No upgrade without evidence.
 
+The ladder applies **symmetrically to characterizations of the reference**:
+a statement of the form "Julia does X" carries a citation into the pin or it
+is merely Stated — never ground truth. Both remembered-vs-pinned failures
+(the subtype machinery the port predated; the promotion policy the pin had
+removed) lived in uncited reference prose that read as authoritative.
+
 ## The increment loop
 
 1. **Pick from the frontier.** The human selects the increment from
