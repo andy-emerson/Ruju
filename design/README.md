@@ -8,9 +8,10 @@ Three documents, three questions:
 | [`implementation.md`](implementation.md) | **Where are we?** | the per-module comparison of Julia's C/C++ runtime against the Rust reimplementation — architectural maps, side-by-side mini-maps, status tables, audit findings |
 | [`methodology.md`](methodology.md) | **How do we get there?** | the process that moves code from written to pushed — the claim ladder, the increment loop, divergence handling, pin discipline, audits |
 
-## How they work together
+## The cycle
 
-Every increment makes one trip around the three:
+The three documents are not just complementary answers — they are stations
+on a cycle, and every increment is one turn of it:
 
 1. **`strategy.md` chooses.** The human picks an item from the dependency
    map's unblocked frontier.
@@ -18,8 +19,12 @@ Every increment makes one trip around the three:
    read and cited first, code and right-reason tests together, verification,
    the reference recheck, honest labeling.
 3. **`implementation.md` records.** The same commit updates the touched
-   module's maps, status rows, and citations; the strategy's frontier shifts
-   if the increment opened or closed work.
+   module's maps, status rows, citations, and obligations.
+4. **The cycle closes back into `strategy.md`.** What was recorded re-derives
+   the frontier: a completed gate unblocks nodes, a new obligation becomes
+   future work, a recorded divergence may add an edge. Step 3's output is
+   step 1's next menu — the next increment begins from a strategy the last
+   increment rewrote.
 
 The increment's two boundary tables are where the documents touch: the
 **pre-table** (the costed options for what to do next) is `strategy.md`

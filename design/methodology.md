@@ -1,7 +1,10 @@
 # Methodology
 
 How we get there: the process that moves code from written to pushed, in a
-project that demands precision and runs on human–agent trust.
+project that demands precision and runs on human–agent trust. The increment
+loop below is the arc of a cycle — it begins by consuming the strategy's
+frontier (step 1) and ends by rewriting it (steps 6–8), so each increment
+hands the next one its menu.
 
 The founding observation, confirmed by every audit this project has run:
 **the failure mode is never fabrication — it is a claim quietly sitting one
