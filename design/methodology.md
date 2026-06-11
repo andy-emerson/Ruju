@@ -61,15 +61,19 @@ side comparison) recorded in `implementation.md`. No upgrade without evidence.
    Documents that lag the code are the first step of the next over-claim.
 7. **Commit and push** following the repository's commit conventions, push
    to `main`, and verify local and remote are in sync.
-8. **Report with a weakest link.** Every increment report ends by naming its
-   least-verified claim — the counted-not-grepped citation, the subset that
-   wasn't exercised, the case the oracle can't reach. This is the structural
-   answer to self-verification: the agent cannot audit itself, but it can
-   hand the human a sorted list of where auditing pays off most. The human
-   spot-checks the disclosed link, not the whole diff. If the weakest link
-   implies a future verification obligation, record it in
-   `implementation.md` **before** the push — the report is a pointer to the
-   record, never the record itself.
+8. **Report with a deviation table.** Every increment report ends with a
+   table — the settlement that answers the frontier table's promise: one
+   table chose the slice, one assesses how it went. One row per deviation
+   from the slice's plan and per claim sitting below Reference-verified:
+   what was planned vs delivered, the claim's rung, a severity, and where
+   it is recorded. Rows are sorted by severity — the human spot-checks from
+   the top, which preserves what the old single-weakest-link rule was for
+   (a sorted list of where auditing pays off) while fixing its fixed output
+   size: it manufactured a disclosure when nothing was serious and
+   truncated to one when three were. **An empty table is itself a claim**
+   ("no deviations") that audits will check. Anything implying a future
+   verification obligation is recorded in `implementation.md` **before**
+   the push — the table is a pointer to records, never the record itself.
 
 ## Divergences
 
