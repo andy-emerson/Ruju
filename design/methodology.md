@@ -66,7 +66,10 @@ side comparison) recorded in `implementation.md`. No upgrade without evidence.
    wasn't exercised, the case the oracle can't reach. This is the structural
    answer to self-verification: the agent cannot audit itself, but it can
    hand the human a sorted list of where auditing pays off most. The human
-   spot-checks the disclosed link, not the whole diff.
+   spot-checks the disclosed link, not the whole diff. If the weakest link
+   implies a future verification obligation, record it in
+   `implementation.md` **before** the push — the report is a pointer to the
+   record, never the record itself.
 
 ## Divergences
 
