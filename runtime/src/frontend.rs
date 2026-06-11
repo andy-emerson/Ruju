@@ -42,8 +42,13 @@ enum Tok {
     Assign,
     LParen,
     RParen,
+    Dot,
+    Comma,
+    ColonColon,
     Sep, // newline or `;`
     If,
+    Struct,
+    Mutable,
     Else,
     Elseif,
     End,
@@ -107,6 +112,18 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
             b'(' => {
                 out.push(Tok::LParen);
                 i += 1;
+            }
+            b'.' => {
+                out.push(Tok::Dot);
+                i += 1;
+            }
+            b',' => {
+                out.push(Tok::Comma);
+                i += 1;
+            }
+            b':' if b.get(i + 1) == Some(&b':') => {
+                out.push(Tok::ColonColon);
+                i += 2;
             }
             b')' => {
                 out.push(Tok::RParen);
@@ -180,6 +197,8 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                     "elseif" => Tok::Elseif,
                     "end" => Tok::End,
                     "while" => Tok::While,
+                    "struct" => Tok::Struct,
+                    "mutable" => Tok::Mutable,
                     w => Tok::Ident(w.to_string()),
                 });
             }
@@ -219,13 +238,21 @@ enum Expr {
     Float(f64),
     Var(String),
     Bin(BinOp, Box<Expr>, Box<Expr>),
+    /// `Name(args...)` — a struct constructor call.
+    Call(String, Vec<Expr>),
+    /// `base.field` — field access.
+    Field(Box<Expr>, String),
 }
 
 enum SrcStmt {
     Assign(String, Expr),
+    /// `var.field = expr` (`setfield!`).
+    FieldAssign(String, String, Expr),
     Expr(Expr),
     If(Expr, Vec<SrcStmt>, Vec<SrcStmt>),
     While(Expr, Vec<SrcStmt>),
+    /// `[mutable] struct Name; field[::Type]...; end`.
+    StructDef { name: String, mutabl: bool, fields: Vec<(String, Option<String>)> },
 }
 
 // --- parser -----------------------------------------------------------------
@@ -284,6 +311,30 @@ impl Parser {
 
     fn parse_stmt(&mut self) -> Result<SrcStmt, String> {
         match self.peek().clone() {
+            Tok::Struct => {
+                self.next();
+                self.parse_struct(false)
+            }
+            Tok::Mutable => {
+                self.next();
+                self.expect(&Tok::Struct)?;
+                self.parse_struct(true)
+            }
+            // `var.field = expr` — setfield! on a variable's field.
+            Tok::Ident(name)
+                if self.toks.get(self.pos + 1) == Some(&Tok::Dot)
+                    && matches!(self.toks.get(self.pos + 2), Some(Tok::Ident(_)))
+                    && self.toks.get(self.pos + 3) == Some(&Tok::Assign) =>
+            {
+                self.next(); // var
+                self.next(); // `.`
+                let field = match self.next() {
+                    Tok::Ident(f) => f,
+                    _ => unreachable!(),
+                };
+                self.next(); // `=`
+                Ok(SrcStmt::FieldAssign(name, field, self.parse_expr()?))
+            }
             Tok::While => {
                 self.next();
                 let cond = self.parse_expr()?;
@@ -404,11 +455,49 @@ impl Parser {
         Ok(lhs)
     }
 
+    /// An atom with its postfix forms: `Name(args...)` and `.field` chains.
     fn parse_atom(&mut self) -> Result<Expr, String> {
+        let mut e = self.parse_primary()?;
+        loop {
+            match self.peek() {
+                Tok::Dot => {
+                    self.next();
+                    match self.next() {
+                        Tok::Ident(f) => e = Expr::Field(Box::new(e), f),
+                        t => return Err(format!("expected field name after `.`, found {:?}", t)),
+                    }
+                }
+                _ => break,
+            }
+        }
+        Ok(e)
+    }
+
+    fn parse_primary(&mut self) -> Result<Expr, String> {
         match self.next() {
             Tok::Int(n) => Ok(Expr::Int(n)),
             Tok::Float(f) => Ok(Expr::Float(f)),
-            Tok::Ident(s) => Ok(Expr::Var(s)),
+            Tok::Ident(s) => {
+                if *self.peek() == Tok::LParen {
+                    self.next(); // `(`
+                    let mut args = Vec::new();
+                    if *self.peek() == Tok::RParen {
+                        self.next();
+                    } else {
+                        loop {
+                            args.push(self.parse_expr()?);
+                            match self.next() {
+                                Tok::Comma => continue,
+                                Tok::RParen => break,
+                                t => return Err(format!("expected `,` or `)`, found {:?}", t)),
+                            }
+                        }
+                    }
+                    Ok(Expr::Call(s, args))
+                } else {
+                    Ok(Expr::Var(s))
+                }
+            }
             Tok::LParen => {
                 let e = self.parse_expr()?;
                 self.expect(&Tok::RParen)?;
@@ -417,6 +506,39 @@ impl Parser {
             Tok::Minus => Ok(Expr::Bin(BinOp::Sub, Box::new(Expr::Int(0)), Box::new(self.parse_atom()?))),
             t => Err(format!("unexpected token {:?}", t)),
         }
+    }
+
+    /// Field declarations up to `end`; `struct`/`mutable struct` is consumed.
+    fn parse_struct(&mut self, mutabl: bool) -> Result<SrcStmt, String> {
+        let name = match self.next() {
+            Tok::Ident(s) => s,
+            t => return Err(format!("expected struct name, found {:?}", t)),
+        };
+        let mut fields = Vec::new();
+        loop {
+            self.skip_seps();
+            match self.peek().clone() {
+                Tok::End => {
+                    self.next();
+                    break;
+                }
+                Tok::Ident(fname) => {
+                    self.next();
+                    let fty = if *self.peek() == Tok::ColonColon {
+                        self.next();
+                        match self.next() {
+                            Tok::Ident(tn) => Some(tn),
+                            t => return Err(format!("expected field type, found {:?}", t)),
+                        }
+                    } else {
+                        None
+                    };
+                    fields.push((fname, fty));
+                }
+                t => return Err(format!("expected field or `end` in struct, found {:?}", t)),
+            }
+        }
+        Ok(SrcStmt::StructDef { name, mutabl, fields })
     }
 }
 
@@ -467,45 +589,62 @@ impl Lower {
         self.code.len() - 1
     }
 
-    fn lower_expr(&mut self, e: &Expr) -> Op {
-        match e {
+    fn lower_expr(&mut self, e: &Expr) -> Result<Op, String> {
+        Ok(match e {
             Expr::Int(n) => Op::Int(*n),
             Expr::Float(f) => Op::Float(*f),
             Expr::Var(s) => Op::Slot(self.slot(s)),
             Expr::Bin(op, l, r) => {
-                let lo = self.lower_expr(l);
-                let ro = self.lower_expr(r);
+                let lo = self.lower_expr(l)?;
+                let ro = self.lower_expr(r)?;
                 let (b, swap) = binop(*op);
                 let (a0, a1) = if swap { (ro, lo) } else { (lo, ro) };
                 Op::Ssa(self.emit(Stmt::Call(b, vec![a0, a1])))
             }
-        }
+            Expr::Call(name, args) => {
+                let t = resolve_type(name)?;
+                let ops = args.iter().map(|a| self.lower_expr(a)).collect::<Result<Vec<_>, _>>()?;
+                Op::Ssa(self.emit(Stmt::New(t, ops)))
+            }
+            Expr::Field(base, fname) => {
+                let b = self.lower_expr(base)?;
+                let sym = crate::symbol::intern(crate::types::builtin(crate::types::id::SYMBOL), fname);
+                Op::Ssa(self.emit(Stmt::GetField(b, sym)))
+            }
+        })
     }
 
-    fn lower_block(&mut self, stmts: &[SrcStmt]) -> Option<Op> {
+    fn lower_block(&mut self, stmts: &[SrcStmt]) -> Result<Option<Op>, String> {
         let mut last = None;
         for s in stmts {
-            last = self.lower_stmt(s);
+            last = self.lower_stmt(s)?;
         }
-        last
+        Ok(last)
     }
 
-    fn lower_stmt(&mut self, s: &SrcStmt) -> Option<Op> {
-        match s {
+    fn lower_stmt(&mut self, s: &SrcStmt) -> Result<Option<Op>, String> {
+        Ok(match s {
             SrcStmt::Assign(name, e) => {
-                let op = self.lower_expr(e);
+                let op = self.lower_expr(e)?;
                 let slot = self.slot(name);
                 self.emit(Stmt::Assign(slot, op));
                 Some(Op::Slot(slot))
             }
-            SrcStmt::Expr(e) => Some(self.lower_expr(e)),
+            SrcStmt::FieldAssign(var, field, e) => {
+                let rhs = self.lower_expr(e)?;
+                let obj = Op::Slot(self.slot(var));
+                let sym = crate::symbol::intern(crate::types::builtin(crate::types::id::SYMBOL), field);
+                self.emit(Stmt::SetField(obj, sym, rhs));
+                Some(rhs)
+            }
+            SrcStmt::Expr(e) => Some(self.lower_expr(e)?),
             SrcStmt::If(cond, then, els) => {
-                let c = self.lower_expr(cond);
+                let c = self.lower_expr(cond)?;
                 let gif = self.emit(Stmt::GotoIfNot(c, 0));
-                self.lower_block(then);
+                self.lower_block(then)?;
                 let gend = self.emit(Stmt::Goto(0));
                 let else_start = self.code.len();
-                self.lower_block(els);
+                self.lower_block(els)?;
                 let end = self.code.len();
                 self.patch(gif, else_start);
                 self.patch(gend, end);
@@ -513,15 +652,31 @@ impl Lower {
             }
             SrcStmt::While(cond, body) => {
                 let start = self.code.len();
-                let c = self.lower_expr(cond);
+                let c = self.lower_expr(cond)?;
                 let gif = self.emit(Stmt::GotoIfNot(c, 0));
-                self.lower_block(body);
+                self.lower_block(body)?;
                 self.emit(Stmt::Goto(start));
                 let end = self.code.len();
                 self.patch(gif, end);
                 None
             }
-        }
+            // A struct definition is a lowering-time side effect (a top-level
+            // form); it contributes no IR and its value is not an expression.
+            SrcStmt::StructDef { name, mutabl, fields } => {
+                let resolved = fields
+                    .iter()
+                    .map(|(fname, ftyname)| {
+                        let ft = match ftyname {
+                            Some(tn) => resolve_type(tn)?,
+                            None => crate::types::builtin(crate::types::id::ANY),
+                        };
+                        Ok((fname.as_str(), ft))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                crate::types::define_struct_from_source(name, &resolved, *mutabl)?;
+                None
+            }
+        })
     }
 
     fn patch(&mut self, idx: usize, target: usize) {
@@ -532,19 +687,53 @@ impl Lower {
     }
 }
 
-fn lower_program(stmts: &[SrcStmt]) -> Body {
+fn lower_program(stmts: &[SrcStmt]) -> Result<Body, String> {
     let mut l = Lower {
         code: Vec::new(),
         slots: HashMap::new(),
         nslots: 0,
     };
-    let last = l.lower_block(stmts);
+    let last = l.lower_block(stmts)?;
     let ret = last.unwrap_or(Op::Int(0));
     l.emit(Stmt::Return(ret));
-    Body {
+    Ok(Body {
         nslots: l.nslots,
         code: l.code,
-    }
+    })
+}
+
+/// Resolve a type name from source: the builtin tower by name, then the
+/// source-defined struct registry.
+fn resolve_type(name: &str) -> Result<crate::region::Offset, String> {
+    use crate::types::id as tid;
+    let i = match name {
+        "Any" => tid::ANY,
+        "Number" => tid::NUMBER,
+        "Real" => tid::REAL,
+        "Integer" => tid::INTEGER,
+        "Signed" => tid::SIGNED,
+        "Unsigned" => tid::UNSIGNED,
+        "AbstractFloat" => tid::ABSTRACTFLOAT,
+        "Bool" => tid::BOOL,
+        "Int8" => tid::INT8,
+        "Int16" => tid::INT16,
+        "Int32" => tid::INT32,
+        "Int64" | "Int" => tid::INT64,
+        "UInt8" => tid::UINT8,
+        "UInt16" => tid::UINT16,
+        "UInt32" => tid::UINT32,
+        "UInt64" => tid::UINT64,
+        "Float32" => tid::FLOAT32,
+        "Float64" => tid::FLOAT64,
+        "Char" => tid::CHAR,
+        "Nothing" => tid::NOTHING,
+        _ => {
+            let sym = crate::symbol::intern(crate::types::builtin(tid::SYMBOL), name);
+            return crate::types::lookup_struct(sym)
+                .ok_or_else(|| format!("UndefVarError: `{}` not defined", name));
+        }
+    };
+    Ok(crate::types::builtin(i))
 }
 
 /// Parse, lower, and evaluate a Julia source string, returning its value.
@@ -552,5 +741,5 @@ pub fn eval_source(src: &str) -> Result<Value, String> {
     let toks = lex(src)?;
     let mut parser = Parser { toks, pos: 0 };
     let program = parser.parse_program()?;
-    interp::eval(&lower_program(&program))
+    interp::eval(&lower_program(&program)?)
 }

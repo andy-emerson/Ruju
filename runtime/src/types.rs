@@ -240,6 +240,7 @@ const TABLE: &[(u32, &str, u32, u32, u32)] = &[
 /// after [`region::init`](crate::region::init) and before any value is boxed.
 pub fn bootstrap() {
     symbol::reset();
+    reset_structs();
     let mut types = [NULL; id::COUNT];
 
     // 1. Allocate the bootstrap type objects; their bodies are patched once
@@ -784,6 +785,67 @@ pub fn unionall_var(u: Offset) -> Offset {
 /// A `UnionAll`'s body type.
 pub fn unionall_body(u: Offset) -> Offset {
     read_ref(u, 4)
+}
+
+// --- source-defined struct registry -------------------------------------------
+//
+// Struct types defined from source are reachable from nowhere until their
+// first instance exists, so the registry roots them (the collector visits it)
+// and gives the front-end name → type lookup. A REPL session re-evaluating
+// its accumulated source reuses the identical definition, keeping type
+// identity stable across entries.
+
+struct StructRegistry(core::cell::UnsafeCell<Vec<(Offset, Offset)>>);
+// Sound only because the runtime is single-threaded under wasm32 for now.
+unsafe impl Sync for StructRegistry {}
+static STRUCTS: StructRegistry = StructRegistry(core::cell::UnsafeCell::new(Vec::new()));
+
+fn structs() -> &'static mut Vec<(Offset, Offset)> {
+    unsafe { &mut *STRUCTS.0.get() }
+}
+
+/// Clear the registry (offsets into a region that is being reset).
+fn reset_structs() {
+    structs().clear();
+}
+
+/// Visit every registered struct type; the collector roots them.
+pub fn each_registered_struct(mut f: impl FnMut(Offset)) {
+    for &(_, t) in structs().iter() {
+        f(t);
+    }
+}
+
+/// The registered struct type named `name_sym`, or `None`.
+pub fn lookup_struct(name_sym: Offset) -> Option<Offset> {
+    structs().iter().rev().find(|&&(n, _)| n == name_sym).map(|&(_, t)| t)
+}
+
+/// Define a struct from source. An *identical* existing definition is reused;
+/// a different one under the same name is an error, as in Julia.
+pub fn define_struct_from_source(
+    name: &str,
+    fields: &[(&str, Offset)],
+    mutabl: bool,
+) -> Result<Offset, String> {
+    let b = builtins();
+    let name_sym = symbol::intern(b.types[id::SYMBOL as usize], name);
+    if let Some(t) = lookup_struct(name_sym) {
+        let names = field_names(t);
+        let same = is_mutable(t) == mutabl
+            && nfields_of(t) == fields.len() as u32
+            && fields.iter().enumerate().all(|(i, &(fname, ft))| {
+                svec_ref(names, i as u32) == symbol::intern(b.types[id::SYMBOL as usize], fname)
+                    && field_type(t, i as u32) == ft
+            });
+        if same {
+            return Ok(t);
+        }
+        return Err(format!("invalid redefinition of constant {}", name));
+    }
+    let t = define_struct(name, b.types[id::ANY as usize], fields, mutabl);
+    structs().push((name_sym, t));
+    Ok(t)
 }
 
 // --- subtyping --------------------------------------------------------------

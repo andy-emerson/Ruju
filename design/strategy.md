@@ -94,7 +94,7 @@ flowchart TD
     FE0["bootstrap front-end [done: subset]"]
 
     EGAL["egal & === [done: phase-0 subset]"]
-    STRUCTS("struct support (frontier: runtime core done, surface syntax next)")
+    STRUCTS["struct support [done: phase-0 subset]"]
     INTRIN["intrinsics & boxing breadth [done: phase-0 subset]"]
     GCX("GC exactness & tuning (frontier)")
     SUBX("subtype hardening (frontier)")
@@ -104,8 +104,8 @@ flowchart TD
     MORESPEC{"type_morespecific"}
     VARARG{"varargs & Type{T} kinds"}
     DISPX{"dispatch hardening: cache, ambiguity, MethodError"}
-    ARRAYS{"arrays & GenericMemory"}
-    MODULES{"modules & bindings, toplevel"}
+    ARRAYS("arrays & GenericMemory (frontier)")
+    MODULES("modules & bindings, toplevel (frontier)")
     LOWER{"real lowering: JuliaSyntax/JuliaLowering"}
     AOT{"phase-1 AOT backend"}
     BASE{"base/ & stdlib/ AOT-compiled"}
@@ -145,7 +145,8 @@ Unblocked now, in no required order — pick by the selection principles below.
 
 | Increment | What it is | What it unblocks |
 | - | - | - |
-| **struct support** | slice 1 (runtime core: field layout, `new`/`getfield`/`setfield!`) is done; slice 2 remains: `struct` syntax, constructor calls, and `p.x` in the front-end + interpreter | arrays, modules, real `base/` code — the widest gate on the map |
+| **arrays & GenericMemory** | `GenericMemory`/`Array` (`genericmemory.c`, `array.c`): the buffer type, `arrayref`/`arrayset`, length, growth | most real Julia programs; `base/` code |
+| **modules & bindings** | `module.c`/`toplevel.c`: globals, bindings, top-level eval beyond expressions | `base/` code; method definitions from source |
 | **GC exactness & tuning** | write-barrier exact condition + `queue_root` re-tag, promotion age, heap-target trigger, full-vs-quick (audit findings 17–19) | phase-1 AOT (GC must be trustworthy under real load) |
 | **subtype hardening** | remaining audit divergences: the global union-decision machine (heals the oracle's known divergence), union-split priority order, cross-var `concrete` propagation, `Intersect`/`Loffset` from the newer pin | intersection, then `type_morespecific`, then dispatch hardening |
 | **exceptions** | `enter`/`leave` in the interpreter (`interpreter.c`), error throwing (`rtutils.c`) | real lowering; `base/` code throws |

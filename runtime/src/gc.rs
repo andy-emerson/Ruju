@@ -290,6 +290,7 @@ fn push_roots(work: &mut Vec<Value>) {
     work.push(Value(b.box_typename)); // demo parametric constructor
     crate::symbol::each_interned(|s| work.push(Value(s))); // symbols are immortal
     crate::dispatch::each_sig(|s| work.push(Value(s))); // method signatures
+    crate::types::each_registered_struct(|t| work.push(Value(t))); // source-defined types
 }
 
 /// Push the objects that `v` references onto the work list.

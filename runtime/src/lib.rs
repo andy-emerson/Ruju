@@ -1275,6 +1275,45 @@ mod tests {
         assert_eq!(gc::root_count(), 0, "roots balanced");
     }
 
+    // Struct slice 2: `struct` syntax, constructor calls, and field access
+    // from real Julia source through the front-end and interpreter.
+    #[test]
+    fn frontend_runs_struct_source() {
+        let _g = serial();
+        rj_init();
+        let run = |s: &str| unbox_int(frontend::eval_source(s).unwrap());
+        let runf = |s: &str| value::unbox_float64(frontend::eval_source(s).unwrap());
+
+        // Immutable struct: typed fields inline; construct and read.
+        assert_eq!(
+            run("struct Point\nx::Int64\ny::Int64\nend\np = Point(3, 4)\np.x * p.x + p.y * p.y"),
+            25
+        );
+        // Mutable struct: field assignment, used in a loop.
+        assert_eq!(
+            run("mutable struct Counter\nn::Int64\nend\nc = Counter(0)\ni = 1\nwhile i <= 10\nc.n = c.n + i\ni = i + 1\nend\nc.n"),
+            55
+        );
+        // Untyped fields are Any (boxed references); floats flow through.
+        assert_eq!(runf("mutable struct Box2\nv\nend\nb = Box2(1.5)\nb.v = b.v * 2.0\nb.v"), 3.0);
+        // Nested structs and chained field access.
+        assert_eq!(
+            run("struct Inner\nk::Int64\nend\nstruct Outer\ni::Inner\nend\no = Outer(Inner(42))\no.i.k"),
+            42
+        );
+        // Redefinition with identical shape is reuse; different shape errors.
+        assert_eq!(run("struct Pt2\na::Int64\nend\nstruct Pt2\na::Int64\nend\nPt2(7).a"), 7);
+        assert!(frontend::eval_source("struct Pt3\na::Int64\nend\nstruct Pt3\nb::Int64\nend").is_err());
+        // setfield! on an immutable struct errors; unknown fields error.
+        assert!(frontend::eval_source("struct Frozen\nv::Int64\nend\nf = Frozen(1)\nf.v = 2").is_err());
+        assert!(frontend::eval_source("struct One\na::Int64\nend\nOne(1).b").is_err());
+        // Construction type-checks against declared field types.
+        assert!(frontend::eval_source("struct TypedF\na::Int64\nend\nTypedF(1.5)").is_err());
+        // === on struct values is identity (compare_fields not yet ported).
+        let runb = |s: &str| value::unbox_bool(frontend::eval_source(s).unwrap());
+        assert!(runb("mutable struct MRef\nv::Int64\nend\nm = MRef(1)\nm === m"));
+    }
+
     // The remaining primitive boxings round-trip, carry their type, and egal
     // by bits within a width but never across types.
     #[test]

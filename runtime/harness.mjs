@@ -200,6 +200,17 @@ check("source: -8 >> 1", evalJulia("-8 >> 1"), -4n);
 check("source: 1 << 62", evalJulia("1 << 62"), 4611686018427387904n);
 check("source: 6 ⊻ 3", evalJulia("6 ⊻ 3"), 5n);
 check("source: 1 ÷ 0 is DivideError (reads 0)", evalJulia("1 ÷ 0"), 0n);
+// Structs from source: definition, construction, field access, mutation.
+check(
+  "source: struct Point; p.x*p.x + p.y*p.y",
+  evalJulia("struct Point\nx::Int64\ny::Int64\nend\np = Point(3, 4)\np.x * p.x + p.y * p.y"),
+  25n,
+);
+check(
+  "source: mutable struct counter loop",
+  evalJulia("mutable struct C\nn::Int64\nend\nc = C(0)\ni = 1\nwhile i <= 10\nc.n = c.n + i\ni = i + 1\nend\nc.n"),
+  55n,
+);
 // Float64 source (result read as a double).
 function evalJuliaF64(src) {
   const bytes = new TextEncoder().encode(src);

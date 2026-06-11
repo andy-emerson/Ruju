@@ -409,7 +409,7 @@ loop and the slots-then-SSA-values single-frame layout match the C exactly
 | Operands (SSA / slot / const) | Done | Faithful | — |
 | Phi / phic / upsilon | Planned | Faithful | SSA-form nodes |
 | Exception handling (`enter`/`leave`) | Planned | Faithful | — |
-| `:new` / `getfield` / `setfield!` / globals / closures | Planned | Faithful | — |
+| `:new` / `getfield` / `setfield!` / globals / closures | Partial | Faithful | `New`/`GetField`/`SetField` statements over the slice-1 runtime core (structs 2026-06); field resolution by interned symbol at run time; globals and closures still Planned |
 | IR source | Partial | **Divergence** | hand-built Rust IR via a Rust front-end; faithful path is heap `CodeInfo` from `JuliaLowering` |
 
 ## Builtins — `builtins.c` vs `builtins.rs`

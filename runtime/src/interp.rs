@@ -78,6 +78,13 @@ pub enum Stmt {
     GotoIfNot(Op, usize),
     /// return `op`
     Return(Op),
+    /// `ssa[i] = new(type, args...)` — construct a struct instance
+    /// (`jl_new_structv`; the type offset is rooted via the struct registry).
+    New(crate::region::Offset, Vec<Op>),
+    /// `ssa[i] = getfield(op, name)` — field read by interned symbol.
+    GetField(Op, crate::region::Offset),
+    /// `setfield!(obj, name, rhs)`; the statement's value is `rhs`.
+    SetField(Op, crate::region::Offset, Op),
 }
 
 /// A lowered method body: its statements and its number of local slots. For a
@@ -216,6 +223,43 @@ pub fn eval_with_args(body: &Body, args: &[Value]) -> Result<Value, String> {
                 let result = dispatch::invoke(*func, &vals); // args stay rooted via argf
                 drop(argf);
                 frame.set(ssa_base + ip, result?);
+            }
+            Stmt::New(ty, args) => {
+                let argf = Frame::new(args.len());
+                for (j, op) in args.iter().enumerate() {
+                    argf.set(j, read_op(*op, &frame, ssa_base));
+                }
+                let vals: Vec<Value> = (0..args.len()).map(|j| argf.get(j)).collect();
+                let result = types::new_struct(*ty, &vals); // args stay rooted via argf
+                drop(argf);
+                frame.set(ssa_base + ip, result?);
+            }
+            Stmt::GetField(op, name_sym) => {
+                let v = read_op(*op, &frame, ssa_base);
+                let t = object::type_of(v);
+                let i = types::field_index(t, *name_sym).ok_or_else(|| {
+                    format!(
+                        "type {} has no field {}",
+                        crate::symbol::as_str(types::type_sym(t)),
+                        crate::symbol::as_str(*name_sym)
+                    )
+                })?;
+                let r = types::get_nth_field(v, i)?;
+                frame.set(ssa_base + ip, r);
+            }
+            Stmt::SetField(obj, name_sym, rhs) => {
+                let v = read_op(*obj, &frame, ssa_base);
+                let r = read_op(*rhs, &frame, ssa_base);
+                let t = object::type_of(v);
+                let i = types::field_index(t, *name_sym).ok_or_else(|| {
+                    format!(
+                        "type {} has no field {}",
+                        crate::symbol::as_str(types::type_sym(t)),
+                        crate::symbol::as_str(*name_sym)
+                    )
+                })?;
+                types::set_nth_field(v, i, r)?;
+                frame.set(ssa_base + ip, r);
             }
         }
         ip += 1;

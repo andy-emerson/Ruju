@@ -9,7 +9,8 @@
 // Supported subset (the bootstrap front-end, runtime/src/frontend.rs):
 // integer and float literals, variables, assignment, arithmetic
 // (`+ - * / ÷ %`), bitwise (`& | ⊻ << >> >>>`), comparisons (`< <= > >= ==`
-// and `===`), `if`/`elseif`/`else`/`end`, and `while`. `/` yields Float64,
+// and `===`), `if`/`elseif`/`else`/`end`, `while`, and `struct`/`mutable
+// struct` with constructor calls and `p.x` field access. `/` yields Float64,
 // as in Julia. The value of the session is its last expression.
 //
 // Honest limitations of this tool (not the runtime):
@@ -63,7 +64,7 @@ function show(r) {
 function openBlocks(src) {
   let n = 0;
   for (const tok of src.split(/[^A-Za-z_]+/)) {
-    if (tok === "if" || tok === "while") n++;
+    if (tok === "if" || tok === "while" || tok === "struct") n++;
     else if (tok === "end") n--;
   }
   return n;
@@ -78,7 +79,8 @@ if (arg) {
 
 console.log("Ruju REPL — Julia source via rj_eval (subset: literals, variables,");
 console.log("+ - * / ÷ %, & | ⊻ << >> >>>, comparisons incl. ===, if/elseif/else,");
-console.log("while). :reset clears the session, :quit exits.\n");
+console.log("while, struct/mutable struct with Point(1,2) and p.x). :reset clears");
+console.log("the session, :quit exits.\n");
 
 let session = ""; // accumulated source: how variables persist across lines
 let pending = ""; // multi-line entry in progress
