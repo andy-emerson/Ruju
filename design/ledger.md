@@ -30,11 +30,11 @@ departure *beyond* them.
 | Piece | Status | Fidelity | Notes (Julia → ours) |
 | - | - | - | - |
 | Tagged header (tag-before-object, GC bits) | Done | Faithful | `jl_taggedvalue_t` |
-| `DataType` struct | Partial | Faithful | ~6 of `jl_datatype_t`'s ~17 fields |
+| `DataType` struct | Partial | Faithful | ~7 of `jl_datatype_t`'s ~17 fields (incl. `instance`) |
 | Field layout | Partial | Faithful | pointer bitmap only; no field-type/offset table |
-| Boxing | Partial | Faithful | `Int64`/`Bool`/`Float64`; no small-int cache; `Bool` boxes are freshly allocated, not the `jl_true`/`jl_false` singletons (identity gap, observable once `===` exists); other primitives later |
+| Boxing | Partial | Faithful | `Int64`/`Bool`/`Float64`; `Bool` boxes are the `jl_true`/`jl_false` permboxes (fixed, audit 2026-06); no small-int cache; other primitives later |
 | `SimpleVector` | Done | Faithful | `jl_svec_t` |
-| Singletons | Partial | Faithful | tracked outside the type; no `instance` field |
+| Singletons | Done | Faithful | `jl_datatype_t.instance`: `nothing` lives in `Nothing.instance`; zero-size pointer-free structs get an eager instance (`jl_compute_field_offsets`) |
 
 ## Type system — `jltypes.c`, `datatype.c`
 
@@ -45,7 +45,7 @@ departure *beyond* them.
 | `TypeName` | Partial | Faithful | name + cache; missing module/wrapper/names/hash |
 | `apply_type` instantiation | Partial | Faithful | tuples + parametrics; no `UnionAll` instantiation |
 | Uniquing (hash-consing) | Partial | Faithful | on `TypeName`; linear scan vs sorted/hashed |
-| `Union` | Partial | Faithful | normalized (`jl_type_union`): flatten, subtype-dedup, canonical sort; sort misses `union_sort_cmp`'s singleton/isbits tiers; dedup uses full `issubtype` vs the C's typevar-aware `simple_subtype`; type `===` needs structural `jl_types_egal` (Julia does **not** intern unions); no `Vararg` merge |
+| `Union` | Partial | Faithful | normalized (`jl_type_union`): flatten, subtype-dedup, canonical sort with `union_sort_cmp`'s singleton/isbits tiers (fixed, audit 2026-06); dedup uses full `issubtype` vs the C's typevar-aware `simple_subtype`; type `===` needs structural `jl_types_egal` (Julia does **not** intern unions); no `Vararg` merge |
 | `Bottom` | Partial | Faithful | a `DataType`; Julia uses a `TypeofBottom` instance |
 | `UnionAll` / `TypeVar` | Partial | Faithful | `jl_unionall_t`/`jl_tvar_t` objects (var + bounds + body); no `where`-var renaming/aliasing or `innervars` |
 | `Type{T}` kinds | Planned | Faithful | — |

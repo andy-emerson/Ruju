@@ -786,6 +786,46 @@ mod tests {
         assert_eq!(gc::root_count(), 0, "roots balanced after union normalization");
     }
 
+    // jl_datatype_t.instance, the Bool permboxes, and union_sort_cmp's tiers.
+    #[test]
+    fn singletons_and_bool_permboxes() {
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+
+        // `nothing` is Nothing's `instance`; Nothing is a singleton type, Bool
+        // and Integer are not.
+        assert_eq!(types::nothing_instance(), types::instance_of(t(id::NOTHING)));
+        assert!(types::is_datatype_singleton(t(id::NOTHING)));
+        assert!(!types::is_datatype_singleton(t(id::BOOL)));
+        assert!(!types::is_datatype_singleton(t(id::INTEGER)));
+
+        // jl_box_bool: boxing returns the jl_true/jl_false permboxes — the
+        // same object every time, never a fresh allocation.
+        assert_eq!(value::box_bool(true), value::box_bool(true));
+        assert_eq!(value::box_bool(false), value::box_bool(false));
+        assert_ne!(value::box_bool(true), value::box_bool(false));
+        assert!(value::unbox_bool(value::box_bool(true)));
+        assert!(!value::unbox_bool(value::box_bool(false)));
+        assert_eq!(type_of(value::box_bool(true)), t(id::BOOL));
+
+        // A zero-size, pointer-free struct is a singleton with an eager instance.
+        let unit = types::define_struct("UnitLike", t(id::ANY), 0, &[]);
+        assert!(types::is_datatype_singleton(unit));
+        assert_eq!(type_of(object::Value(types::instance_of(unit))), unit);
+
+        // union_sort_cmp tiers: the singleton Nothing sorts before the isbits
+        // Int64 (alphabetically Int64 < Nothing — only the tier explains this
+        // order), and isbits Int64 sorts before the non-isbits Box{Int64}.
+        let u = types::union_type(t(id::INT64), t(id::NOTHING));
+        assert_eq!(types::union_a(u), t(id::NOTHING));
+        assert_eq!(types::union_b(u), t(id::INT64));
+        let v = types::union_type(types::box_type(t(id::INT64)), t(id::INT64));
+        assert_eq!(types::union_a(v), t(id::INT64));
+
+        assert_eq!(gc::root_count(), 0, "roots balanced");
+    }
+
     // The `where` machinery (UnionAll/TypeVar) and the environment-based
     // subtype algorithm: a variable bound on the right is existential (∃), on
     // the left universal (∀), exactly as in subtype.c's `subtype_unionall`.

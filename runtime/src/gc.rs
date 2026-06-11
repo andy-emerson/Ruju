@@ -281,7 +281,10 @@ fn push_roots(work: &mut Vec<Value>) {
     for &t in b.types.iter() {
         work.push(Value(t));
     }
-    work.push(Value(b.nothing_instance));
+    // `nothing` is reached through `Nothing.instance` (traced via the DataType
+    // bitmap); the Bool permboxes are reachable only through `Builtins`.
+    work.push(Value(b.true_instance));
+    work.push(Value(b.false_instance));
     work.push(Value(b.tuple_typename)); // shared across all tuple types
     work.push(Value(b.box_typename)); // demo parametric constructor
     crate::symbol::each_interned(|s| work.push(Value(s))); // symbols are immortal

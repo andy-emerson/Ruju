@@ -21,7 +21,8 @@ use crate::symbol;
 
 /// The body of a DataType object: a reduced `jl_datatype_t` with an inlined
 /// reference to its layout. Field byte offsets must stay in sync with the GC
-/// pointer bitmap built for `DataType` in [`bootstrap`] (name@0, super@4).
+/// pointer bitmap built for `DataType` in [`bootstrap`]
+/// (name@0, super@4, parameters@8, instance@12).
 #[repr(C)]
 pub struct DataType {
     /// The type's name (a `TypeName` reference, `jl_typename_t`).
@@ -31,6 +32,9 @@ pub struct DataType {
     /// Type parameters (a `SimpleVector` reference, or `NULL` for non-parametric
     /// types). For tuple types these are the element types.
     pub parameters: Offset,
+    /// The singleton instance for singleton types (`jl_datatype_t.instance`),
+    /// or `NULL`. `Nothing`'s instance is `nothing`.
+    pub instance: Offset,
     /// Raw layout metadata (offset, or `NULL`): the embedded-pointer bitmap.
     pub layout: Offset,
     /// Size in bytes of an instance's data (`layout->size`).
@@ -85,11 +89,14 @@ pub mod id {
     pub const COUNT: usize = 32;
 }
 
-/// Offsets of the bootstrapped core types and the `nothing` singleton.
+/// Offsets of the bootstrapped core types and the immortal value permboxes.
 #[derive(Clone, Copy)]
 pub struct Builtins {
     pub types: [Offset; id::COUNT],
-    pub nothing_instance: Offset,
+    /// The `true` permbox (`jl_true`): the value every `Bool`-true box shares.
+    pub true_instance: Offset,
+    /// The `false` permbox (`jl_false`).
+    pub false_instance: Offset,
     /// The `TypeName` shared by every tuple type (`jl_tuple_typename`).
     pub tuple_typename: Offset,
     /// The `TypeName` of the demo parametric constructor `Box{T}` (invariant).
@@ -118,9 +125,9 @@ pub fn builtin(type_id: u32) -> Offset {
     builtins().types[type_id as usize]
 }
 
-/// Region offset of the `nothing` singleton value.
+/// Region offset of the `nothing` singleton value (`Nothing`'s `instance`).
 pub fn nothing_instance() -> Offset {
-    builtins().nothing_instance
+    instance_of(builtin(id::NOTHING))
 }
 
 // --- DataType body access ---------------------------------------------------
@@ -144,11 +151,32 @@ fn write_dt(
         (*p).name = name;
         (*p).super_ = super_;
         (*p).parameters = parameters;
+        (*p).instance = NULL;
         (*p).layout = layout;
         (*p).size = size;
         (*p).nfields = 0;
         (*p).flags = flags;
     }
+}
+
+/// Byte offset of the `instance` field within a DataType body (see the GC
+/// pointer bitmap in [`bootstrap`]).
+const DT_INSTANCE: u32 = 12;
+
+/// The singleton instance of `t` (`jl_datatype_t.instance`), or `NULL`.
+pub fn instance_of(t: Offset) -> Offset {
+    unsafe { (*dt(t)).instance }
+}
+
+/// Set `t`'s singleton instance (through the write barrier — `t` may be old).
+fn set_instance(t: Offset, inst: Offset) {
+    object::set_ref(object::Value(t), DT_INSTANCE, object::Value(inst));
+}
+
+/// Whether `t` is a singleton type (`jl_is_datatype_singleton`): a DataType
+/// with an `instance`.
+pub fn is_datatype_singleton(t: Offset) -> bool {
+    is_datatype(t) && instance_of(t) != NULL
 }
 
 /// Allocate a raw (untagged) layout: `npointers` followed by their byte offsets
@@ -230,8 +258,9 @@ pub fn bootstrap() {
     let tn = |s: &str| make_typename(typename, sym(s));
 
     // 3. Patch the bootstrap bodies. DataType instances embed name@0, super@4,
-    //    parameters@8; TypeName instances embed name@0 (Symbol) and cache@4.
-    write_dt(datatype, tn("DataType"), any, NULL, make_layout(&[0, 4, 8]), DT_SIZE as u32, 0);
+    //    parameters@8, instance@12; TypeName instances embed name@0 (Symbol)
+    //    and cache@4.
+    write_dt(datatype, tn("DataType"), any, NULL, make_layout(&[0, 4, 8, 12]), DT_SIZE as u32, 0);
     write_dt(symbol, tn("Symbol"), any, NULL, NULL, 0, 0);
     write_dt(typename, tn("TypeName"), any, NULL, make_layout(&[0, 4]), 8, 0);
     write_dt(any, tn("Any"), any, NULL, NULL, 0, FLAG_ABSTRACT);
@@ -262,12 +291,29 @@ pub fn bootstrap() {
     let tuple_typename = tn("Tuple");
     let box_typename = tn("Box");
 
-    // 7. The `nothing` singleton: the sole (zero-size) instance of Nothing.
-    let nothing_instance = object::alloc(types[id::NOTHING as usize], 0).raw();
+    // 7. The `nothing` singleton: the sole (zero-size) instance of Nothing,
+    //    recorded in the type's `instance` field (jl_datatype_t.instance).
+    let nothing = object::alloc(types[id::NOTHING as usize], 0).raw();
+    set_instance(types[id::NOTHING as usize], nothing);
+
+    // 8. The `true`/`false` permboxes (`jl_true`/`jl_false`, jl_init_box_caches):
+    //    boxing a Bool returns one of these two immortal values, never a fresh
+    //    allocation. They are values of Bool, not a singleton `instance` —
+    //    Bool has two instances, so its `instance` field stays NULL.
+    let mk_bool = |b: u8| {
+        let v = object::alloc(types[id::BOOL as usize], 1);
+        unsafe {
+            *region::ptr_mut::<u8>(v.raw()) = b;
+        }
+        v.raw()
+    };
+    let false_instance = mk_bool(0);
+    let true_instance = mk_bool(1);
 
     BUILTINS.0.set(Some(Builtins {
         types,
-        nothing_instance,
+        true_instance,
+        false_instance,
         tuple_typename,
         box_typename,
     }));
@@ -539,11 +585,36 @@ fn build_union(parts: &[Offset]) -> Offset {
     acc
 }
 
-/// Canonical type ordering for union members, a faithful subset of
-/// `datatype_name_cmp` (`jltypes.c`): DataTypes before non-DataTypes, then by
-/// type-name text, parameter count, and parameters recursively. (Module
-/// qualification is absent in this single-module model.)
+/// Canonical type ordering for union members (`union_sort_cmp`, `jltypes.c`):
+/// singleton DataTypes first, then isbits DataTypes, then other DataTypes,
+/// then non-DataTypes (UnionAlls compared by their unwrapped bodies) — ties
+/// broken by [`name_cmp`].
 fn type_cmp(a: Offset, b: Offset) -> core::cmp::Ordering {
+    let (a_dt, b_dt) = (is_datatype(a), is_datatype(b));
+    if a_dt != b_dt {
+        return b_dt.cmp(&a_dt); // DataTypes sort before non-DataTypes
+    }
+    if !a_dt {
+        return name_cmp(unwrap_unionall(a), unwrap_unionall(b));
+    }
+    let (a_s, b_s) = (is_datatype_singleton(a), is_datatype_singleton(b));
+    if a_s != b_s {
+        return b_s.cmp(&a_s); // singletons first
+    }
+    if !a_s {
+        let (a_b, b_b) = (is_bits(a), is_bits(b));
+        if a_b != b_b {
+            return b_b.cmp(&a_b); // then isbits
+        }
+    }
+    name_cmp(a, b)
+}
+
+/// Tie-breaking ordering, a faithful subset of `datatype_name_cmp`
+/// (`jltypes.c`): DataTypes before non-DataTypes, then by type-name text,
+/// parameter count, and parameters recursively. (Module qualification is
+/// absent in this single-module model.)
+fn name_cmp(a: Offset, b: Offset) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     let (a_dt, b_dt) = (is_datatype(a), is_datatype(b));
     if !a_dt || !b_dt {
@@ -560,12 +631,40 @@ fn type_cmp(a: Offset, b: Offset) -> core::cmp::Ordering {
         return na.cmp(&nb);
     }
     for i in 0..na {
-        let ord = type_cmp(svec_ref(pa, i), svec_ref(pb, i));
+        let ord = name_cmp(svec_ref(pa, i), svec_ref(pb, i));
         if ord != Ordering::Equal {
             return ord;
         }
     }
     Ordering::Equal
+}
+
+/// Descend through `UnionAll` wrappers to the body (`jl_unwrap_unionall`).
+fn unwrap_unionall(mut t: Offset) -> Offset {
+    while is_unionall(t) {
+        t = unionall_body(t);
+    }
+    t
+}
+
+/// Whether instances of `t` are plain bits (`jl_isbits`, faithful subset):
+/// a concrete primitive, or a tuple all of whose element types are isbits.
+/// Parametric constructors like `Box` hold references, so they are not.
+fn is_bits(t: Offset) -> bool {
+    if !is_datatype(t) || is_abstract(t) {
+        return false;
+    }
+    if (unsafe { (*dt(t)).flags }) & FLAG_PRIMITIVE != 0 {
+        return true;
+    }
+    if is_tuple(t) {
+        let p = parameters_of(t);
+        if p == NULL {
+            return false;
+        }
+        return (0..svec_len(p)).all(|i| is_bits(svec_ref(p, i)));
+    }
+    false
 }
 
 /// Whether the value at `t` is a `Union{...}` object.
@@ -678,11 +777,21 @@ pub fn layout_ptr_offset(t: Offset, i: u32) -> u32 {
 
 /// Define a composite struct type with the given name, supertype, instance
 /// size, and embedded reference-field byte offsets (its GC pointer bitmap).
+/// A zero-size, pointer-free struct is a singleton: its sole instance is
+/// allocated eagerly into the type's `instance` field, as
+/// `jl_compute_field_offsets` does.
 #[allow(dead_code)] // used by tests and forthcoming user-defined types
 pub fn define_struct(name: &str, super_: Offset, size: u32, ptr_offsets: &[u32]) -> Offset {
     let b = builtins();
     let name_sym = symbol::intern(b.types[id::SYMBOL as usize], name);
     // Root the TypeName across the DataType allocation.
     let tname = Rooted::new(object::Value(make_typename(b.types[id::TYPENAME as usize], name_sym)));
-    new_type(b.types[id::DATATYPE as usize], tname.get().raw(), super_, size, 0, ptr_offsets)
+    let t = new_type(b.types[id::DATATYPE as usize], tname.get().raw(), super_, size, 0, ptr_offsets);
+    if size == 0 && ptr_offsets.is_empty() {
+        // Root the type across the instance allocation.
+        let t_root = Rooted::new(object::Value(t));
+        let inst = object::alloc(t, 0).raw();
+        set_instance(t_root.get().raw(), inst);
+    }
+    t
 }

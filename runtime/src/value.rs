@@ -46,17 +46,11 @@ pub fn unbox_float64(v: Value) -> f64 {
     unsafe { *object::data_ptr::<f64>(v) }
 }
 
-/// Box a `Bool` (a one-byte tagged object).
+/// Box a `Bool`: return the `true`/`false` permbox (`jl_box_bool` returns
+/// `jl_true`/`jl_false` and never allocates).
 pub fn box_bool(b: bool) -> Value {
-    let t = types::builtin(id::BOOL);
-    let v = object::alloc(t, types::size_of(t) as usize);
-    if v.is_null() {
-        return Value::NULL;
-    }
-    unsafe {
-        *object::data_ptr::<u8>(v) = b as u8;
-    }
-    v
+    let bs = types::builtins();
+    Value(if b { bs.true_instance } else { bs.false_instance })
 }
 
 /// Read the `Bool` payload of `v`. The caller guarantees `v` is a non-null
