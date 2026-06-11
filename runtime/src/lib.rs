@@ -1300,8 +1300,10 @@ mod tests {
         types::set_nth_field(c.get(), 0, x).unwrap();
         assert_eq!(gc::remset_len(), 0, "no barrier for an OLD(2) parent");
         // The next minor mark performs that scan: 2 → 3, child traced and
-        // kept. (The old machine skipped OLD parents in minor marks entirely
-        // — this child would have been freed under it.)
+        // kept. (The pre-exactness machine reached this child too, but via a
+        // conservatively over-firing any-old barrier; now the barrier stays
+        // silent and the promotion-completion scan — which it lacked — is
+        // what keeps the child alive.)
         gc::collect();
         assert_eq!(object::gc_bits(c.get()), OLD_MARKED, "promotion-completion scan");
         let x_now = types::get_nth_field(c.get(), 0).unwrap();
