@@ -6,6 +6,15 @@ is what lets the project balance new capabilities against deeper fidelity and
 absorb unexpected implementation challenges without being bottlenecked by
 them.
 
+**Contents:**
+[What this is](#what-this-is) ·
+[Key design decisions](#key-design-decisions) ·
+[Why a dependency map](#why-a-dependency-map-and-how-to-use-it) ·
+[The dependency map](#the-dependency-map) ·
+[The frontier](#the-frontier) ·
+[Selection principles](#selection-principles) ·
+[Later phases](#later-phases-blocked-in-dependency-order)
+
 ## What this is
 
 Ruju reimplements Julia's C/C++ runtime (`reference/julia/src/`) in Rust,

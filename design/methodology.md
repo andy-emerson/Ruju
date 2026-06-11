@@ -8,6 +8,13 @@ The founding observation, confirmed by every audit this project has run:
 rung above its evidence.** "Tests pass" drifts into "faithful." The process
 below exists to make that drift impossible, or failing that, visible.
 
+**Contents:**
+[The claim ladder](#the-claim-ladder) ·
+[The increment loop](#the-increment-loop) ·
+[Divergences](#divergences) ·
+[Pin discipline](#pin-discipline) ·
+[Audits](#audits)
+
 ## The claim ladder
 
 Every statement about fidelity carries a grade. A claim may never be reported

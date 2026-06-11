@@ -11,6 +11,34 @@ Rust port has begun), the status table, and the audit findings with their
 line citations. Sections for modules not yet started carry the C side alone —
 an empty right column is itself information.
 
+**Contents:**
+[How to read the status tables](#how-to-read-the-status-tables) ·
+[The shape of Julia's C runtime](#the-shape-of-julias-c-runtime) ·
+[The shape of Ruju's runtime](#the-shape-of-rujus-runtime) ·
+[Audit record](#audit-record)
+
+**Modules:**
+[Object model & values](#object-model--values--juliah-datatypec-simplevectorc-vs-objectrs-valuers) ·
+[Type system](#type-system--jltypesc-datatypec-vs-typesrs) ·
+[Subtyping](#subtyping--subtypec-vs-subtypers) ·
+[Method dispatch](#method-dispatch--gfc-typemapc-vs-dispatchrs) ·
+[Interpreter](#interpreter--interpreterc-vs-interprs) ·
+[Builtins](#builtins--builtinsc-vs-builtinsrs) ·
+[Intrinsics](#intrinsics--runtime_intrinsicsc-vs-intrinsics-crate) ·
+[Garbage collector](#garbage-collector--gc-stockc-gc-commonc-gc-pagesc-gc-stacksc-vs-gcrs-regionrs) ·
+[Symbols](#symbols--symbolc-vs-symbolrs) ·
+[Tasks & concurrency](#tasks--concurrency--taskc-threadingc-schedulerc-safepointc) ·
+[Modules & top level](#modules--top-level--modulec-toplevelc) ·
+[Runtime utilities](#runtime-utilities--rtutilsc-iddictc-idsetc-smallintsetc) ·
+[IR & methods](#ir--methods--ircodec-methodc-opaque_closurec) ·
+[Arrays & memory](#arrays--memory--arrayc-genericmemoryc) ·
+[Serialization & system image](#serialization--system-image--staticdatac-precompilec) ·
+[Init & C API](#init--c-api--initc-jlapic-jloptionsc-enginec) ·
+[Front-end](#front-end-parsing--lowering--astc-juliasyntax-julialowering-vs-frontendrs) ·
+[FFI](#ffi--runtime_ccallc) ·
+[AOT backend](#aot-backend-phase-1--replaces-removed-codegencppjitlayerscpp) ·
+[Platform & support](#platform-profiling--support--dlloadc-sysc-timingc-srcsupport)
+
 ## How to read the status tables
 
 Two independent axes per piece:
