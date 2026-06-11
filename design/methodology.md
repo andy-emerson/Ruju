@@ -89,6 +89,9 @@ reference changed, update `reference/README.md`.
 Full audits (the `implementation.md` deep pass, module by module) are
 event-driven:
 
+- at the start of each session: a quick orientation pass — the documents
+  match the code, the frontier matches reality — before any work is picked
+  up;
 - when the pin advances (touched modules);
 - before new work begins in a module that hasn't been audited since its
   last substantial change;

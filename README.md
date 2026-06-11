@@ -96,6 +96,7 @@ cargo test  -p ruju-runtime                                    # native unit tes
 cargo build -p ruju-runtime --target wasm32-unknown-unknown --release
 node runtime/harness.mjs               # wasm -> JS end-to-end checks
 node runtime/verify_julia_subtype.mjs  # subtype answers vs JuliaLang/julia
+node runtime/repl.mjs                  # interactive: type Julia at the runtime
 ```
 
 ## Contributing and license
