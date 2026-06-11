@@ -2,10 +2,9 @@
 
 Where we are: the per-module comparison of Julia's C/C++ runtime
 (`reference/julia/src/`, pinned at the commit in `reference/README.md`)
-against Ruju's Rust reimplementation. This is the evidence ledger that
-`methodology.md`'s claim ladder requires — every **Done · Faithful** row is
-backed by a reference-verified comparison recorded here. `strategy.md` reads
-this document to derive its frontier.
+against Ruju's Rust reimplementation. This is the evidence ledger — every
+**Done · Faithful** row is backed by a reference-verified comparison
+recorded here.
 
 Each module section carries: the side-by-side C-vs-Rust mini-maps (where the
 Rust port has begun), the status table, and the audit findings with their
@@ -158,6 +157,7 @@ flowchart TD
 ```mermaid
 flowchart LR
     subgraph C["Julia C"]
+        direction TB
         CH["jl_taggedvalue_t — word header:<br/>type tag · gc:2 · in_image:2 (mask ~15)"]
         CD["jl_datatype_t — name, super, parameters,<br/>types, instance, layout, hash + 11 flags"]
         CL["jl_datatype_layout_t — size, nfields, npointers,<br/>fielddescs (isptr/size/offset), ptr words"]
@@ -166,6 +166,7 @@ flowchart LR
         CH --> CD --> CL
     end
     subgraph R["Ruju Rust"]
+        direction TB
         RH["8-byte header — u32 type offset:<br/>gc:2 (mask ~3), no in_image"]
         RD["DataType — name, super_, parameters,<br/>instance, layout, size, nfields, flags"]
         RL["layout — npointers + byte offsets<br/>(pointer bitmap only)"]
@@ -173,6 +174,7 @@ flowchart LR
         RS["svec — u32 len + elements"]
         RH --> RD --> RL
     end
+    C ~~~ R
 ```
 
 **Reference-verified (audit 2026-06).** Tagged header design (tag-before-
@@ -207,12 +209,14 @@ freelist threaded through the header word exactly mirrors
 ```mermaid
 flowchart LR
     subgraph C["Julia C"]
+        direction TB
         CI["jl_init_types — alloc uninitialized,<br/>patch after symbols/typenames exist"]
         CU["jl_type_union — flatten, simple_subtype<br/>subsume, union_sort_cmp, right-nest"]
         CA["jl_apply_type — UnionAll wrapper<br/>instantiation, bounds checks, typename cache"]
         CT["jl_tvar_t (name,lb,ub) ·<br/>jl_unionall_t (var,body)"]
     end
     subgraph R["Ruju Rust"]
+        direction TB
         RI["bootstrap() — same alloc-then-patch<br/>pattern, DataType:DataType cycle"]
         RU["union_of — flatten, full-issubtype<br/>subsume, union_sort_cmp tiers, right-nest"]
         RA["apply_type — explicit (typename, super,<br/>params), TypeName cache, linear scan"]
@@ -261,6 +265,7 @@ normalization has the right overall algorithm.
 ```mermaid
 flowchart LR
     subgraph C["Julia C (6324 lines)"]
+        direction TB
         CF["forall_exists_subtype — ∀ loop over<br/>Lunions states, re_save env between"]
         CE["exists_subtype — ∃ loop over Runions<br/>states, restore env between"]
         CSUB["subtype() — typevar & unionall priority<br/>over union split; Intersect nodes; Loffset"]
@@ -268,11 +273,13 @@ flowchart LR
         CF --> CE --> CSUB --> CV
     end
     subgraph R["Ruju Rust (~500 lines)"]
+        direction TB
         RS2["subtype() — single entry"]
         RSUB["sub() — unions split first, locally:<br/>left &&, right try/restore"]
         RV["var_lt / var_gt — ccheck at Param::None,<br/>simple_meet over-estimates"]
         RS2 --> RSUB --> RV
     end
+    C ~~~ R
 ```
 
 **Reference-verified (audit 2026-06).** The `jl_stenv_t`/`jl_varbinding_t`
@@ -406,12 +413,14 @@ match `runtime_intrinsics.c` for the implemented subset.
 ```mermaid
 flowchart LR
     subgraph C["Julia C"]
+        direction TB
         CGS["pools: per-page freelists + newpages,<br/>~50-entry size-class table, 16 KiB pages"]
         CWB["jl_gc_wb: parent == OLD_MARKED(3)<br/>&& child unMARKED → queue_root (re-tags)"]
         CMK["layout-driven precise mark,<br/>lazy/quick page sweep, age-based promotion"]
         CST["GC_CLEAN=0 MARKED=1 OLD=2<br/>OLD_MARKED=3"]
     end
     subgraph R["Ruju Rust"]
+        direction TB
         RGS["pools: one global freelist per class,<br/>12-entry geometric table, 4 KiB pages"]
         RWB["write_barrier: parent any-OLD<br/>&& child not-OLD → push (no re-tag)"]
         RMK["layout-driven precise mark,<br/>eager all-page sweep, promote-on-1st-survival"]

@@ -1,11 +1,7 @@
 # Methodology
 
-How code moves from written to pushed in a project that demands precision and
-runs on human–agent trust. `design/` holds three documents (see its
-`README.md`): `strategy.md` (where we are going — the dependency frontier),
-`implementation.md` (where we are — the per-module C-vs-Rust comparison), and
-this one (how we get there). Conventions for commits and attribution live in
-`CONTRIBUTING.md`; this document governs the engineering process itself.
+How we get there: the process that moves code from written to pushed, in a
+project that demands precision and runs on human–agent trust.
 
 The founding observation, confirmed by every audit this project has run:
 **the failure mode is never fabrication — it is a claim quietly sitting one
@@ -56,9 +52,8 @@ side comparison) recorded in `implementation.md`. No upgrade without evidence.
    status rows, citations, dated annotations (`fixed, audit 2026-06`).
    `strategy.md`: frontier status if the increment opened or closed work.
    Documents that lag the code are the first step of the next over-claim.
-7. **Commit and push** per `CONTRIBUTING.md` (`component: Brief summary`,
-   human author, agent co-author trailer), push to `main`, verify local and
-   remote are in sync.
+7. **Commit and push** following the repository's commit conventions, push
+   to `main`, and verify local and remote are in sync.
 8. **Report with a weakest link.** Every increment report ends by naming its
    least-verified claim — the counted-not-grepped citation, the subset that
    wasn't exercised, the case the oracle can't reach. This is the structural

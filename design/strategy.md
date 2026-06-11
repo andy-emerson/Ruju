@@ -1,10 +1,10 @@
 # Strategy
 
-Where the project is going and what can be worked on *now*. The plan is a
-dependency structure, not a list: at any moment several increments are
-unblocked, and when one stalls on an unexpected challenge, work slides to
-another frontier item instead of stalling the project. `implementation.md` records
-where we are; `methodology.md` governs how each increment moves.
+Where we are going, and what can be worked on *now*. The plan is a dependency
+structure, not a list: at any moment several increments are unblocked, which
+is what lets the project balance new capabilities against deeper fidelity and
+absorb unexpected implementation challenges without being bottlenecked by
+them.
 
 ## What this is
 
@@ -53,9 +53,11 @@ This is deliberately not a schedule. The map has no time axis, no durations,
 and no dates, because for work like this (a mechanical intrinsics port next
 to research-grade subtype machinery) durations would be invented numbers, and
 invented precision is the exact failure mode this project's culture exists to
-prevent. The adaptability a schedule promises is delivered instead by the
-frontier's *width*: when one item resists, work slides to another, and the
-project never blocks on its hardest problem.
+prevent. What the frontier's *width* provides instead is balance: at any
+moment it offers both **breadth** (new capabilities) and **depth** (making
+existing capabilities more faithful), and the project stays productive while
+the difficult problems get the sustained, unhurried attention they need to be
+solved well — rather than bottlenecking everything behind them.
 
 It is also not the architectural call graph — that lives in
 `implementation.md`. Same subsystems, different edges: the architectural map's
@@ -149,12 +151,13 @@ When several frontier items are available:
    increment that unblocks one branch waits.
 2. **Prefer increments that grow the oracle** — verification capacity
    compounds; every oracle case keeps paying.
-3. **Slide, don't stall** — when a research-grade item (subtype hardening)
-   resists, move to a mechanical frontier item (intrinsics breadth) and come
-   back. The frontier exists so the project never blocks on its hardest
-   problem.
+3. **Balance breadth and depth** — the frontier always offers both new
+   capabilities (structs, exceptions) and deeper fidelity in existing ones
+   (GC exactness, subtype hardening). Difficult problems get sustained
+   attention across increments; the rest of the project advances in
+   parallel rather than queueing behind them.
 4. **Audit before entering a module** untouched since its last substantial
-   change (`methodology.md`).
+   change.
 
 ## Later phases (blocked, in dependency order)
 
