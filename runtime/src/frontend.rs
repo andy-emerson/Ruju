@@ -4,9 +4,10 @@
 //! This is deliberately **not** JuliaSyntax/JuliaLowering — those are Julia
 //! packages that require a running Julia, which is the very thing being built.
 //! Until the runtime can host them (AOT-compiled, much later), this hand-written
-//! Rust front-end lets real Julia source execute. It covers integer literals,
-//! variables, assignment, `+ - *`, comparisons, `if`/`elseif`/`else`, and
-//! `while`. Results are assumed to be `Int64`.
+//! Rust front-end lets real Julia source execute. It covers integer and float
+//! literals, variables, assignment, arithmetic (`+ - * / ÷ %`), bitwise ops
+//! (`& | << >> >>>`), comparisons (incl. `===`), `if`/`elseif`/`else`, and
+//! `while`. `/` always yields `Float64`, as in Julia.
 
 use std::collections::HashMap;
 
@@ -23,6 +24,15 @@ enum Tok {
     Plus,
     Minus,
     Star,
+    Slash,
+    IDiv, // ÷
+    Percent,
+    Amp,
+    Pipe,
+    Veebar, // ⊻ (xor)
+    Shl,  // <<
+    Shr,  // >>
+    Ushr, // >>>
     Lt,
     Le,
     Gt,
@@ -70,6 +80,30 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 out.push(Tok::Star);
                 i += 1;
             }
+            b'/' => {
+                out.push(Tok::Slash);
+                i += 1;
+            }
+            b'%' => {
+                out.push(Tok::Percent);
+                i += 1;
+            }
+            b'&' => {
+                out.push(Tok::Amp);
+                i += 1;
+            }
+            b'|' => {
+                out.push(Tok::Pipe);
+                i += 1;
+            }
+            0xC3 if b.get(i + 1) == Some(&0xB7) => {
+                out.push(Tok::IDiv); // ÷ (U+00F7)
+                i += 2;
+            }
+            0xE2 if b.get(i + 1) == Some(&0x8A) && b.get(i + 2) == Some(&0xBB) => {
+                out.push(Tok::Veebar); // ⊻ (U+22BB, xor)
+                i += 3;
+            }
             b'(' => {
                 out.push(Tok::LParen);
                 i += 1;
@@ -79,7 +113,10 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 i += 1;
             }
             b'<' => {
-                if b.get(i + 1) == Some(&b'=') {
+                if b.get(i + 1) == Some(&b'<') {
+                    out.push(Tok::Shl);
+                    i += 2;
+                } else if b.get(i + 1) == Some(&b'=') {
                     out.push(Tok::Le);
                     i += 2;
                 } else {
@@ -88,7 +125,13 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 }
             }
             b'>' => {
-                if b.get(i + 1) == Some(&b'=') {
+                if b.get(i + 1) == Some(&b'>') && b.get(i + 2) == Some(&b'>') {
+                    out.push(Tok::Ushr);
+                    i += 3;
+                } else if b.get(i + 1) == Some(&b'>') {
+                    out.push(Tok::Shr);
+                    i += 2;
+                } else if b.get(i + 1) == Some(&b'=') {
                     out.push(Tok::Ge);
                     i += 2;
                 } else {
@@ -154,6 +197,15 @@ enum BinOp {
     Add,
     Sub,
     Mul,
+    Div,
+    IDiv,
+    Rem,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
+    Ushr,
     Lt,
     Le,
     Gt,
@@ -299,12 +351,16 @@ impl Parser {
         Ok(lhs)
     }
 
+    // Julia's precedence: `|` sits at the additive level and `&` at the
+    // multiplicative level; shifts bind tighter than `*`.
     fn parse_add(&mut self) -> Result<Expr, String> {
         let mut lhs = self.parse_mul()?;
         loop {
             let op = match self.peek() {
                 Tok::Plus => BinOp::Add,
                 Tok::Minus => BinOp::Sub,
+                Tok::Pipe => BinOp::Or,
+                Tok::Veebar => BinOp::Xor,
                 _ => break,
             };
             self.next();
@@ -315,11 +371,35 @@ impl Parser {
     }
 
     fn parse_mul(&mut self) -> Result<Expr, String> {
+        let mut lhs = self.parse_shift()?;
+        loop {
+            let op = match self.peek() {
+                Tok::Star => BinOp::Mul,
+                Tok::Slash => BinOp::Div,
+                Tok::IDiv => BinOp::IDiv,
+                Tok::Percent => BinOp::Rem,
+                Tok::Amp => BinOp::And,
+                _ => break,
+            };
+            self.next();
+            let rhs = self.parse_shift()?;
+            lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_shift(&mut self) -> Result<Expr, String> {
         let mut lhs = self.parse_atom()?;
-        while *self.peek() == Tok::Star {
+        loop {
+            let op = match self.peek() {
+                Tok::Shl => BinOp::Shl,
+                Tok::Shr => BinOp::Shr,
+                Tok::Ushr => BinOp::Ushr,
+                _ => break,
+            };
             self.next();
             let rhs = self.parse_atom()?;
-            lhs = Expr::Bin(BinOp::Mul, Box::new(lhs), Box::new(rhs));
+            lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
         }
         Ok(lhs)
     }
@@ -347,6 +427,15 @@ fn binop(op: BinOp) -> (Builtin, bool) {
         BinOp::Add => (Builtin::Add, false),
         BinOp::Sub => (Builtin::Sub, false),
         BinOp::Mul => (Builtin::Mul, false),
+        BinOp::Div => (Builtin::Div, false),
+        BinOp::IDiv => (Builtin::IDiv, false),
+        BinOp::Rem => (Builtin::Rem, false),
+        BinOp::And => (Builtin::And, false),
+        BinOp::Or => (Builtin::Or, false),
+        BinOp::Xor => (Builtin::Xor, false),
+        BinOp::Shl => (Builtin::Shl, false),
+        BinOp::Shr => (Builtin::Shr, false),
+        BinOp::Ushr => (Builtin::Lshr, false),
         BinOp::Lt => (Builtin::Slt, false),
         BinOp::Le => (Builtin::Sle, false),
         BinOp::Gt => (Builtin::Slt, true), // a > b  ==  b < a
@@ -463,5 +552,5 @@ pub fn eval_source(src: &str) -> Result<Value, String> {
     let toks = lex(src)?;
     let mut parser = Parser { toks, pos: 0 };
     let program = parser.parse_program()?;
-    Ok(interp::eval(&lower_program(&program)))
+    interp::eval(&lower_program(&program))
 }

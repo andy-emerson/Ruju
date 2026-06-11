@@ -95,7 +95,7 @@ flowchart TD
 
     EGAL["egal & === [done: phase-0 subset]"]
     STRUCTS("struct support (frontier)")
-    INTRIN("intrinsics & boxing breadth (frontier)")
+    INTRIN["intrinsics & boxing breadth [done: phase-0 subset]"]
     GCX("GC exactness & tuning (frontier)")
     SUBX("subtype hardening (frontier)")
     EXC("exceptions: enter/leave (frontier)")
@@ -146,7 +146,6 @@ Unblocked now, in no required order — pick by the selection principles below.
 | Increment | What it is | What it unblocks |
 | - | - | - |
 | **struct support** | `DataType.types` (field types), `new`/`getfield`/`setfield!` in the interpreter | arrays, modules, real `base/` code — the widest gate on the map |
-| **intrinsics & boxing breadth** | remaining primitive boxings; div/rem, bitwise, shifts, conversions (`runtime_intrinsics.c`) | numeric Julia; mostly mechanical |
 | **GC exactness & tuning** | write-barrier exact condition + `queue_root` re-tag, promotion age, heap-target trigger, full-vs-quick (audit findings 17–19) | phase-1 AOT (GC must be trustworthy under real load) |
 | **subtype hardening** | remaining audit divergences: the global union-decision machine (heals the oracle's known divergence), union-split priority order, cross-var `concrete` propagation, `Intersect`/`Loffset` from the newer pin | intersection, then `type_morespecific`, then dispatch hardening |
 | **exceptions** | `enter`/`leave` in the interpreter (`interpreter.c`), error throwing (`rtutils.c`) | real lowering; `base/` code throws |

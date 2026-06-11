@@ -228,7 +228,7 @@ freelist threaded through the header word exactly mirrors
 | Tagged header (tag-before-object, GC bits) | Done | Faithful | `jl_taggedvalue_t` |
 | `DataType` struct | Partial | Faithful | ~7 of `jl_datatype_t`'s ~17 fields (incl. `instance`) |
 | Field layout | Partial | Faithful | pointer bitmap only; no field-type/offset table |
-| Boxing | Partial | Faithful | `Int64`/`Bool`/`Float64`; `Bool` boxes are the `jl_true`/`jl_false` permboxes (fixed, audit 2026-06); no small-int cache; other primitives later |
+| Boxing | Partial | Faithful | every primitive width except `Int128`/`UInt128`/`Float16` (intrinsics 2026-06); `Bool` boxes are the `jl_true`/`jl_false` permboxes (fixed, audit 2026-06); no permbox caches for ints/chars |
 | `SimpleVector` | Done | Faithful | `jl_svec_t` |
 | Singletons | Done | Faithful | `jl_datatype_t.instance`: `nothing` lives in `Nothing.instance`; zero-size pointer-free structs get an eager instance (`jl_compute_field_offsets`) |
 
@@ -405,7 +405,7 @@ loop and the slots-then-SSA-values single-frame layout match the C exactly
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
 | `eval_body` loop | Done | Faithful | instruction-pointer loop |
-| Statements (`Goto`/`GotoIfNot`/`Return`/`:call`/`:(=)`) | Partial | Faithful | `GotoIfNot` skips the `Bool` `TypeError` |
+| Statements (`Goto`/`GotoIfNot`/`Return`/`:call`/`:(=)`) | Partial | Faithful | `GotoIfNot` skips the `Bool` `TypeError`; builtin errors (`DivideError`) propagate as `Result` eval errors until `enter`/`leave` exist |
 | Operands (SSA / slot / const) | Done | Faithful | — |
 | Phi / phic / upsilon | Planned | Faithful | SSA-form nodes |
 | Exception handling (`enter`/`leave`) | Planned | Faithful | — |
@@ -442,12 +442,12 @@ match `runtime_intrinsics.c` for the implemented subset.
 
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
-| Integer arithmetic | Partial | Faithful | `add/sub/mul` + `slt/sle/eq` of ~50+ |
-| Bitwise / shifts | Planned | Faithful | — |
-| Float arithmetic & compare | Partial | Faithful | `add/sub/mul` + `lt/le/eq` |
-| Conversions (`sitofp`, `trunc`, …) | Planned | Faithful | — |
+| Integer arithmetic | Partial | Faithful | `add/sub/mul/neg` wrapping; `checked_sdiv/srem` with Julia's `DivideError` conditions (`runtime_intrinsics.c:1251` — the throw is the interpreter's, via the eval error channel); `slt/sle/ult/ule/eq`; i64 width only (intrinsics 2026-06) |
+| Bitwise / shifts | Partial | Faithful | `and/or/xor/not`; `shl/lshr/ashr` with the exact count-overflow semantics (`runtime_intrinsics.c:1569–1574`: ≥ width → 0 / sign word); i64 only |
+| Float arithmetic & compare | Partial | Faithful | `add/sub/mul/div/neg` + `rem_float` (= `fmod`) + `lt/le/eq` |
+| Conversions (`sitofp`, `trunc`, …) | Partial | Faithful | `sitofp`/`fptosi` (i64↔f64); `fptosi` saturates where the C is implementation-defined; `trunc/sext/zext/bitcast` later |
 | Pointer / memory intrinsics | Planned | Faithful | — |
-| Operator → intrinsic dispatch | Partial | Faithful | type-switched in `apply`; faithful is generic-function operators (`+` etc.) over the typed intrinsics |
+| Operator → intrinsic dispatch | Partial | Faithful | type-switched in `apply`; `/` converts integer operands via `sitofp` (Julia's `base/` promotion); faithful is generic-function operators over the typed intrinsics |
 
 ## Garbage collector — `gc-stock.c`, `gc-common.c`, `gc-pages.c`, `gc-stacks.c` vs `gc.rs`, `region.rs`
 

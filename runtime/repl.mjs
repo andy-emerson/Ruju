@@ -7,19 +7,18 @@
 // (build first: cargo build -p ruju-runtime --target wasm32-unknown-unknown --release)
 //
 // Supported subset (the bootstrap front-end, runtime/src/frontend.rs):
-// integer and float literals, variables, assignment, `+ - *`, comparisons
-// (`< <= > >= ==` and `===`), `if`/`elseif`/`else`/`end`, and `while`. The
-// value of the session is its last expression.
+// integer and float literals, variables, assignment, arithmetic
+// (`+ - * / ÷ %`), bitwise (`& | ⊻ << >> >>>`), comparisons (`< <= > >= ==`
+// and `===`), `if`/`elseif`/`else`/`end`, and `while`. `/` yields Float64,
+// as in Julia. The value of the session is its last expression.
 //
 // Honest limitations of this tool (not the runtime):
 // - Variables persist between lines by re-evaluating the accumulated session
 //   source (evaluation is pure, so this is sound; `:reset` clears it).
-// - The eval ABI returns 0 on a parse/eval error, indistinguishable from a
-//   computed 0; this REPL drops an entry when both interpretations read 0
-//   and warns. The 8 KiB source buffer bounds a session.
-// - Result type detection: the result is read as both Int64 and Float64 bit
-//   patterns; an Int64's bits reinterpreted as a double are a denormal
-//   (< 2^-1000) that no program here produces, so the readings disambiguate.
+// - The result's type comes from rj_eval_typeof, so Int64, Float64, and Bool
+//   results print correctly; an erroring entry (parse error or e.g.
+//   DivideError) is reported and dropped from the session. The 8 KiB source
+//   buffer bounds a session.
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -33,26 +32,31 @@ const x = instance.exports;
 x.rj_init();
 
 const SRC_CAP = 8192;
+const FLOAT64_T = x.rj_builtin_type(21); // types.rs id::FLOAT64
+const BOOL_T = x.rj_builtin_type(8); // types.rs id::BOOL
 
-function evalBoth(src) {
+// Evaluate the session source: ask the runtime for the result's type, then
+// read with the matching decoder (evaluation is pure, so evaluating twice is
+// sound). A type of 0 means a parse/eval error (e.g. DivideError).
+function evaluate(src) {
   const bytes = new TextEncoder().encode(src);
   if (bytes.length > SRC_CAP) return { err: `session exceeds the ${SRC_CAP}-byte source buffer (:reset to clear)` };
-  new Uint8Array(x.memory.buffer, x.rj_source_ptr(), bytes.length).set(bytes);
+  const write = () => new Uint8Array(x.memory.buffer, x.rj_source_ptr(), bytes.length).set(bytes);
+  write();
+  const t = x.rj_eval_typeof(bytes.length);
+  if (t === 0) return { err: "error (parse error, unsupported syntax, or e.g. DivideError)" };
+  write();
+  if (t === FLOAT64_T) {
+    const f = x.rj_eval_f64(bytes.length);
+    return { text: Number.isInteger(f) ? f.toFixed(1) : String(f) };
+  }
   const i = x.rj_eval(bytes.length);
-  new Uint8Array(x.memory.buffer, x.rj_source_ptr(), bytes.length).set(bytes);
-  const f = x.rj_eval_f64(bytes.length);
-  return { i, f };
+  if (t === BOOL_T) return { text: i === 1n ? "true" : "false" };
+  return { text: String(i) };
 }
 
-function show({ i, f, err }) {
-  if (err) return { text: err, ok: false };
-  if (i === 0n && f === 0) return { text: "0  (note: a parse/eval error also reads as 0)", ok: true };
-  // A genuine Int64 read as a double is a denormal; a genuine Float64 read as
-  // an Int64 is astronomically large. Prefer the plausible reading.
-  if (Math.abs(f) > 1e-300 || (i === 0n && f !== 0)) {
-    return { text: Number.isInteger(f) ? f.toFixed(1) : String(f), ok: true };
-  }
-  return { text: String(i), ok: true };
+function show(r) {
+  return r.err ? { text: r.err, ok: false } : { text: r.text, ok: true };
 }
 
 // Count block openers vs `end` to know when a multi-line entry is complete.
@@ -68,13 +72,13 @@ function openBlocks(src) {
 // One-shot mode.
 const arg = process.argv.slice(2).join(" ").trim();
 if (arg) {
-  console.log(show(evalBoth(arg)).text);
+  console.log(show(evaluate(arg)).text);
   process.exit(0);
 }
 
 console.log("Ruju REPL — Julia source via rj_eval (subset: literals, variables,");
-console.log("+ - *, comparisons, if/elseif/else, while). :reset clears the");
-console.log("session, :quit exits.\n");
+console.log("+ - * / ÷ %, & | ⊻ << >> >>>, comparisons incl. ===, if/elseif/else,");
+console.log("while). :reset clears the session, :quit exits.\n");
 
 let session = ""; // accumulated source: how variables persist across lines
 let pending = ""; // multi-line entry in progress
@@ -95,7 +99,7 @@ rl.on("line", (line) => {
   }
   const candidate = session + (session ? "\n" : "") + pending;
   pending = "";
-  const out = show(evalBoth(candidate));
+  const out = show(evaluate(candidate));
   console.log(out.text);
   if (out.ok) session = candidate; // keep the entry only if it evaluated
   rl.setPrompt("ruju> "); rl.prompt();

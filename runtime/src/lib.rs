@@ -93,7 +93,7 @@ pub extern "C" fn rj_call_classify_i64(n: i64) -> i64 {
     ensure_init();
     let body = generic_call_body(F_CLASSIFY, 1);
     let arg = box_int(n);
-    unbox_int(interp::eval_with_args(&body, &[arg]))
+    unbox_int(interp::eval_with_args(&body, &[arg]).unwrap_or(Value::NULL))
 }
 
 /// Interpret `classify(x)` for a boxed `Bool` argument (dispatches to 30).
@@ -102,7 +102,7 @@ pub extern "C" fn rj_call_classify_bool() -> i64 {
     ensure_init();
     let body = generic_call_body(F_CLASSIFY, 1);
     let arg = value::box_bool(true);
-    unbox_int(interp::eval_with_args(&body, &[arg]))
+    unbox_int(interp::eval_with_args(&body, &[arg]).unwrap_or(Value::NULL))
 }
 
 /// Interpret `double(x)` for a boxed `Int64` argument (returns `2n`).
@@ -111,7 +111,7 @@ pub extern "C" fn rj_call_double(n: i64) -> i64 {
     ensure_init();
     let body = generic_call_body(F_DOUBLE, 1);
     let arg = box_int(n);
-    unbox_int(interp::eval_with_args(&body, &[arg]))
+    unbox_int(interp::eval_with_args(&body, &[arg]).unwrap_or(Value::NULL))
 }
 
 /// Interpret `combine(a, b)` for two boxed `Int64` arguments (dispatches to 2).
@@ -121,7 +121,7 @@ pub extern "C" fn rj_call_combine(a: i64, b: i64) -> i64 {
     let body = generic_call_body(F_COMBINE, 2);
     let ra = Rooted::new(box_int(a));
     let rb = Rooted::new(box_int(b));
-    unbox_int(interp::eval_with_args(&body, &[ra.get(), rb.get()]))
+    unbox_int(interp::eval_with_args(&body, &[ra.get(), rb.get()]).unwrap_or(Value::NULL))
 }
 
 // Scratch buffer the host writes source into before calling `rj_eval`.
@@ -145,6 +145,19 @@ pub extern "C" fn rj_eval(len: u32) -> i64 {
     let bytes = unsafe { core::slice::from_raw_parts(SOURCE.0.get() as *const u8, len as usize) };
     match core::str::from_utf8(bytes).ok().and_then(|s| frontend::eval_source(s).ok()) {
         Some(v) => unbox_int(v),
+        None => 0,
+    }
+}
+
+/// Evaluate the source buffer and return the region offset of the result's
+/// type (`0` on a parse/eval error). Lets a host pick the right reader
+/// (`rj_eval` vs `rj_eval_f64`) instead of guessing from bit patterns.
+#[no_mangle]
+pub extern "C" fn rj_eval_typeof(len: u32) -> u32 {
+    ensure_init();
+    let bytes = unsafe { core::slice::from_raw_parts(SOURCE.0.get() as *const u8, len as usize) };
+    match core::str::from_utf8(bytes).ok().and_then(|s| frontend::eval_source(s).ok()) {
+        Some(v) => type_of(v),
         None => 0,
     }
 }
@@ -376,14 +389,14 @@ fn sum_to_body(n: i64) -> interp::Body {
 #[no_mangle]
 pub extern "C" fn rj_interp_poly(a: i64, b: i64, c: i64) -> i64 {
     ensure_init();
-    unbox_int(interp::eval(&poly_body(a, b, c)))
+    unbox_int(interp::eval(&poly_body(a, b, c)).unwrap_or(Value::NULL))
 }
 
 /// Interpret `sum(1:n)` (0 for n <= 0).
 #[no_mangle]
 pub extern "C" fn rj_interp_sum_to(n: i64) -> i64 {
     ensure_init();
-    unbox_int(interp::eval(&sum_to_body(n)))
+    unbox_int(interp::eval(&sum_to_body(n)).unwrap_or(Value::NULL))
 }
 
 /// Build the lowered IR for `i = n; steps = 0; while i != 0; i -= 1; steps += 1;
@@ -411,7 +424,7 @@ fn count_down_body(n: i64) -> interp::Body {
 #[no_mangle]
 pub extern "C" fn rj_interp_count_down(n: i64) -> i64 {
     ensure_init();
-    unbox_int(interp::eval(&count_down_body(n)))
+    unbox_int(interp::eval(&count_down_body(n)).unwrap_or(Value::NULL))
 }
 
 #[cfg(test)]
@@ -1113,6 +1126,64 @@ mod tests {
         assert!(!runb("1 === 1.5")); // different type tags, never equal
     }
 
+    // Intrinsics breadth from source: ÷ % / bitwise shifts, precedence, and
+    // the DivideError path.
+    #[test]
+    fn frontend_runs_integer_and_float_operators() {
+        let _g = serial();
+        rj_init();
+        let run = |s: &str| unbox_int(frontend::eval_source(s).unwrap());
+        let runf = |s: &str| value::unbox_float64(frontend::eval_source(s).unwrap());
+
+        assert_eq!(run("7 \u{f7} 2"), 3); // ÷ truncates
+        assert_eq!(run("-7 \u{f7} 2"), -3);
+        assert_eq!(run("7 % 2"), 1);
+        assert_eq!(run("-7 % 2"), -1); // sign of the dividend
+        assert_eq!(run("6 & 3"), 2);
+        assert_eq!(run("6 | 3"), 7);
+        assert_eq!(run("6 \u{22bb} 3"), 5); // ⊻ xor
+        assert_eq!(run("1 << 10"), 1024);
+        assert_eq!(run("-8 >> 1"), -4); // arithmetic: sign-fill
+        assert_eq!(run("-8 >>> 60"), 15); // logical: zero-fill
+        assert_eq!(run("1 << 64"), 0); // count >= width
+
+        // Precedence: `&` multiplicative, `|` additive, shifts tighter than `*`.
+        assert_eq!(run("4 | 2 + 1"), 7); // 4 | (2+1)
+        assert_eq!(run("6 & 3 + 1"), 3); // (6 & 3) + 1 — & binds tighter than +
+        assert_eq!(run("2 * 1 << 3"), 16); // 2 * (1<<3)
+
+        // `/` always produces Float64, converting integer operands (Julia's
+        // Int / Int promotion).
+        assert_eq!(runf("1 / 2"), 0.5);
+        assert_eq!(runf("7.0 / 2.0"), 3.5);
+        assert_eq!(runf("5.5 % 2.0"), 1.5); // float % is fmod
+
+        // DivideError surfaces as an eval error (no exceptions yet).
+        assert!(frontend::eval_source("1 \u{f7} 0").is_err());
+        assert!(frontend::eval_source("x = 5\nx % 0").is_err());
+    }
+
+    // The remaining primitive boxings round-trip, carry their type, and egal
+    // by bits within a width but never across types.
+    #[test]
+    fn primitive_boxing_round_trips() {
+        let _g = serial();
+        rj_init();
+        assert_eq!(value::unbox_int8(value::box_int8(-5)), -5);
+        assert_eq!(value::unbox_int16(value::box_int16(-300)), -300);
+        assert_eq!(value::unbox_int32(value::box_int32(70_000)), 70_000);
+        assert_eq!(value::unbox_uint8(value::box_uint8(200)), 200);
+        assert_eq!(value::unbox_uint16(value::box_uint16(60_000)), 60_000);
+        assert_eq!(value::unbox_uint32(value::box_uint32(4_000_000_000)), 4_000_000_000);
+        assert_eq!(value::unbox_uint64(value::box_uint64(u64::MAX)), u64::MAX);
+        assert_eq!(value::unbox_float32(value::box_float32(1.5)), 1.5);
+        assert_eq!(value::unbox_char(value::box_char(0x41)), 0x41);
+        assert_eq!(type_of(value::box_int8(1)), types::builtin(id::INT8));
+        assert_eq!(type_of(value::box_char(7)), types::builtin(id::CHAR));
+        assert!(builtins::egal(value::box_int8(7), value::box_int8(7)));
+        assert!(!builtins::egal(value::box_int8(7), value::box_uint8(7))); // types differ
+    }
+
     #[test]
     fn frontend_runs_float_arithmetic() {
         let _g = serial();
@@ -1140,21 +1211,21 @@ mod tests {
 
         // classify: Int64 and Bool beat the abstract Integer overload.
         let xi = Rooted::new(box_int(7));
-        assert_eq!(unbox_int(dispatch::invoke(F_CLASSIFY, &[xi.get()])), 20);
+        assert_eq!(unbox_int(dispatch::invoke(F_CLASSIFY, &[xi.get()]).unwrap()), 20);
         let xb = Rooted::new(value::box_bool(true));
-        assert_eq!(unbox_int(dispatch::invoke(F_CLASSIFY, &[xb.get()])), 30);
+        assert_eq!(unbox_int(dispatch::invoke(F_CLASSIFY, &[xb.get()]).unwrap()), 30);
 
         // double uses its argument: 21 + 21 = 42.
         let x = Rooted::new(box_int(21));
-        assert_eq!(unbox_int(dispatch::invoke(F_DOUBLE, &[x.get()])), 42);
+        assert_eq!(unbox_int(dispatch::invoke(F_DOUBLE, &[x.get()]).unwrap()), 42);
 
         // combine: two-argument tuple dispatch, with partial applicability.
         let a = Rooted::new(box_int(1));
         let b = Rooted::new(box_int(2));
-        assert_eq!(unbox_int(dispatch::invoke(F_COMBINE, &[a.get(), b.get()])), 2); // (Int64,Int64)
+        assert_eq!(unbox_int(dispatch::invoke(F_COMBINE, &[a.get(), b.get()]).unwrap()), 2); // (Int64,Int64)
         // Tuple{Bool,Int64}: Bool is not <: Int64, so only (Integer,Integer) applies.
         let bb = Rooted::new(value::box_bool(true));
-        assert_eq!(unbox_int(dispatch::invoke(F_COMBINE, &[bb.get(), b.get()])), 1);
+        assert_eq!(unbox_int(dispatch::invoke(F_COMBINE, &[bb.get(), b.get()]).unwrap()), 1);
 
         // Same selection, driven through the interpreter's CallGeneric path.
         assert_eq!(rj_call_classify_i64(7), 20);

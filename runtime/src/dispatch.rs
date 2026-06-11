@@ -79,13 +79,14 @@ fn select(func: u32, arg_types: &[Offset]) -> Option<usize> {
 }
 
 /// Dispatch `func` on `args` (by their runtime types) and evaluate the chosen
-/// method body. Returns `Value::NULL` if no method applies (a MethodError in
-/// Julia). The caller must keep `args` rooted across this call.
-pub fn invoke(func: u32, args: &[Value]) -> Value {
+/// method body. Returns `Ok(Value::NULL)` if no method applies (a MethodError
+/// in Julia); `Err` carries a would-be exception from the body. The caller
+/// must keep `args` rooted across this call.
+pub fn invoke(func: u32, args: &[Value]) -> Result<Value, String> {
     let arg_types: Vec<Offset> = args.iter().map(|&v| object::type_of(v)).collect();
     let body = match select(func, &arg_types) {
         Some(i) => table()[i].body.clone(),
-        None => return Value::NULL,
+        None => return Ok(Value::NULL),
     };
     interp::eval_with_args(&body, args)
 }

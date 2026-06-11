@@ -193,6 +193,13 @@ check(
   x.rj_types_egal(x.rj_union_type(ty(T.Int64), ty(T.Nothing)), x.rj_union_type(ty(T.Nothing), ty(T.Int64))),
   1,
 );
+// Intrinsics breadth: integer division, remainder, shifts, and the error path.
+check("source: 7 ÷ 2", evalJulia("7 ÷ 2"), 3n);
+check("source: 7 % 2", evalJulia("7 % 2"), 1n);
+check("source: -8 >> 1", evalJulia("-8 >> 1"), -4n);
+check("source: 1 << 62", evalJulia("1 << 62"), 4611686018427387904n);
+check("source: 6 ⊻ 3", evalJulia("6 ⊻ 3"), 5n);
+check("source: 1 ÷ 0 is DivideError (reads 0)", evalJulia("1 ÷ 0"), 0n);
 // Float64 source (result read as a double).
 function evalJuliaF64(src) {
   const bytes = new TextEncoder().encode(src);
@@ -200,6 +207,7 @@ function evalJuliaF64(src) {
   return x.rj_eval_f64(bytes.length);
 }
 check("source: 1.5 + 2.0", evalJuliaF64("1.5 + 2.0"), 3.5);
+check("source: 1 / 2 promotes to Float64", evalJuliaF64("1 / 2"), 0.5);
 check("source: 2.0 * 3.0 + 1.0", evalJuliaF64("2.0 * 3.0 + 1.0"), 7.0);
 check("source: float while-loop", evalJuliaF64("x = 0.0\nwhile x < 5.0\nx = x + 0.5\nend\nx"), 5.0);
 

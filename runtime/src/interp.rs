@@ -21,8 +21,9 @@ use crate::object::{self, Value};
 use crate::types::{self, id};
 use crate::value::{box_bool, box_float64, box_int, unbox_bool, unbox_float64, unbox_int};
 use intrinsics::{
-    add_float, add_int, eq_float, eq_int, le_float, lt_float, mul_float, mul_int, sle_int, slt_int,
-    sub_float, sub_int,
+    add_float, add_int, and_int, ashr_int, checked_sdiv_int, checked_srem_int, div_float, eq_float,
+    eq_int, le_float, lshr_int, lt_float, mul_float, mul_int, or_int, rem_float, shl_int, sitofp,
+    sle_int, slt_int, sub_float, sub_int, xor_int,
 };
 
 /// A builtin operation invoked by a `:call` statement (no dispatch).
@@ -31,6 +32,21 @@ pub enum Builtin {
     Add,
     Sub,
     Mul,
+    /// `/`: float division; integer operands convert through `sitofp`
+    /// (Julia's `Int / Int` promotes to `Float64` in `base/`).
+    Div,
+    /// `÷` (`checked_sdiv_int`): truncating; `DivideError` on 0 or typemin÷-1.
+    IDiv,
+    /// `%` (`checked_srem_int` / `rem_float`).
+    Rem,
+    And,
+    Or,
+    Xor,
+    Shl,
+    /// `>>` (`ashr_int`, sign-fill).
+    Shr,
+    /// `>>>` (`lshr_int`, zero-fill).
+    Lshr,
     Slt,
     Sle,
     Eq,
@@ -84,47 +100,76 @@ fn read_op(op: Op, frame: &Frame, ssa_base: usize) -> Value {
 /// Apply a numeric builtin, choosing the `Int64` or `Float64` intrinsic by the
 /// operands' runtime type. This is a simplification: in Julia the operator is a
 /// generic function that dispatches to the typed intrinsic. Operands are assumed
-/// homogeneous (no implicit promotion yet).
-fn apply(b: Builtin, args: &Frame) -> Value {
+/// homogeneous (no implicit promotion yet), except `/`, which converts integer
+/// operands through `sitofp` as Julia's `base/` promotion does. `Err` carries
+/// the would-be exception (e.g. `DivideError`) until real exceptions exist.
+fn apply(b: Builtin, args: &Frame) -> Result<Value, String> {
     let x = args.get(0);
     let y = args.get(1);
     if let Builtin::Egal = b {
-        return box_bool(crate::builtins::egal(x, y)); // any values, no unboxing
+        return Ok(box_bool(crate::builtins::egal(x, y))); // any values, no unboxing
+    }
+    if let Builtin::Div = b {
+        let as_f64 = |v| {
+            if object::type_of(v) == types::builtin(id::FLOAT64) {
+                unbox_float64(v)
+            } else {
+                sitofp(unbox_int(v))
+            }
+        };
+        return Ok(box_float64(div_float(as_f64(x), as_f64(y))));
     }
     if object::type_of(x) == types::builtin(id::FLOAT64) {
         let (a, c) = (unbox_float64(x), unbox_float64(y));
-        match b {
+        Ok(match b {
             Builtin::Add => box_float64(add_float(a, c)),
             Builtin::Sub => box_float64(sub_float(a, c)),
             Builtin::Mul => box_float64(mul_float(a, c)),
+            Builtin::Rem => box_float64(rem_float(a, c)),
             Builtin::Slt => box_bool(lt_float(a, c)),
             Builtin::Sle => box_bool(le_float(a, c)),
             Builtin::Eq => box_bool(eq_float(a, c)),
-            Builtin::Egal => unreachable!("handled before unboxing"),
-        }
+            Builtin::IDiv
+            | Builtin::And
+            | Builtin::Or
+            | Builtin::Xor
+            | Builtin::Shl
+            | Builtin::Shr
+            | Builtin::Lshr => return Err("integer operator applied to Float64".to_string()),
+            Builtin::Div | Builtin::Egal => unreachable!("handled above"),
+        })
     } else {
         let (a, c) = (unbox_int(x), unbox_int(y));
-        match b {
+        Ok(match b {
             Builtin::Add => box_int(add_int(a, c)),
             Builtin::Sub => box_int(sub_int(a, c)),
             Builtin::Mul => box_int(mul_int(a, c)),
+            Builtin::IDiv => box_int(checked_sdiv_int(a, c).ok_or("DivideError")?),
+            Builtin::Rem => box_int(checked_srem_int(a, c).ok_or("DivideError")?),
+            Builtin::And => box_int(and_int(a, c)),
+            Builtin::Or => box_int(or_int(a, c)),
+            Builtin::Xor => box_int(xor_int(a, c)),
+            Builtin::Shl => box_int(shl_int(a, c)),
+            Builtin::Shr => box_int(ashr_int(a, c)),
+            Builtin::Lshr => box_int(lshr_int(a, c)),
             Builtin::Slt => box_bool(slt_int(a, c)),
             Builtin::Sle => box_bool(sle_int(a, c)),
             Builtin::Eq => box_bool(eq_int(a, c)),
-            Builtin::Egal => unreachable!("handled before unboxing"),
-        }
+            Builtin::Div | Builtin::Egal => unreachable!("handled above"),
+        })
     }
 }
 
 /// Evaluate `body` with no arguments.
-pub fn eval(body: &Body) -> Value {
+pub fn eval(body: &Body) -> Result<Value, String> {
     eval_with_args(body, &[])
 }
 
 /// Evaluate `body`, binding `args` to its leading slots (a method invocation).
 /// The slots and SSA values live in one GC frame and are roots throughout; each
-/// call's argument temporaries get their own short-lived frame.
-pub fn eval_with_args(body: &Body, args: &[Value]) -> Value {
+/// call's argument temporaries get their own short-lived frame. `Err` carries
+/// a would-be exception upward until real exception handling exists.
+pub fn eval_with_args(body: &Body, args: &[Value]) -> Result<Value, String> {
     let ssa_base = body.nslots;
     let frame = Frame::new(body.nslots + body.code.len());
     for (i, &a) in args.iter().enumerate() {
@@ -146,7 +191,7 @@ pub fn eval_with_args(body: &Body, args: &[Value]) -> Value {
                 }
             }
             Stmt::Return(op) => {
-                return read_op(*op, &frame, ssa_base);
+                return Ok(read_op(*op, &frame, ssa_base));
             }
             Stmt::Assign(slot, op) => {
                 let v = read_op(*op, &frame, ssa_base);
@@ -160,7 +205,7 @@ pub fn eval_with_args(body: &Body, args: &[Value]) -> Value {
                 }
                 let result = apply(*builtin, &argf);
                 drop(argf);
-                frame.set(ssa_base + ip, result);
+                frame.set(ssa_base + ip, result?);
             }
             Stmt::CallGeneric(func, args) => {
                 let argf = Frame::new(args.len());
@@ -170,7 +215,7 @@ pub fn eval_with_args(body: &Body, args: &[Value]) -> Value {
                 let vals: Vec<Value> = (0..args.len()).map(|j| argf.get(j)).collect();
                 let result = dispatch::invoke(*func, &vals); // args stay rooted via argf
                 drop(argf);
-                frame.set(ssa_base + ip, result);
+                frame.set(ssa_base + ip, result?);
             }
         }
         ip += 1;
