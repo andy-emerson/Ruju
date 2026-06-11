@@ -1,0 +1,13 @@
+[package]
+name = "ruju-runtime"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Ruju runtime: value representation, bounded-region allocator, and GC rooting."
+
+[lib]
+# cdylib produces the .wasm module; rlib lets the crate be unit-tested natively.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+intrinsics = { package = "ruju-intrinsics", path = "../intrinsics" }

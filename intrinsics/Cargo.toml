@@ -1,0 +1,9 @@
+[package]
+name = "ruju-intrinsics"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Ruju runtime intrinsics: arithmetic, memory, and type operations."
+
+[lib]
+name = "intrinsics"

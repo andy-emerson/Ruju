@@ -1,0 +1,387 @@
+# This file is a part of Julia. License is MIT: https://julialang.org/license
+
+import Core: AbstractChar, Char
+
+"""
+The `AbstractChar` type is the supertype of all character implementations
+in Julia. A character normally represents a Unicode codepoint (and can
+also encapsulate other information from an encoded byte sequence as described below),
+and characters can be converted to integer codepoint values via the [`codepoint`](@ref)
+function, or can be constructed from the same integer.  At least for valid,
+properly encoded Unicode characters, these numerical codepoint values
+determine how characters are compared with `<` and `==`, for example.
+New `T <: AbstractChar` types should define a `codepoint(::T)`
+method and a `T(::UInt32)` constructor, at minimum.
+
+A given `AbstractChar` subtype may be capable of representing only a subset
+of Unicode, in which case conversion from an unsupported `UInt32` value
+may throw an error. Conversely, the built-in [`Char`](@ref) type represents
+a *superset* of Unicode (in order to losslessly encode invalid byte streams),
+in which case conversion of a non-Unicode value *to* `UInt32` throws an error
+(see [`Base.ismalformed`](@ref)), and on the other hand a `Char` can also represent
+a nonstandard "overlong" encoding ([`Base.isoverlong`](@ref)) of a codepoint.
+The [`isvalid`](@ref) function can be used to check which codepoints are
+representable in a given `AbstractChar` type.
+
+Internally, an `AbstractChar` type may use a variety of encodings.  Conversion
+via `codepoint(char)` will not reveal this encoding because it always returns the
+Unicode value of the character. `print(io, c)` of any `c::AbstractChar`
+produces an encoding determined by `io` (UTF-8 for all built-in `IO`
+types), via conversion to `Char` if necessary.
+
+`write(io, c)`, in contrast, may emit an encoding depending on
+`typeof(c)`, and `read(io, typeof(c))` should read the same encoding as `write`.
+New `AbstractChar` types must provide their own implementations of
+`write` and `read`.
+"""
+AbstractChar
+
+"""
+    Char(c::Union{Number,AbstractChar})
+
+`Char` is a 32-bit [`AbstractChar`](@ref) type that is the default representation
+of characters in Julia. `Char` is the type used for character literals like `'x'`
+and it is also the element type of [`String`](@ref).
+
+In order to losslessly represent arbitrary byte streams stored in a `String`,
+a `Char` value may store information that cannot be converted to a Unicode
+codepoint — converting such a `Char` to `UInt32` will throw an error.
+The [`isvalid(c::Char)`](@ref) function can be used to query whether `c`
+represents a valid Unicode character.
+"""
+Char
+
+@constprop :aggressive (::Type{T})(x::Number) where {T<:AbstractChar} = T(UInt32(x)::UInt32)
+@constprop :aggressive AbstractChar(x::Number) = Char(x)
+@constprop :aggressive (::Type{T})(x::AbstractChar) where {T<:Union{Number,AbstractChar}} = T(codepoint(x))
+@constprop :aggressive (::Type{T})(x::AbstractChar) where {T<:Union{Int32,Int64}} = codepoint(x) % T
+(::Type{T})(x::T) where {T<:AbstractChar} = x
+
+"""
+    ncodeunits(c::Char)::Int
+
+Return the number of code units required to encode a character as UTF-8.
+This is the number of bytes which will be printed if the character is written
+to an output stream, or `ncodeunits(string(c))` but computed efficiently.
+
+!!! compat "Julia 1.1"
+    This method requires at least Julia 1.1. In Julia 1.0 consider
+    using `ncodeunits(string(c))`.
+"""
+function ncodeunits(c::Char)
+    u = reinterpret(UInt32, c)
+    # We care about how many trailing bytes are all zero
+    # subtract that from the total number of bytes
+    n_nonzero_bytes = sizeof(UInt32) - div(trailing_zeros(u), 0x8)
+    # Take care of '\0', which has an all-zero bitpattern
+    n_nonzero_bytes + iszero(u)
+end
+
+"""
+    codepoint(c::AbstractChar)::Integer
+
+Return the Unicode codepoint (an unsigned integer) corresponding
+to the character `c` (or throw an exception if `c` represents
+a malformed character). For `Char`, this is a `UInt32` value, but
+`AbstractChar` types that represent only a subset of Unicode may
+return a different-sized integer (e.g. `UInt8`).
+
+Should succeed for any non-malformed character, i.e. when
+[`Base.ismalformed(c)`](@ref) returns `false`.   This includes
+invalid Unicode characters (such as unpaired surrogates)
+and overlong encodings.
+
+!!! compat "Julia 1.12"
+    Prior to Julia 1.12, `codepoint(c)` fails for overlong encodings (when
+    [`Base.isoverlong(c)`](@ref) is `true`), and `Base.decode_overlong(c)` was needed.
+"""
+function codepoint end
+
+@constprop :aggressive codepoint(c::Char) = UInt32(c)
+
+struct InvalidCharError{T<:AbstractChar} <: Exception
+    char::T
+end
+struct CodePointError{T<:Integer} <: Exception
+    code::T
+end
+@noinline throw_invalid_char(c::AbstractChar) = throw(InvalidCharError(c))
+@noinline throw_code_point_err(u::Integer) = throw(CodePointError(u))
+
+function ismalformed(c::Char)
+    u = bitcast(UInt32, c)
+    l1 = leading_ones(u) << 3
+    t0 = trailing_zeros(u) & 56
+    (l1 == 8) | (l1 + t0 > 32) |
+    (((u & 0x00c0c0c0) ⊻ 0x00808080) >> t0 != 0)
+end
+
+@inline is_overlong_enc(u::UInt32) = (u >> 24 == 0xc0) | (u >> 24 == 0xc1) | (u >> 21 == 0x0704) | (u >> 20 == 0x0f08)
+
+function isoverlong(c::Char)
+    u = bitcast(UInt32, c)
+    is_overlong_enc(u)
+end
+
+# fallback: other AbstractChar types, by default, are assumed
+#           not to support malformed or overlong encodings.
+
+"""
+    ismalformed(c::AbstractChar)::Bool
+
+Return `true` if `c` represents malformed (non-codepoint / mis-encoded) data according to the
+encoding used by `c`. Defaults to `false` for non-`Char` types.
+
+Any *non*-malformed `c` can be mapped to an integer codepoint
+by [`codepoint(c)`](@ref); this includes codepoints that are
+not valid Unicode characters ([`isvalid(c)`](@ref) is `false`).
+For example, well-formed characters can include invalid Unicode
+codepoints like `'\\U110000'`, unpaired surrogates such as `'\\ud800'`,
+and can also include overlong encodings ([`Base.isoverlong`](@ref)).
+Malformed data, in contrast, cannot be decoded to a codepoint
+(`codepoint` will throw an exception).
+
+See also [`Base.show_invalid`](@ref).
+"""
+ismalformed(c::AbstractChar) = false
+
+"""
+    isoverlong(c::AbstractChar)::Bool
+
+Return `true` if `c` represents an overlong UTF-8 sequence. Defaults
+to `false` for non-`Char` types.
+
+See also [`Base.show_invalid`](@ref).
+"""
+isoverlong(c::AbstractChar) = false
+
+@constprop :aggressive function UInt32(c::Char)
+    # TODO: use optimized inline LLVM
+    u = bitcast(UInt32, c)
+    u < 0x80000000 && return u >> 24
+    l1 = leading_ones(u)
+    t0 = trailing_zeros(u) & 56
+    (l1 == 1) | (8l1 + t0 > 32) |
+    (((u & 0x00c0c0c0) ⊻ 0x00808080) >> t0 != 0) &&
+        throw_invalid_char(c)
+    u &= 0xffffffff >> l1
+    u >>= t0
+    ((u & 0x0000007f) >> 0) | ((u & 0x00007f00) >> 2) |
+    ((u & 0x007f0000) >> 4) | ((u & 0x7f000000) >> 6)
+end
+
+"""
+    Base.unsafe_codepoint(c::AbstractChar)::UInt32
+
+Like [`codepoint(c)`](@ref), but assumes `!`[`Base.ismalformed(c)`](@ref): for
+`Char`, the result is unspecified when `c` is malformed. Intended as a low-level
+helper for code that has already verified well-formedness, so that the compiler
+can prove the result is `:nothrow`. Prefer `codepoint(c)` otherwise.
+
+For non-`Char` `AbstractChar` subtypes this falls back to `UInt32(c)`.
+"""
+unsafe_codepoint(c::AbstractChar) = UInt32(c)::UInt32
+@constprop :aggressive @assume_effects :nothrow :foldable function unsafe_codepoint(c::Char)
+    u = bitcast(UInt32, c)
+    u < 0x80000000 && return u >> 24
+    l1 = leading_ones(u)
+    t0 = trailing_zeros(u) & 56
+    u &= 0xffffffff >> l1
+    u >>= t0
+    return ((u & 0x0000007f) >> 0) | ((u & 0x00007f00) >> 2) | ((u & 0x007f0000) >> 4) | ((u & 0x7f000000) >> 6)
+end
+
+"""
+    decode_overlong(c::AbstractChar)::Integer
+
+When [`isoverlong(c)`](@ref) is `true`, `decode_overlong(c)` returns
+the Unicode codepoint value of `c`.   Deprecated in favor of
+`codepoint(c)`.
+
+!!! compat "Julia 1.12"
+    In Julia 1.12 or later, `decode_overlong(c)` simply calls
+    `codepoint(c)`, which should now work for overlong encodings.
+    `AbstractChar` implementations that support overlong encodings
+    should implement `Base.decode_overlong` on older releases.
+"""
+function decode_overlong end
+
+@constprop :aggressive decode_overlong(c::AbstractChar) = codepoint(c)
+
+@constprop :aggressive function Char(u::UInt32)
+    u < 0x80 && return bitcast(Char, u << 24)
+    u < 0x00200000 || throw_code_point_err(u)
+    c = ((u << 0) & 0x0000003f) | ((u << 2) & 0x00003f00) |
+        ((u << 4) & 0x003f0000) | ((u << 6) & 0x3f000000)
+    c = u < 0x00000800 ? (c << 16) | 0xc0800000 :
+        u < 0x00010000 ? (c << 08) | 0xe0808000 :
+                         (c << 00) | 0xf0808080
+    bitcast(Char, c)
+end
+
+@constprop :aggressive @noinline UInt32_cold(c::Char) = UInt32(c)
+@constprop :aggressive function (T::Union{Type{Int8},Type{UInt8}})(c::Char)
+    i = bitcast(Int32, c)
+    i ≥ 0 ? ((i >>> 24) % T) : T(UInt32_cold(c))
+end
+
+@constprop :aggressive @noinline Char_cold(b::UInt32) = Char(b)
+@constprop :aggressive function Char(b::Union{Int8,UInt8})
+    0 ≤ b ≤ 0x7f ? bitcast(Char, (b % UInt32) << 24) : Char_cold(UInt32(b))
+end
+
+convert(::Type{AbstractChar}, x::Number) = Char(x) # default to Char
+convert(::Type{T}, x::Number) where {T<:AbstractChar} = T(x)::T
+convert(::Type{T}, x::AbstractChar) where {T<:Number} = T(x)::T
+convert(::Type{T}, c::AbstractChar) where {T<:AbstractChar} = T(c)::T
+convert(::Type{T}, c::T) where {T<:AbstractChar} = c
+
+rem(x::AbstractChar, ::Type{T}) where {T<:Number} = rem(codepoint(x), T)
+
+typemax(::Type{Char}) = bitcast(Char, typemax(UInt32))
+typemin(::Type{Char}) = bitcast(Char, typemin(UInt32))
+
+size(c::AbstractChar) = ()
+size(c::AbstractChar, d::Integer) = d < 1 ? throw(BoundsError()) : 1
+ndims(c::AbstractChar) = 0
+ndims(::Type{<:AbstractChar}) = 0
+length(c::AbstractChar) = 1
+IteratorSize(::Type{<:AbstractChar}) = HasShape{0}()
+firstindex(c::AbstractChar) = 1
+lastindex(c::AbstractChar) = 1
+getindex(c::AbstractChar) = c
+getindex(c::AbstractChar, i::Integer) = i == 1 ? c : throw(BoundsError())
+getindex(c::AbstractChar, I::Integer...) = all(x -> x == 1, I) ? c : throw(BoundsError())
+first(c::AbstractChar) = c
+last(c::AbstractChar) = c
+eltype(::Type{T}) where {T<:AbstractChar} = T
+
+iterate(c::AbstractChar, done=false) = done ? nothing : (c, true)
+isempty(c::AbstractChar) = false
+in(x::AbstractChar, y::AbstractChar) = x == y
+
+==(x::Char, y::Char) = bitcast(UInt32, x) == bitcast(UInt32, y)
+isless(x::Char, y::Char) = bitcast(UInt32, x) < bitcast(UInt32, y)
+hash(x::Char, h::UInt) =
+    hash_finalizer(((bitcast(UInt32, x) + UInt64(0xd4d64234)) << 32) ⊻ UInt64(h)) % UInt
+
+# fallbacks:
+isless(x::AbstractChar, y::AbstractChar) = isless(Char(x)::Char, Char(y)::Char)
+==(x::AbstractChar, y::AbstractChar) = Char(x)::Char == Char(y)::Char
+hash(x::AbstractChar, h::UInt) = hash(Char(x)::Char, h)
+widen(::Type{T}) where {T<:AbstractChar} = T
+
+@inline -(x::AbstractChar, y::AbstractChar) = Int(x) - Int(y)
+@inline function -(x::T, y::Integer) where {T<:AbstractChar}
+    if x isa Char
+        u = Int32((bitcast(UInt32, x) >> 24) % Int8)
+        if u >= 0 # inline the runtime fast path
+            z = u - y
+            return 0 <= z < 0x80 ? bitcast(Char, (z % UInt32) << 24) : Char(UInt32(z))
+        end
+    end
+    return T(Int32(x) - Int32(y))
+end
+@inline function +(x::T, y::Integer) where {T<:AbstractChar}
+    if x isa Char
+        u = Int32((bitcast(UInt32, x) >> 24) % Int8)
+        if u >= 0 # inline the runtime fast path
+            z = u + y
+            return 0 <= z < 0x80 ? bitcast(Char, (z % UInt32) << 24) : Char(UInt32(z))
+        end
+    end
+    return T(Int32(x) + Int32(y))
+end
+@inline +(x::Integer, y::AbstractChar) = y + x
+
+# `print` should output UTF-8 by default for all AbstractChar types.
+# (Packages may implement other IO subtypes to specify different encodings.)
+# In contrast, `write(io, c)` outputs a `c` in an encoding determined by typeof(c).
+print(io::IO, c::Char) = (write(io, c); nothing)
+print(io::IO, c::AbstractChar) = print(io, Char(c)::Char) # fallback: convert to output UTF-8
+
+const hex_chars = UInt8['0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+                        'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
+                        'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r',
+                        's', 't', 'u', 'v', 'w', 'x', 'y', 'z']
+
+function show_invalid(io::IO, c::Char)
+    write(io, 0x27)
+    u = bitcast(UInt32, c)
+    while true
+        a = hex_chars[((u >> 28) & 0xf) + 1]
+        b = hex_chars[((u >> 24) & 0xf) + 1]
+        write(io, 0x5c, UInt8('x'), a, b)
+        (u <<= 8) == 0 && break
+    end
+    write(io, 0x27)
+end
+
+"""
+    Base.show_invalid(io::IO, c::AbstractChar)
+
+Called by `show(io, c)` when [`isoverlong(c)`](@ref) or
+[`ismalformed(c)`](@ref) return `true`.   Subclasses
+of `AbstractChar` should define `Base.show_invalid` methods
+if they support storing invalid character data.
+"""
+show_invalid
+
+# show c to io, assuming UTF-8 encoded output
+function show(io::IO, c::AbstractChar)
+    if c <= '\\'
+        b = c == '\0' ? 0x30 :
+            c == '\a' ? 0x61 :
+            c == '\b' ? 0x62 :
+            c == '\t' ? 0x74 :
+            c == '\n' ? 0x6e :
+            c == '\v' ? 0x76 :
+            c == '\f' ? 0x66 :
+            c == '\r' ? 0x72 :
+            c == '\e' ? 0x65 :
+            c == '\'' ? 0x27 :
+            c == '\\' ? 0x5c : 0xff
+        if b != 0xff
+            write(io, 0x27, 0x5c, b, 0x27)
+            return
+        end
+    end
+    if isoverlong(c) || ismalformed(c)
+        show_invalid(io, c)
+    elseif isprint(c)
+        write(io, 0x27)
+        print(io, c) # use print, not write, to use UTF-8 for any AbstractChar
+        write(io, 0x27)
+    else # unprintable, well-formed, non-overlong Unicode
+        u = codepoint(c)
+        write(io, 0x27, 0x5c, u <= 0x7f ? 0x78 : u <= 0xffff ? 0x75 : 0x55)
+        d = max(2, 8 - (leading_zeros(u) >> 2))
+        while 0 < d
+            write(io, hex_chars[((u >> ((d -= 1) << 2)) & 0xf) + 1])
+        end
+        write(io, 0x27)
+    end
+    return
+end
+
+function show(io::IO, ::MIME"text/plain", c::T) where {T<:AbstractChar}
+    show(io, c)
+    get(io, :compact, false)::Bool && return
+    if !ismalformed(c)
+        print(io, ": ")
+        if isoverlong(c)
+            print(io, "[overlong] ")
+            u = decode_overlong(c) # backwards compat Julia < 1.12
+            c = T(u)
+        else
+            u = codepoint(c)
+        end
+        h = uppercase(string(u, base = 16, pad = 4))
+        print(io, (isascii(c) ? "ASCII/" : ""), "Unicode U+", h)
+    else
+        print(io, ": Malformed UTF-8")
+    end
+    abr = Unicode.category_abbrev(c)
+    str = Unicode.category_string(c)
+    print(io, " (category ", abr, ": ", str, ")")
+end

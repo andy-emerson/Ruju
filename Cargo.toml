@@ -1,0 +1,14 @@
+# Ruju Rust workspace.
+#
+# This is the build root for the Rust reimplementation of Julia's runtime. The
+# Julia-written layers (base/, stdlib/, Compiler/) and the C reference under
+# src/ are not part of this workspace; they are built by their own tooling.
+[workspace]
+resolver = "2"
+members = ["runtime", "intrinsics"]
+
+[profile.release]
+# Small, predictable .wasm output.
+opt-level = "s"
+lto = true
+panic = "abort"
