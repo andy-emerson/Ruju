@@ -32,7 +32,7 @@ departure *beyond* them.
 | Tagged header (tag-before-object, GC bits) | Done | Faithful | `jl_taggedvalue_t` |
 | `DataType` struct | Partial | Faithful | ~6 of `jl_datatype_t`'s ~17 fields |
 | Field layout | Partial | Faithful | pointer bitmap only; no field-type/offset table |
-| Boxing | Partial | Faithful | `Int64`/`Bool`/`Float64`; no small-int cache; other primitives later |
+| Boxing | Partial | Faithful | `Int64`/`Bool`/`Float64`; no small-int cache; `Bool` boxes are freshly allocated, not the `jl_true`/`jl_false` singletons (identity gap, observable once `===` exists); other primitives later |
 | `SimpleVector` | Done | Faithful | `jl_svec_t` |
 | Singletons | Partial | Faithful | tracked outside the type; no `instance` field |
 
@@ -45,7 +45,7 @@ departure *beyond* them.
 | `TypeName` | Partial | Faithful | name + cache; missing module/wrapper/names/hash |
 | `apply_type` instantiation | Partial | Faithful | tuples + parametrics; no `UnionAll` instantiation |
 | Uniquing (hash-consing) | Partial | Faithful | on `TypeName`; linear scan vs sorted/hashed |
-| `Union` | Partial | Faithful | normalized (`jl_type_union`): flatten, subtype-dedup, canonical sort; not interned to `===`, no `Vararg` merge |
+| `Union` | Partial | Faithful | normalized (`jl_type_union`): flatten, subtype-dedup, canonical sort; sort misses `union_sort_cmp`'s singleton/isbits tiers; dedup uses full `issubtype` vs the C's typevar-aware `simple_subtype`; type `===` needs structural `jl_types_egal` (Julia does **not** intern unions); no `Vararg` merge |
 | `Bottom` | Partial | Faithful | a `DataType`; Julia uses a `TypeofBottom` instance |
 | `UnionAll` / `TypeVar` | Partial | Faithful | `jl_unionall_t`/`jl_tvar_t` objects (var + bounds + body); no `where`-var renaming/aliasing or `innervars` |
 | `Type{T}` kinds | Planned | Faithful | — |
@@ -60,9 +60,9 @@ currently 24/24.
 
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
-| `jl_subtype` structural core | Partial | Faithful | reflexive/`Any`/`Bottom`, Union forall–exists, covariant tuples, nominal, invariant parametrics, `UnionAll`/`TypeVar` via the env |
+| `jl_subtype` structural core | Partial | Faithful | reflexive/`Any`/`Bottom`, Union forall–exists, covariant tuples, nominal, invariant parametrics, `UnionAll`/`TypeVar` via the env. Known divergences (audit 2026-06): free-vs-free typevars consult bounds (Julia: unconditionally false); unions split before typevar/UnionAll handling (Julia prioritizes the latter); `forall_exists_equal` reverse check runs Invariant (Julia: `PARAM_NONE`) and lacks the same-name-datatype and two-union fast paths |
 | Existential env (`jl_stenv_t`) | Partial | Faithful | `var_lt`/`var_gt` narrow per-var `lb`/`ub`; ∀/∃ via the `existential` flag; `invdepth`/`depth0` order interacting existentials (`var_outside`, ∀∃-vs-∃∀). No `where`-var renaming or `innervars` leak handling |
-| Diagonal rule | Partial | Faithful | `occurs_cov` + `cov_diag` consistency-scope folding (`subtype_ccheck`), static `var_occurs_invariant`, `is_leaf_bound`; no cross-var `concrete` propagation |
+| Diagonal rule | Partial | Faithful | `occurs_cov` + `cov_diag` consistency-scope folding (`subtype_ccheck`), static `var_occurs_invariant`, `is_leaf_bound`; no cross-var `concrete` propagation; `ccheck` enters at the caller's param (Julia: `PARAM_NONE`); pinned C has newer machinery the port predates (`Intersect` #61917, `push_forall_bound_scope`, `Loffset`) |
 | Union backtracking | Partial | Faithful | env save/restore on the exists branch; not Julia's `Lunions`/`Runions` bit-stack iterator |
 | `simple_meet` / `simple_join` | Partial | Faithful | join defers to the normalized `union_type` (keeps free vars, so `S>:T` survives); meet over-estimates to `b` for typevar operands (no `Intersect` node) |
 | `jl_type_intersection` | Planned | Faithful | — |
@@ -75,7 +75,7 @@ currently 24/24.
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
 | Method table | Partial | Faithful | Rust-side table; Julia's is heap `jl_methtable_t` |
-| Applicability | Partial | Faithful | `argtuple <: sig`; Julia uses type intersection |
+| Applicability | Partial | Faithful | `argtuple <: sig` — matches Julia's concrete-tuple dispatch (intersection serves abstract match queries/ambiguity); missing: typemap cache, world age |
 | Specificity | Partial | Faithful | subtype-based |
 | Method cache (`typemap`) | Planned | Faithful | linear scan per call now |
 | World age | Planned | Faithful | — |
@@ -118,14 +118,14 @@ currently 24/24.
 
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
-| Pool allocation (size classes, pages, free lists) | Done | Faithful | `jl_gc_pool_t` |
+| Pool allocation (size classes, pages, free lists) | Partial | Faithful | `jl_gc_pool_t` design (freelist threads the header word = `jl_taggedvalue_t.next`); but 12-entry geometric size table vs Julia's ~50-entry table, 4 KiB pages vs default 16 KiB, one global freelist per class vs per-page freelists + `newpages` + `pagemeta` (audit 2026-06) |
 | Big-object path | Planned | Faithful | large objects use a pool for now |
 | Precise marking | Done | Faithful | type-layout driven |
-| Sweeping (page walk, free-list rebuild) | Done | Faithful | — |
+| Sweeping (page walk, free-list rebuild) | Partial | Faithful | eager every-page walk; Julia's lazy/quick-sweep page machinery (`pagemeta` has_marked/has_young) absent (audit 2026-06) |
 | Non-moving collection | Done | Faithful | the stock GC is non-moving too |
 | Generational state encodings | Done | Faithful | `GC_CLEAN/MARKED/OLD/OLD_MARKED`, verified |
 | Promotion policy | Partial | Faithful | one-survival placeholder; Julia uses `PROMOTE_AGE` + per-object age |
-| Write barrier + remembered set | Done | Faithful | `jl_gc_wb`; our condition fires on any old parent (a consequence of the promotion stub) |
+| Write barrier + remembered set | Partial | Faithful | `jl_gc_wb`'s condition differs in both halves: Julia fires on parent `== GC_OLD_MARKED` with child unMARKED and re-tags via `jl_gc_queue_root`; ours fires on any old parent with child not-old, never re-tags (duplicates possible). Conservative-correct (audit 2026-06) |
 | Collection trigger | Partial | Faithful | exhaustion-only placeholder; Julia is proactive at a heap-target |
 | Full-vs-quick policy | Partial | Faithful | escalation placeholder; Julia uses a growth heuristic |
 | Shadow-stack rooting (`gcframe`) | Done | Faithful | — |
@@ -148,7 +148,7 @@ currently 24/24.
 
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
-| Interned, immortal symbol table | Partial | Faithful | immortal ✓; a Rust `Vec` (linear) vs Julia's hashed table |
+| Interned, immortal symbol table | Partial | Faithful | immortal ✓; a Rust `Vec` (linear) vs Julia's hash-keyed invasive binary tree embedded in `jl_sym_t` (`left`/`right`/`hash`) — our symbol body is `len + bytes`, no embedded tree links |
 
 ## Modules & top level — `module.c`, `toplevel.c`
 

@@ -26,7 +26,7 @@ them current as you work.
 | Path | Owner | What it is |
 | - | - | - |
 | `runtime/`, `intrinsics/` | **ours** | the Rust runtime + a pure-intrinsics crate, plus `runtime/harness.mjs` (JS host) and `runtime/verify_julia_subtype.mjs` (the oracle) |
-| `design/` | **ours** | `architecture.md`, `roadmap.md`, `ledger.md` |
+| `design/` | **ours** | `architecture.md`, `roadmap.md`, `ledger.md`, `fidelity-audit.md` |
 | `reference/julia/` | **Julia (MIT)** | a pinned, verbatim subset of JuliaLang/julia (incl. `test/`, the oracle source) — see `reference/README.md`; licensing in `LICENSE.md` |
 
 We port from `reference/julia/src/` (the C/C++ runtime). `reference/julia/`'s
