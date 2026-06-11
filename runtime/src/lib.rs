@@ -8,6 +8,7 @@
 //! their DataType, per `src/julia.h` and the GC-rooting decision in
 //! `design/strategy.md`.
 
+mod builtins;
 mod dispatch;
 mod frontend;
 mod gc;
@@ -238,6 +239,21 @@ pub extern "C" fn rj_supertype(t: u32) -> u32 {
 #[no_mangle]
 pub extern "C" fn rj_subtype(a: u32, b: u32) -> u32 {
     types::issubtype(a as Offset, b as Offset) as u32
+}
+
+/// `a === b` (`jl_egal`): 1 if the values are egal.
+#[no_mangle]
+pub extern "C" fn rj_egal(a: u32, b: u32) -> u32 {
+    ensure_init();
+    builtins::egal(Value(a), Value(b)) as u32
+}
+
+/// Structural type equality (`jl_types_egal`): alpha-equivalent `where` types
+/// are equal regardless of variable names.
+#[no_mangle]
+pub extern "C" fn rj_types_egal(a: u32, b: u32) -> u32 {
+    ensure_init();
+    builtins::types_egal(a as Offset, b as Offset) as u32
 }
 
 /// Construct the tuple type `Tuple{a}`.
@@ -787,6 +803,68 @@ mod tests {
         assert_eq!(gc::root_count(), 0, "roots balanced after union normalization");
     }
 
+    // jl_egal / jl_types_egal: identity, payload bits, structure, and the
+    // tvar_names asymmetry between `===` and types-equal.
+    #[test]
+    fn egal_and_types_egal() {
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+        let eg = |a: Value, b: Value| builtins::egal(a, b);
+
+        // Distinct boxes, equal bits: egal compares the payload, not identity.
+        let (a, b) = (box_int(5), box_int(5));
+        assert_ne!(a, b, "two boxes are distinct objects");
+        assert!(eg(a, b));
+        assert!(!eg(box_int(5), box_int(6)));
+        // Type tags must match: Int64(1) is not Bool(true) or Float64.
+        assert!(!eg(box_int(1), value::box_bool(true)));
+        assert!(!eg(box_int(0), value::box_float64(0.0)));
+
+        // Bitwise float semantics — where `===` and `==` disagree:
+        // NaN === NaN (equal bits) though NaN == NaN is false …
+        assert!(eg(value::box_float64(f64::NAN), value::box_float64(f64::NAN)));
+        assert!(!intrinsics::eq_float(f64::NAN, f64::NAN));
+        // … and -0.0 !== 0.0 (different bits) though -0.0 == 0.0 is true.
+        assert!(!eg(value::box_float64(-0.0), value::box_float64(0.0)));
+        assert!(intrinsics::eq_float(-0.0, 0.0));
+
+        // Identity-only kinds: the permboxes and `nothing`.
+        assert!(eg(value::box_bool(true), value::box_bool(true)));
+        assert!(!eg(value::box_bool(true), value::box_bool(false)));
+        assert!(eg(value::nothing(), value::nothing()));
+
+        // Types: uniqued instantiations are identical; distinct instantiations
+        // differ; structurally equal unions built separately are egal even
+        // though they are distinct objects (Julia does not intern unions).
+        assert!(eg(Value(types::box_type(t(id::INT64))), Value(types::box_type(t(id::INT64)))));
+        assert!(!eg(Value(types::box_type(t(id::INT64))), Value(types::box_type(t(id::INTEGER)))));
+        let u1 = types::union_type(t(id::INT64), t(id::NOTHING));
+        let u2 = types::union_type(t(id::NOTHING), t(id::INT64));
+        assert!(eg(Value(u1), Value(u2)));
+
+        // The tvar_names asymmetry: (Tuple{T,T} where T) vs (Tuple{R,R} where R)
+        // is types_egal (alpha-equivalent) but NOT === (names matter to egal).
+        let wh = |name: &str| {
+            let v = types::make_typevar(name, t(id::BOTTOM), t(id::ANY));
+            types::unionall_type(v, types::tuple_type(&[v, v]))
+        };
+        let (wt, wr) = (wh("T"), wh("R"));
+        assert!(builtins::types_egal(wt, wr));
+        assert!(!eg(Value(wt), Value(wr)));
+        // Same name, separately built: both equal.
+        let wt2 = wh("T");
+        assert!(builtins::types_egal(wt, wt2));
+        assert!(eg(Value(wt), Value(wt2)));
+        // Free typevars: equal only to themselves.
+        let (fv1, fv2) = (types::make_typevar("X", t(id::BOTTOM), t(id::ANY)),
+                          types::make_typevar("X", t(id::BOTTOM), t(id::ANY)));
+        assert!(builtins::types_egal(fv1, fv1));
+        assert!(!builtins::types_egal(fv1, fv2));
+
+        assert_eq!(gc::root_count(), 0, "roots balanced");
+    }
+
     // jl_datatype_t.instance, the Bool permboxes, and union_sort_cmp's tiers.
     #[test]
     fn singletons_and_bool_permboxes() {
@@ -1026,6 +1104,13 @@ mod tests {
             run("acc = 0\ni = 1\nwhile i <= 100\nacc = acc + i\ni = i + 1\nend\nacc"),
             5050
         );
+
+        // `===` from source goes through the egal builtin, not numeric `==`.
+        let runb = |s: &str| value::unbox_bool(frontend::eval_source(s).unwrap());
+        assert!(runb("x = 7\nx === 7"));
+        assert!(!runb("1 === 2"));
+        assert!(runb("1.5 === 1.5"));
+        assert!(!runb("1 === 1.5")); // different type tags, never equal
     }
 
     #[test]

@@ -384,12 +384,25 @@ loop and the slots-then-SSA-values single-frame layout match the C exactly
 | `:new` / `getfield` / `setfield!` / globals / closures | Planned | Faithful | — |
 | IR source | Partial | **Divergence** | hand-built Rust IR via a Rust front-end; faithful path is heap `CodeInfo` from `JuliaLowering` |
 
-## Builtins — `builtins.c`
+## Builtins — `builtins.c` vs `builtins.rs`
+
+**Reference-verified (2026-06, egal increment).** `egal` ports `jl_egal_`
+(`julia.h:1877`) → `jl_egal__unboxed_` (`julia.h:1866`: symbols, `Bool`,
+`Nothing`, mutables compare by identity only — sound because of interning,
+the permboxes, and `instance`) → `jl_egal__bitstag` (`builtins.c:247`:
+payload bits by width, svec elementwise, DataType name+parameters, `Union`
+componentwise, `UnionAll` via `egal_types` with `tvar_names = 1`).
+`types_egal` ports `egal_types` (`builtins.c:169`) with the typevar
+environment; `jl_types_egal` (`builtins.c:230`) is the `tvar_names = 0`
+entry — so `===` on `where` types is name-sensitive while structural type
+equality is alpha-equivalent, and the tests pin that asymmetry. The
+front-end lexes `===` to the egal builtin (any values, no unboxing).
 
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
 | `typeof`, `<:` | Partial | Faithful | via the ABI |
-| `isa`, `===` | Planned | Faithful | unblocked: the `instance`/permbox work made identity sound (strategy frontier) |
+| `===` (`jl_egal`), `jl_types_egal` | Partial | Faithful | implemented for every value kind that exists (primitives by bits — NaN egal, ±0.0 not; identity-only kinds; svec; types; `where` alpha-equivalence). Omitted with the values that don't exist yet: strings, struct fields (`compare_fields`), `Vararg`, `TypeEq`, modules, `object_id`; the concrete-DataType fast path is skipped (uniquing reaches the same answer through parameters) |
+| `isa` | Planned | Faithful | — |
 | `getfield`/`setfield!`/`nfields`/`fieldtype` | Planned | Faithful | needs struct support |
 | `tuple`, `apply`, `invoke`, array builtins | Planned | Faithful | `invoke`-like dispatch exists |
 

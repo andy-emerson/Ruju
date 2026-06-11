@@ -84,7 +84,7 @@ flowchart TD
     INTERP0["interpreter core [done: phase-0 subset]"]
     FE0["bootstrap front-end [done: subset]"]
 
-    EGAL("egal & === (frontier)")
+    EGAL["egal & === [done: phase-0 subset]"]
     STRUCTS("struct support (frontier)")
     INTRIN("intrinsics & boxing breadth (frontier)")
     GCX("GC exactness & tuning (frontier)")
@@ -136,7 +136,6 @@ Unblocked now, in no required order — pick by the selection principles below.
 
 | Increment | What it is | What it unblocks |
 | - | - | - |
-| **egal & `===`** | `jl_egal` / `jl_types_egal` (`builtins.c`): structural type equality, value identity. Small; the `instance`/permbox work made it sound | union `===` semantics, dict/idset machinery later |
 | **struct support** | `DataType.types` (field types), `new`/`getfield`/`setfield!` in the interpreter | arrays, modules, real `base/` code — the widest gate on the map |
 | **intrinsics & boxing breadth** | remaining primitive boxings; div/rem, bitwise, shifts, conversions (`runtime_intrinsics.c`) | numeric Julia; mostly mechanical |
 | **GC exactness & tuning** | write-barrier exact condition + `queue_root` re-tag, promotion age, heap-target trigger, full-vs-quick (audit findings 17–19) | phase-1 AOT (GC must be trustworthy under real load) |

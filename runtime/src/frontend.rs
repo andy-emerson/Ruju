@@ -28,6 +28,7 @@ enum Tok {
     Gt,
     Ge,
     EqEq,
+    EqEqEq,
     Assign,
     LParen,
     RParen,
@@ -96,7 +97,10 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 }
             }
             b'=' => {
-                if b.get(i + 1) == Some(&b'=') {
+                if b.get(i + 1) == Some(&b'=') && b.get(i + 2) == Some(&b'=') {
+                    out.push(Tok::EqEqEq);
+                    i += 3;
+                } else if b.get(i + 1) == Some(&b'=') {
                     out.push(Tok::EqEq);
                     i += 2;
                 } else {
@@ -155,6 +159,7 @@ enum BinOp {
     Gt,
     Ge,
     Eq,
+    Egal,
 }
 
 enum Expr {
@@ -284,6 +289,7 @@ impl Parser {
                 Tok::Gt => BinOp::Gt,
                 Tok::Ge => BinOp::Ge,
                 Tok::EqEq => BinOp::Eq,
+                Tok::EqEqEq => BinOp::Egal,
                 _ => break,
             };
             self.next();
@@ -346,6 +352,7 @@ fn binop(op: BinOp) -> (Builtin, bool) {
         BinOp::Gt => (Builtin::Slt, true), // a > b  ==  b < a
         BinOp::Ge => (Builtin::Sle, true), // a >= b ==  b <= a
         BinOp::Eq => (Builtin::Eq, false),
+        BinOp::Egal => (Builtin::Egal, false),
     }
 }
 

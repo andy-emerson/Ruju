@@ -181,6 +181,18 @@ check(
   evalJulia("acc = 0\ni = 1\nwhile i <= 100\nacc = acc + i\ni = i + 1\nend\nacc"),
   5050n,
 );
+// `===` (egal) from source; the Bool result reads back as 1/0.
+check("source: 1 === 1", evalJulia("1 === 1"), 1n);
+check("source: 1 === 2", evalJulia("1 === 2"), 0n);
+check("source: x = 6 * 7; x === 42", evalJulia("x = 6 * 7\nx === 42"), 1n);
+// egal across the ABI: type identity and structural union equality.
+check("rj_egal(Int64, Int64)", x.rj_egal(ty(T.Int64), ty(T.Int64)), 1);
+check("rj_egal(Int64, Signed)", x.rj_egal(ty(T.Int64), ty(T.Signed)), 0);
+check(
+  "rj_types_egal(Union{Int64,Nothing} x2, built separately)",
+  x.rj_types_egal(x.rj_union_type(ty(T.Int64), ty(T.Nothing)), x.rj_union_type(ty(T.Nothing), ty(T.Int64))),
+  1,
+);
 // Float64 source (result read as a double).
 function evalJuliaF64(src) {
   const bytes = new TextEncoder().encode(src);

@@ -351,6 +351,11 @@ pub fn is_abstract(t: Offset) -> bool {
     unsafe { (*dt(t)).flags & FLAG_ABSTRACT != 0 }
 }
 
+/// Whether the DataType at `t` was declared `primitive type` (`isprimitivetype`).
+pub fn is_primitive(t: Offset) -> bool {
+    unsafe { (*dt(t)).flags & FLAG_PRIMITIVE != 0 }
+}
+
 /// A DataType's `TypeName` (the `name` field).
 pub fn name_of(t: Offset) -> Offset {
     unsafe { (*dt(t)).name }
@@ -727,6 +732,11 @@ pub fn is_typevar(t: Offset) -> bool {
 /// Whether the value at `t` is a `UnionAll`.
 pub fn is_unionall(t: Offset) -> bool {
     object::type_of(object::Value(t)) == builtin(id::UNIONALL)
+}
+
+/// A `TypeVar`'s name (a `Symbol`).
+pub fn tvar_name(v: Offset) -> Offset {
+    read_ref(v, 0)
 }
 
 /// A `TypeVar`'s declared lower bound.

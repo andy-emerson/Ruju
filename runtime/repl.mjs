@@ -8,8 +8,8 @@
 //
 // Supported subset (the bootstrap front-end, runtime/src/frontend.rs):
 // integer and float literals, variables, assignment, `+ - *`, comparisons
-// (`< <= > >= ==`), `if`/`elseif`/`else`/`end`, and `while`. The value of the
-// session is its last expression.
+// (`< <= > >= ==` and `===`), `if`/`elseif`/`else`/`end`, and `while`. The
+// value of the session is its last expression.
 //
 // Honest limitations of this tool (not the runtime):
 // - Variables persist between lines by re-evaluating the accumulated session

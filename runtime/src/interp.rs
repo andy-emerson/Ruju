@@ -34,6 +34,8 @@ pub enum Builtin {
     Slt,
     Sle,
     Eq,
+    /// `===` (`jl_egal`): works on any two values, no unboxing.
+    Egal,
 }
 
 /// A statement operand: an SSA result, a local slot, or an integer constant.
@@ -86,6 +88,9 @@ fn read_op(op: Op, frame: &Frame, ssa_base: usize) -> Value {
 fn apply(b: Builtin, args: &Frame) -> Value {
     let x = args.get(0);
     let y = args.get(1);
+    if let Builtin::Egal = b {
+        return box_bool(crate::builtins::egal(x, y)); // any values, no unboxing
+    }
     if object::type_of(x) == types::builtin(id::FLOAT64) {
         let (a, c) = (unbox_float64(x), unbox_float64(y));
         match b {
@@ -95,6 +100,7 @@ fn apply(b: Builtin, args: &Frame) -> Value {
             Builtin::Slt => box_bool(lt_float(a, c)),
             Builtin::Sle => box_bool(le_float(a, c)),
             Builtin::Eq => box_bool(eq_float(a, c)),
+            Builtin::Egal => unreachable!("handled before unboxing"),
         }
     } else {
         let (a, c) = (unbox_int(x), unbox_int(y));
@@ -105,6 +111,7 @@ fn apply(b: Builtin, args: &Frame) -> Value {
             Builtin::Slt => box_bool(slt_int(a, c)),
             Builtin::Sle => box_bool(sle_int(a, c)),
             Builtin::Eq => box_bool(eq_int(a, c)),
+            Builtin::Egal => unreachable!("handled before unboxing"),
         }
     }
 }
