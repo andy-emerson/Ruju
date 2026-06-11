@@ -497,7 +497,7 @@ strategy's "GC exactness & tuning" frontier item).**
 | Pool allocation (size classes, pages, free lists) | Partial | Faithful | `jl_gc_pool_t` design (freelist threads the header word = `jl_taggedvalue_t.next`); but 12-entry geometric size table vs Julia's ~50-entry table, 4 KiB pages vs default 16 KiB, one global freelist per class vs per-page freelists + `newpages` + `pagemeta` (audit 2026-06) |
 | Big-object path | Planned | Faithful | large objects use a pool for now |
 | Precise marking | Done | Faithful | type-layout driven |
-| Sweeping (page walk, free-list rebuild) | Partial | Faithful | eager every-page walk; Julia's lazy/quick-sweep page machinery (`pagemeta` has_marked/has_young) absent (audit 2026-06) |
+| Sweeping (page walk, free-list rebuild) | Partial | Faithful | eager every-page walk; Julia's lazy/quick-sweep page machinery (`pagemeta` has_marked/has_young) absent (audit 2026-06). **Verification obligation:** the full-sweep state transitions (3→2 demotion, the one-full-cycle lag) are verified against the state diagram and `gc_setmark_tag`, not a line-read of the full-sweep body — `premark` and `mark_reset_age` paths unread; verify in GC slice 2, which touches those functions for `PROMOTE_AGE` |
 | Non-moving collection | Done | Faithful | the stock GC is non-moving too |
 | Generational state encodings | Done | Faithful | `GC_CLEAN/MARKED/OLD/OLD_MARKED`, verified |
 | Promotion policy | Partial | Faithful | one-survival placeholder; Julia uses `PROMOTE_AGE` + per-object age. **Coupling:** clearing the remset per collection is sound only under this placeholder (every survivor is old post-sweep); `PROMOTE_AGE` must land together with the remset-rebuild machinery |
