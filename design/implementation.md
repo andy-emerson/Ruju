@@ -227,7 +227,7 @@ freelist threaded through the header word exactly mirrors
 | - | - | - | - |
 | Tagged header (tag-before-object, GC bits) | Done | Faithful | `jl_taggedvalue_t` |
 | `DataType` struct | Partial | Faithful | ~8 of `jl_datatype_t`'s ~17 fields (incl. `types`, `instance`); `TypeName` gains `names` + `mutabl` (structs 2026-06) |
-| Field layout | Partial | Faithful | `jl_compute_field_offsets` core (structs 2026-06): per-field offset/size/isptr descriptors after the GC's `[npointers, offsets]` prefix; inline pointer-free isbits fields, references otherwise. Omitted: inline isbits unions (selector bytes), inline immutables containing pointers (`first_ptr`/`hasptr`), atomics, `n_uninitialized` |
+| Field layout | Partial | Faithful | `jl_compute_field_offsets` core (structs 2026-06): per-field offset/size/isptr descriptors after the GC's `[npointers, offsets]` prefix; inline pointer-free isbits fields, references otherwise. **Verification obligation:** the alignment rule (field size → power of two, capped at 8) was written from Julia's documented conventions, not line-verified against the `datatype.c:636` body — verify before slice 2 relies on cross-struct layouts. Omitted: inline isbits unions (selector bytes), inline immutables containing pointers (`first_ptr`/`hasptr`), atomics, `n_uninitialized` |
 | Boxing | Partial | Faithful | every primitive width except `Int128`/`UInt128`/`Float16` (intrinsics 2026-06); `Bool` boxes are the `jl_true`/`jl_false` permboxes (fixed, audit 2026-06); no permbox caches for ints/chars |
 | `SimpleVector` | Done | Faithful | `jl_svec_t` |
 | Singletons | Done | Faithful | `jl_datatype_t.instance`: `nothing` lives in `Nothing.instance`; zero-size pointer-free structs get an eager instance (`jl_compute_field_offsets`) |
