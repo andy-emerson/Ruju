@@ -21,6 +21,14 @@ Every increment makes one trip around the three:
    module's maps, status rows, and citations; the strategy's frontier shifts
    if the increment opened or closed work.
 
+The increment's two boundary tables are where the documents touch: the
+**pre-table** (the costed options for what to do next) is `strategy.md`
+rendered actionable — its rows are the frontier; the **post-table** (the
+deviation settlement) is `implementation.md`'s intake — every row points at
+a record. That makes drift detectable, not merely forbidden: a pre-table row
+with no frontier source means the strategy is stale, and a post-table row
+with an empty "Recorded" column means the implementation ledger is.
+
 The documents are load-bearing, not decorative: `implementation.md` is the
 evidence ledger that the claim ladder requires, and `strategy.md`'s frontier
 is the menu the next session starts from. A document that lags the code is
