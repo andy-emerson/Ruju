@@ -1304,43 +1304,64 @@ mod tests {
         // conservatively over-firing any-old barrier; now the barrier stays
         // silent and the promotion-completion scan — which it lacked — is
         // what keeps the child alive.)
+        // The promotion scan (2 → 3 + trace) keeps x alive and, having seen
+        // young x, pushes c for the next cycle (gc_mark_push_remset:
+        // nptr == 0x3). The post-quick-sweep pass then puts c back in the
+        // *queued* state, GC_MARKED, so the barrier won't refire on it
+        // (gc-stock.c:3405–3414).
         gc::collect();
-        assert_eq!(object::gc_bits(c.get()), OLD_MARKED, "promotion-completion scan");
+        assert_eq!(object::gc_bits(c.get()), MARKED, "remset entry re-queued post-sweep");
         let x_now = types::get_nth_field(c.get(), 0).unwrap();
         assert_eq!(object::gc_bits(x_now), OLD, "child survived the minor and promoted");
-        // The promotion scan saw a young x, so c was pushed for the next cycle
-        // (gc_mark_push_remset: nptr == 0x3) even though x promoted at sweep.
         assert_eq!(gc::remset_len(), 1, "scan rebuilt the remset conservatively");
 
-        // A store into an OLD_MARKED parent fires the barrier exactly once
-        // per 3-state visit: queue_root re-tags 3 → 1, the refire guard. The
-        // scan-pushed entry coexists — the remset is a tolerated multiset, as
-        // in Julia (remset_nptr is "conservative"; dup entries re-scan).
+        // Stores into a queued (MARKED) parent are barrier-silent — its
+        // remset entry already covers it.
         let y = types::new_struct(cell, &[value::nothing()]).unwrap();
         types::set_nth_field(c.get(), 0, y).unwrap();
-        assert_eq!(gc::remset_len(), 2, "barrier push joins the scan push");
-        assert_eq!(object::gc_bits(c.get()), MARKED, "queue_root cleared the OLD bit");
+        assert_eq!(gc::remset_len(), 1, "no barrier while queued");
         let z = types::new_struct(cell, &[value::nothing()]).unwrap();
         types::set_nth_field(c.get(), 0, z).unwrap();
-        assert_eq!(gc::remset_len(), 2, "barrier must not refire while in the remset");
+        assert_eq!(gc::remset_len(), 1);
 
-        // The minor collection restores the remset entries to OLD_MARKED and
-        // traces them, keeping a child reachable only through the old parent.
-        // Both duplicate entries re-scan and both re-push (z young at scan).
+        // The minor collection restores the entry to OLD_MARKED, traces it
+        // (keeping z, reachable only through c), re-pushes it (z young at
+        // scan), and re-queues it post-sweep.
         gc::collect();
-        assert_eq!(object::gc_bits(c.get()), OLD_MARKED, "remset entry restored");
-        assert_eq!(gc::remset_len(), 2, "rebuilt: child was young at scan time");
+        assert_eq!(object::gc_bits(c.get()), MARKED, "re-queued: z was young at scan");
+        assert_eq!(gc::remset_len(), 1);
         let z_now = types::get_nth_field(c.get(), 0).unwrap();
         assert_eq!(object::gc_bits(z_now), OLD);
-        // Next cycle the child is old at scan time: the conservative entries
-        // (duplicates included) all drop.
+        // Next cycle the child is old at scan time: the entry drops, and c —
+        // restored to 3 and no longer re-queued — keeps OLD_MARKED.
         gc::collect();
-        assert_eq!(gc::remset_len(), 0, "entries dropped once the child is old");
+        assert_eq!(gc::remset_len(), 0, "entry dropped once the child is old");
         assert_eq!(object::gc_bits(c.get()), OLD_MARKED);
+
+        // NOW the barrier: a store into an OLD_MARKED parent fires exactly
+        // once — queue_root re-tags 3 → 1, which is itself the refire guard.
+        let w = types::new_struct(cell, &[value::nothing()]).unwrap();
+        types::set_nth_field(c.get(), 0, w).unwrap();
+        assert_eq!(gc::remset_len(), 1, "barrier fired on the OLD_MARKED parent");
+        assert_eq!(object::gc_bits(c.get()), MARKED, "queue_root cleared the OLD bit");
+        let w2 = types::new_struct(cell, &[value::nothing()]).unwrap();
+        types::set_nth_field(c.get(), 0, w2).unwrap();
+        assert_eq!(gc::remset_len(), 1, "barrier must not refire while queued");
+
+        // A full sweep clears the remset outright (gc-stock.c:3415): its old
+        // objects are demoted to OLD and rescanned at the next mark anyway.
+        gc::collect_full();
+        assert_eq!(gc::remset_len(), 0, "full sweep clears the remset");
+        assert_eq!(object::gc_bits(c.get()), OLD, "full sweep demoted c");
+        let w2_now = types::get_nth_field(c.get(), 0).unwrap();
+        assert_eq!(object::gc_bits(w2_now), OLD, "child reached via the restored entry");
 
         // Old garbage at OLD_MARKED: quick sweeps never touch it; the first
         // full cycle demotes it (3 → 2, kept); the second frees it — the
-        // documented one-cycle lag, as in Julia.
+        // documented one-cycle lag, as in Julia. Re-prove c to OLD_MARKED
+        // via one more quick mark first.
+        gc::collect();
+        assert_eq!(object::gc_bits(c.get()), OLD_MARKED, "promotion scan re-proved c");
         drop(c);
         let live0 = gc::live_objects();
         gc::collect();
@@ -1350,6 +1371,34 @@ mod tests {
         gc::collect_full(); // the demoted 2 is unmarked now: freed
         assert!(gc::live_objects() < live1, "second full cycle frees demoted old garbage");
 
+        assert_eq!(gc::root_count(), 0, "roots balanced");
+    }
+
+    // The collection policy (gc-stock.c:356, :3032, :3377–3400): proactive
+    // heap-target trigger at allocation, overallocation-based target growth.
+    #[test]
+    fn gc_collection_policy() {
+        let _g = serial();
+        rj_init();
+        // The target starts at the floor (default_collect_interval scaled to
+        // the region: capacity/8).
+        assert_eq!(gc::heap_target(), region::capacity() / 8);
+        // Allocating past the target collects proactively: garbage dies with
+        // no manual collect call and the heap never nears exhaustion.
+        let live_before = gc::live_objects();
+        for i in 0..20_000 {
+            let _ = box_int(i as i64); // ~320 KiB of garbage vs a 128 KiB target
+        }
+        assert!(
+            gc::live_objects() < live_before + 10_000,
+            "proactive trigger collected the garbage"
+        );
+        assert!(
+            gc::heap_size() < region::capacity() / 2,
+            "heap stayed bounded without reaching exhaustion"
+        );
+        // Post-collection the target tracks the live size plus permitted growth.
+        assert!(gc::heap_target() >= gc::heap_size());
         assert_eq!(gc::root_count(), 0, "roots balanced");
     }
 

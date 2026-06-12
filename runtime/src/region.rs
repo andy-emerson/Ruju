@@ -10,6 +10,11 @@ use core::cell::{Cell, UnsafeCell};
 /// Size of the bounded heap region.
 const REGION_SIZE: usize = 1 << 20; // 1 MiB
 
+/// Total capacity of the bounded region in bytes.
+pub fn capacity() -> usize {
+    REGION_SIZE
+}
+
 /// Allocation alignment, in bytes.
 const ALIGN: usize = 8;
 

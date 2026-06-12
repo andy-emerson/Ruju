@@ -154,6 +154,18 @@ struct Heap {
     /// roots a minor collection must scan in addition to the shadow stack.
     remembered: UnsafeCell<Vec<Value>>,
     live: Cell<usize>,
+    /// Live + freshly allocated bytes (`gc_heap_stats.heap_size`).
+    heap_size: Cell<usize>,
+    /// Collect when `heap_size` reaches this (`gc_heap_stats.heap_target`,
+    /// checked at allocation — `gc-stock.c:356`).
+    heap_target: Cell<usize>,
+    /// Young bytes promoted since the last full sweep (`promoted_bytes`).
+    promoted: Cell<usize>,
+    /// `heap_size` as of the last full sweep (`heap_size_after_last_full_gc`).
+    size_after_full: Cell<usize>,
+    /// The full-vs-quick decision for the next automatic collection
+    /// (`next_sweep_full`).
+    next_full: Cell<bool>,
 }
 // Sound only because the runtime is single-threaded under wasm32 for now.
 unsafe impl Sync for Heap {}
@@ -162,7 +174,19 @@ static HEAP: Heap = Heap {
     pages: UnsafeCell::new(Vec::new()),
     remembered: UnsafeCell::new(Vec::new()),
     live: Cell::new(0),
+    heap_size: Cell::new(0),
+    heap_target: Cell::new(0),
+    promoted: Cell::new(0),
+    size_after_full: Cell::new(0),
+    next_full: Cell::new(false),
 };
+
+/// The minimum collection target (`default_collect_interval`,
+/// `gc-stock.c:33–35` — Julia's ~12 MiB on 32-bit, scaled to the bounded
+/// region).
+fn collect_interval_floor() -> usize {
+    region::capacity() / 8
+}
 
 fn pools() -> &'static mut Vec<Pool> {
     unsafe { &mut *HEAP.pools.get() }
@@ -182,6 +206,48 @@ pub fn reset_heap() {
     pages().clear();
     remembered().clear();
     HEAP.live.set(0);
+    HEAP.heap_size.set(0);
+    HEAP.heap_target.set(collect_interval_floor());
+    HEAP.promoted.set(0);
+    HEAP.size_after_full.set(0);
+    HEAP.next_full.set(false);
+}
+
+/// Live + freshly allocated bytes (introspection).
+#[allow(dead_code)]
+pub fn heap_size() -> usize {
+    HEAP.heap_size.get()
+}
+
+/// The current collection target (introspection).
+#[allow(dead_code)]
+pub fn heap_target() -> usize {
+    HEAP.heap_target.get()
+}
+
+/// `overallocation` (`gc-stock.c:3032–3050`): the permitted growth before
+/// the next full collection — `4·n^(7/8) + n/8`, superlinear for small heaps
+/// and ~12.5% for large ones, capped at 5% of `max_val` once it would
+/// exceed it.
+fn overallocation(old_val: u64, val: u64, max_val: u64) -> u64 {
+    if old_val == 0 {
+        return collect_interval_floor() as u64;
+    }
+    let exp2 = 64 - old_val.leading_zeros() as u64;
+    let mut inc = (1u64 << (exp2 * 7 / 8)) * 4 + old_val / 8;
+    if inc + val > max_val && inc > max_val / 20 {
+        inc = max_val / 20;
+    }
+    inc
+}
+
+/// The allocation-time collection trigger (`gc-stock.c:356`): proactive at
+/// the heap target, full or quick per `next_sweep_full`. Called before each
+/// allocation once the core types exist.
+pub fn maybe_collect() {
+    if types::is_bootstrapped() && HEAP.heap_size.get() >= HEAP.heap_target.get() {
+        collect_inner(HEAP.next_full.get());
+    }
 }
 
 /// Number of live (uncollected) objects.
@@ -232,6 +298,7 @@ pub fn alloc_chunk(total: u32) -> Offset {
     if head != region::NULL {
         pools()[pi].freelist = next_free(head);
         HEAP.live.set(HEAP.live.get() + 1);
+        HEAP.heap_size.set(HEAP.heap_size.get() + osize);
         return head;
     }
 
@@ -251,6 +318,7 @@ pub fn alloc_chunk(total: u32) -> Offset {
     let head = pools()[pi].freelist;
     pools()[pi].freelist = next_free(head);
     HEAP.live.set(HEAP.live.get() + 1);
+    HEAP.heap_size.set(HEAP.heap_size.get() + osize);
     head
 }
 
@@ -402,7 +470,7 @@ fn free_slot(slot: Offset, pool: usize) {
 /// freed; survivors promote; `OLD_MARKED` demotes to `OLD`, so the *next*
 /// full cycle re-proves its liveness — old garbage at 3 takes one extra full
 /// cycle to free, as in Julia. Returns the number of live objects.
-fn sweep(full: bool) -> usize {
+fn sweep(full: bool) -> (usize, usize, usize) {
     for p in pools().iter_mut() {
         p.freelist = region::NULL;
     }
@@ -410,6 +478,8 @@ fn sweep(full: bool) -> usize {
     let page_info: Vec<(Offset, usize)> = pages().iter().map(|p| (p.start, p.osize)).collect();
 
     let mut survivors = 0;
+    let mut live_bytes = 0;
+    let mut promoted_bytes = 0;
     for (start, osize) in page_info {
         let pi = pool_for(osize);
         for k in 0..(PAGE_SIZE / osize) {
@@ -420,24 +490,63 @@ fn sweep(full: bool) -> usize {
             if live {
                 if bits == BIT_MARKED {
                     object::set_gc_bits(v, BIT_OLD); // promote young survivor
+                    promoted_bytes += osize;
                 } else if full && bits == (BIT_OLD | BIT_MARKED) {
                     object::set_gc_bits(v, BIT_OLD); // demote: re-prove next full cycle
                 }
                 // quick sweep leaves OLD and OLD_MARKED untouched
                 survivors += 1;
+                live_bytes += osize;
             } else {
                 free_slot(slot, pi);
             }
         }
     }
-    survivors
+    (survivors, live_bytes, promoted_bytes)
 }
 
 fn collect_inner(full: bool) -> u32 {
     mark();
     let before = HEAP.live.get();
-    let survivors = sweep(full);
+    let (survivors, live_bytes, promoted_bytes) = sweep(full);
     HEAP.live.set(survivors);
+    HEAP.heap_size.set(live_bytes);
+
+    // Post-sweep remset handling (`gc-stock.c:3405–3417`): after a quick
+    // sweep, entries are put back in the queued state (`GC_MARKED`) so the
+    // barrier does not refire on them; a full sweep clears the remset — its
+    // old objects were demoted to `OLD` and will be rescanned at next mark.
+    if full {
+        remembered().clear();
+    } else {
+        for &p in remembered().iter() {
+            object::set_gc_bits(p, BIT_MARKED);
+        }
+    }
+
+    // Collection policy (`gc-stock.c:3377–3400`): track promotion since the
+    // last full sweep; go full next time if the promoted ratio exceeds 0.15
+    // or the heap outgrew the post-full-GC baseline by `overallocation`.
+    // (Omitted: the user_max/under_pressure limits — no CLI options — and the
+    // MemBalancer rate machinery behind Julia's `target_allocs`.)
+    if full {
+        HEAP.promoted.set(0);
+        HEAP.size_after_full.set(live_bytes);
+    } else {
+        HEAP.promoted.set(HEAP.promoted.get() + promoted_bytes);
+    }
+    let heap_size = live_bytes as u64;
+    let baseline = HEAP.size_after_full.get() as u64;
+    let old_ratio = if heap_size == 0 { 0.0 } else { HEAP.promoted.get() as f64 / heap_size as f64 };
+    let expected = baseline + overallocation(baseline, 0, region::capacity() as u64);
+    HEAP.next_full.set(old_ratio > 0.15 || heap_size > expected);
+
+    // The next target: current size plus permitted growth, floored
+    // (`target_heap = target_allocs + heap_size`, floor
+    // `default_collect_interval` — `gc-stock.c:3342–3346`, subset).
+    let target = (heap_size + overallocation(heap_size, 0, region::capacity() as u64)) as usize;
+    HEAP.heap_target.set(target.max(collect_interval_floor()));
+
     (before - survivors) as u32
 }
 

@@ -90,6 +90,7 @@ pub fn set_gc_bits(v: Value, bits: u32) {
 /// the collector's free list when possible, and the object is registered so the
 /// collector can sweep it.
 pub fn alloc(type_off: Offset, size: usize) -> Value {
+    gc::maybe_collect(); // proactive heap-target trigger (gc-stock.c:356)
     let total = (HEADER_SIZE + align_up(size)) as u32;
     let mut header_off = gc::alloc_chunk(total);
     if header_off == NULL && types::is_bootstrapped() {
