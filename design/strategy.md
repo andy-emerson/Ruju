@@ -96,7 +96,7 @@ flowchart TD
     EGAL["egal & === [done: phase-0 subset]"]
     STRUCTS["struct support [done: phase-0 subset]"]
     INTRIN["intrinsics & boxing breadth [done: phase-0 subset]"]
-    GCX("GC exactness & tuning (frontier)")
+    GCX["GC exactness & tuning [done: phase-0 subset]"]
     SUBXE("subtype expressibility: varargs,<br/>Type{T}, UnionAll instantiation (frontier)")
     EXC("exceptions: enter/leave (frontier)")
 
@@ -147,9 +147,8 @@ Unblocked now, in no required order — pick by the selection principles below.
 
 | Increment | What it is | What it unblocks |
 | - | - | - |
-| **arrays & GenericMemory** | `GenericMemory`/`Array` (`genericmemory.c`, `array.c`): the buffer type, `arrayref`/`arrayset`, length, growth | most real Julia programs; `base/` code |
+| **arrays & GenericMemory** | `GenericMemory`/`Array` (`genericmemory.c`, `array.c`): the buffer type, `arrayref`/`arrayset`, length, growth — de-risked: the GC's big-object path is in place | most real Julia programs; `base/` code |
 | **modules & bindings** | `module.c`/`toplevel.c`: globals, bindings, top-level eval beyond expressions | `base/` code; method definitions from source |
-| **GC exactness & tuning** | slices 1–2 + tail A–B done (state machine, remset lifecycle, collection policies, the pin's pages/pools/sweep protocol — findings 17–19 closed); remaining: big-object path (de-risks arrays; slice C), deferred-sweep allocation | phase-1 AOT (GC must be trustworthy under real load) |
 | **subtype expressibility** | varargs in tuples, `Type{T}` kinds, `UnionAll` instantiation in `apply_type` — bounded slices, each unlocking a tranche of `test/subtype.jl` for the oracle | grows the oracle from 53 toward the coverage the **engine slice** needs to be measurable; varargs also feeds dispatch |
 | **exceptions** | `enter`/`leave` in the interpreter (`interpreter.c`), error throwing (`rtutils.c`) | real lowering; `base/` code throws |
 

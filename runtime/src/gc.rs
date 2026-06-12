@@ -203,6 +203,15 @@ struct Heap {
     next_full: Cell<bool>,
     /// Pages walked by the most recent sweep (test introspection).
     pages_walked: Cell<usize>,
+    /// Big objects (> the largest size class), young generation — walked by
+    /// every sweep (`young_generation_of_bigvals`). (offset, total bytes).
+    bigs_young: UnsafeCell<Vec<(Offset, u32)>>,
+    /// Settled `OLD_MARKED` big objects — untouched by quick sweeps
+    /// (`oldest_generation_of_bigvals`).
+    bigs_old: UnsafeCell<Vec<(Offset, u32)>>,
+    /// Freed big blocks available for reuse (the region cannot return
+    /// arbitrary ranges, so big frees are recycled first-fit).
+    free_bigs: UnsafeCell<Vec<(Offset, u32)>>,
 }
 // Sound only because the runtime is single-threaded under wasm32 for now.
 unsafe impl Sync for Heap {}
@@ -219,7 +228,22 @@ static HEAP: Heap = Heap {
     size_after_full: Cell::new(0),
     next_full: Cell::new(false),
     pages_walked: Cell::new(0),
+    bigs_young: UnsafeCell::new(Vec::new()),
+    bigs_old: UnsafeCell::new(Vec::new()),
+    free_bigs: UnsafeCell::new(Vec::new()),
 };
+
+fn bigs_young() -> &'static mut Vec<(Offset, u32)> {
+    unsafe { &mut *HEAP.bigs_young.get() }
+}
+
+fn bigs_old() -> &'static mut Vec<(Offset, u32)> {
+    unsafe { &mut *HEAP.bigs_old.get() }
+}
+
+fn free_bigs() -> &'static mut Vec<(Offset, u32)> {
+    unsafe { &mut *HEAP.free_bigs.get() }
+}
 
 /// The minimum collection target (`default_collect_interval`,
 /// `gc-stock.c:33–35` — Julia's ~12 MiB on 32-bit, scaled to the bounded
@@ -250,6 +274,9 @@ pub fn reset_heap() {
     pages().clear();
     free_pages().clear();
     remembered().clear();
+    bigs_young().clear();
+    bigs_old().clear();
+    free_bigs().clear();
     HEAP.prev_full.set(false);
     HEAP.live.set(0);
     HEAP.heap_size.set(0);
@@ -301,15 +328,34 @@ pub fn live_objects() -> usize {
     HEAP.live.get()
 }
 
-/// The slot size (size class) for an allocation of `total` bytes.
-fn size_class(total: u32) -> usize {
+/// The slot size (size class) for an allocation of `total` bytes, or `None`
+/// for the big-object path (> `GC_MAX_SZCLASS` territory,
+/// `julia_internal.h:676`).
+fn size_class(total: u32) -> Option<usize> {
     let t = total as usize;
-    for &c in SIZE_CLASSES {
-        if t <= c {
-            return c;
+    SIZE_CLASSES.iter().copied().find(|&c| t <= c)
+}
+
+/// Allocate a big object (`jl_gc_big_alloc_inner`, `gc-stock.c:436–465`):
+/// outside the page pools, linked into the young bigval generation. Freed
+/// big blocks are recycled first-fit since the bump region cannot reclaim
+/// arbitrary ranges.
+fn big_alloc(total: u32) -> Offset {
+    let aligned = (total + 7) & !7;
+    let off = if let Some(i) = free_bigs().iter().position(|&(_, sz)| sz >= aligned) {
+        let (off, _) = free_bigs().swap_remove(i);
+        off
+    } else {
+        let off = region::alloc(aligned as usize);
+        if off == region::NULL {
+            return region::NULL;
         }
-    }
-    (t + 15) & !15
+        off
+    };
+    bigs_young().push((off, aligned));
+    HEAP.live.set(HEAP.live.get() + 1);
+    HEAP.heap_size.set(HEAP.heap_size.get() + aligned as usize);
+    off
 }
 
 /// Index of the pool serving `osize`, creating it on first use.
@@ -358,7 +404,10 @@ fn init_page_freelist(idx: usize) {
 /// recycling a released page or carving a fresh one when the pool has none.
 /// Returns the slot (header) offset, or [`region::NULL`] on exhaustion.
 pub fn alloc_chunk(total: u32) -> Offset {
-    let osize = size_class(total);
+    let osize = match size_class(total) {
+        Some(c) => c,
+        None => return big_alloc(total),
+    };
     let pi = pool_for(osize);
 
     // A page with free slots, from the pool's queue — or a recycled/fresh one.
@@ -683,6 +732,49 @@ fn sweep(full: bool) -> (usize, usize, usize) {
                 pools()[pi].page_q.push(idx);
             }
         }
+    }
+
+    // Big objects (`sweep_big`, `gc-stock.c:495–560`): walk the young list —
+    // marked && (full || young-marked) → `GC_OLD`, staying young; a quick
+    // sweep's `OLD_MARKED` survivors move to the oldest list (the big-object
+    // analog of the settled-page skip); unmarked frees, the block recycled.
+    // On a full sweep the oldest list is demoted to `OLD` wholesale and
+    // merged back into the young list to be re-proven (`:527–560`).
+    // Snapshot the pre-existing oldest list: the young walk below may park
+    // more entries there, and those are already counted as they move.
+    let preexisting_old_n = bigs_old().len();
+    let preexisting_old_bytes: usize = bigs_old().iter().map(|&(_, sz)| sz as usize).sum();
+    let young = core::mem::take(bigs_young());
+    for (off, sz) in young {
+        let v = Value(off + HEADER_SIZE as u32);
+        let bits = object::gc_bits(v);
+        if bits & BIT_MARKED != 0 {
+            if full || bits == BIT_MARKED {
+                if bits == BIT_MARKED {
+                    promoted_bytes += sz as usize;
+                }
+                object::set_gc_bits(v, BIT_OLD);
+                bigs_young().push((off, sz));
+            } else {
+                bigs_old().push((off, sz)); // settled: quick sweeps skip it
+            }
+            survivors += 1;
+            live_bytes += sz as usize;
+        } else {
+            free_bigs().push((off, sz));
+        }
+    }
+    if full {
+        let old_list = core::mem::take(bigs_old());
+        for (off, sz) in old_list {
+            object::set_gc_bits(Value(off + HEADER_SIZE as u32), BIT_OLD);
+            bigs_young().push((off, sz));
+            survivors += 1;
+            live_bytes += sz as usize;
+        }
+    } else {
+        survivors += preexisting_old_n;
+        live_bytes += preexisting_old_bytes;
     }
 
     HEAP.prev_full.set(full);

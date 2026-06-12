@@ -1374,6 +1374,44 @@ mod tests {
         assert_eq!(gc::root_count(), 0, "roots balanced");
     }
 
+    // The big-object path (gc-stock.c:436–465, :495–560): allocation past
+    // the largest size class, the young/oldest bigval generations, block
+    // recycling, and the full-sweep demote-and-merge.
+    #[test]
+    fn gc_big_objects() {
+        let _g = serial();
+        rj_init();
+        let blob_t = types::builtin(id::SYMBOL); // layout-free blob, GC-safe
+
+        // Unrooted big garbage dies at the next collection; its block recycles
+        // into the next big allocation instead of carving fresh region space.
+        let g = object::alloc(blob_t, 2400); // total 2408 > 2032: big path
+        assert!(!g.is_null());
+        gc::collect();
+        let used1 = region::used();
+        let g2 = object::alloc(blob_t, 2400);
+        assert!(!g2.is_null());
+        assert_eq!(region::used(), used1, "freed big block was recycled");
+
+        // A rooted big object walks the generational lists: promote, settle
+        // on the oldest list (quick sweeps skip it), demote-and-merge on a
+        // full sweep, die once dropped.
+        let b = Rooted::new(object::alloc(blob_t, 4096));
+        gc::collect(); // young-marked: promotes, stays on the young list
+        assert_eq!(object::gc_bits(b.get()), 2, "promoted at sweep");
+        gc::collect(); // promotion scan 2→3; quick sweep parks it on oldest
+        assert_eq!(object::gc_bits(b.get()), 3);
+        gc::collect(); // oldest list untouched by quick sweeps
+        assert_eq!(object::gc_bits(b.get()), 3, "settled bigval skipped");
+        gc::collect_full(); // demoted to OLD, merged back to the young list
+        assert_eq!(object::gc_bits(b.get()), 2, "full sweep demotes and merges");
+        let live0 = gc::live_objects();
+        drop(b);
+        gc::collect_full(); // unmarked OLD on the young list: freed
+        assert!(gc::live_objects() < live0, "dropped bigval freed");
+        assert_eq!(gc::root_count(), 0, "roots balanced");
+    }
+
     // The page protocol (gc-stock.c:878–898): whole-page release on
     // !has_marked, page reuse across size classes, and the quick-sweep skip
     // of settled all-old pages.
