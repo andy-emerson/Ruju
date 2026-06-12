@@ -463,7 +463,7 @@ flowchart LR
     end
     subgraph R["Ruju Rust"]
         direction TB
-        RGS["pools: one global freelist per class,<br/>12-entry geometric table, 4 KiB pages"]
+        RGS["pools: per-page freelists + page release/reuse,<br/>the pin's 50-class table, 16 KiB pages"]
         RWB["write_barrier: parent == OLD_MARKED(3)<br/>&& child unMARKED → queue_root (re-tags 3→1)"]
         RMK["layout-driven precise mark with<br/>promotion-completion scan (2→3+trace),<br/>eager all-page sweep, promote-on-1st-survival"]
         RST["same encoding: MARKED=1, OLD=2"]
@@ -487,18 +487,23 @@ strategy's "GC exactness & tuning" frontier item).**
     mark, quick sweeps leaving 2/3 untouched, full sweeps demoting 3→2 with
     the one-full-cycle lag for old garbage. A state-machine test pins every
     transition.
-18. **Pool allocation constants and structure are placeholders.** 16 KiB
+18. ~~Pool allocation constants and structure were placeholders~~ — **largely
+    fixed (GC tail slice B, 2026-06)**: the pin's table, 16 KiB pages,
+    per-page freelists, `pagemeta`, page release/reuse; deferred-sweep
+    allocation and `newpages` remain. Original finding: 16 KiB
     default pages vs 4 KiB; ~50-entry size-class table vs 12-entry
     geometric; per-page freelists + `newpages` + `pagemeta` vs one global
     freelist per class.
-19. **Sweeping is eager.** Julia's lazy/quick-sweep page machinery absent.
+19. ~~Sweeping was eager~~ — **fixed (GC tail slice B, 2026-06)**: page
+    release, the settled-page skip, and the walked-page protocol landed;
+    only on-demand (allocation-time) sweeping remains.
 
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
-| Pool allocation (size classes, pages, free lists) | Partial | Faithful | `jl_gc_pool_t` design (freelist threads the header word = `jl_taggedvalue_t.next`); but 12-entry geometric size table vs Julia's ~50-entry table, 4 KiB pages vs default 16 KiB, one global freelist per class vs per-page freelists + `newpages` + `pagemeta` (audit 2026-06) |
+| Pool allocation (size classes, pages, free lists) | Partial | Faithful | the pin's exact size-class table (`jl_gc_sizeclasses`, `julia_internal.h:544–586`, the 32-bit `MAX_ALIGN > 4` branch — 50 classes to 2032) and 16 KiB pages (`gc-stock.h:47–49`); per-page freelists threaded through header words, with whole-page release and cross-class reuse (GC tail slice B, 2026-06). Remaining: Julia's allocation-time deferred freelist build (`fl_begin`/`fl_end` lazy sweeping) and the `newpages` bump path; oversize > 2032 still pool-rounds pending the big-object path (slice C) |
 | Big-object path | Planned | Faithful | large objects use a pool for now |
 | Precise marking | Done | Faithful | type-layout driven |
-| Sweeping (page walk, free-list rebuild) | Partial | Faithful | the state transitions are now **verified against the sweep body** (`gc-stock.c:925–941`; obligation discharged, GC slice 2) — "premark" is the timing label around `gc_queue_remset`, our remset-restore equivalent. Remaining gap: Julia's lazy/quick-sweep page machinery (`pagemeta` has_marked/has_young) is absent — the pin's quick sweep frees unmarked old objects on the (has_young) pages it visits and skips the rest; ours visits every page but keeps unmarked old objects until a full sweep. Conservative; old garbage waits longer |
+| Sweeping (page walk, free-list rebuild) | Partial | Faithful | the pin's page protocol (GC tail slice B, 2026-06): whole-page release on `!has_marked` (`gc-stock.c:882–887`, the flag persisting between walks), the quick-sweep skip of settled all-old pages (`:890–897`, `prev_nold == nold` discipline), and walked pages freeing every unmarked cell — quick sweeps included (`:925–933`), closing the earlier keeps-unmarked-old divergence (sound because the remset machinery guarantees live olds on walked pages are marked). Mark-side `pagemeta` (`has_marked`/`has_young`/`nold`) maintained per `gc_setmark_pool_` (`:291–309`). Remaining: allocation-time deferred sweeping (pages swept on demand rather than at collection) |
 | Non-moving collection | Done | Faithful | the stock GC is non-moving too |
 | Generational state encodings | Done | Faithful | `GC_CLEAN/MARKED/OLD/OLD_MARKED`, verified |
 | Promotion policy | Done | Faithful | promote-marked-young at sweep **is the pin's design** (`gc-stock.c:935–937`: `current_sweep_full \|\| bits == GC_MARKED → GC_OLD`) — the pin removed `PROMOTE_AGE` and the per-object age arrays; only the stale comment at `:196` describes the old design. The previous row note ("Julia uses `PROMOTE_AGE` + per-object age") was ported from memory of older Julia, not the pin — corrected, GC slice 2, 2026-06 |

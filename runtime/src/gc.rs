@@ -122,37 +122,72 @@ impl Drop for Frame {
 
 // --- pooled heap (size-classed pools over pages, after gc-stock.c) ----------
 
-/// Page size; pages are carved from the region and hold one size class each
-/// (`GC_PAGE_SZ`, here with `GC_PAGE_LG2 = 12`).
-const PAGE_SIZE: usize = 4096;
+/// Page size: `GC_PAGE_SZ = 1 << GC_PAGE_LG2`, `GC_PAGE_LG2 = 14`
+/// (`gc-stock.h:47–49`, the default non-`GC_SMALL_PAGE` configuration).
+const PAGE_SIZE: usize = 1 << 14;
 
-/// Object size classes in bytes (header + data, multiples of 16). Allocations
-/// round up to the smallest class that fits; anything larger rounds to a
-/// multiple of 16 and gets its own pool.
-const SIZE_CLASSES: &[usize] = &[16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024];
+/// The pin's pool size classes (`jl_gc_sizeclasses`,
+/// `julia_internal.h:544–586`, the 32-bit `MAX_ALIGN > 4` branch): 4 and 8,
+/// sixteen 8-spaced classes, eight 16-spaced classes, then the
+/// packing-optimized tail for 16 KiB pages. Anything above 2032
+/// (`GC_MAX_SZCLASS` territory) belongs to the big-object path — until that
+/// lands (GC tail slice C), oversize allocations round to 16 and get their
+/// own pool, recorded as the remaining gap.
+const SIZE_CLASSES: &[usize] = &[
+    4, 8,
+    16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136,
+    144, 160, 176, 192, 208, 224, 240, 256,
+    272, 288, 304, 336, 368, 400, 448, 496,
+    544, 576, 624, 672, 736, 816, 896, 1008,
+    1088, 1168, 1248, 1360, 1488, 1632, 1808, 2032,
+];
 
-/// A per-size-class pool: a free list threaded through free slots, plus the slot
-/// size (the analog of `jl_gc_pool_t`).
+/// A per-size-class pool (`jl_gc_pool_t`): the indices of this class's pages
+/// that still have free slots.
 struct Pool {
     osize: usize,
-    /// Head of the free list (`0` = empty); each free slot's first word holds
-    /// the offset of the next free slot.
-    freelist: Offset,
+    /// Indices into the page table of pages with `nfree > 0`.
+    page_q: Vec<usize>,
 }
 
-/// Page metadata: where a page lives and which size class it serves (the analog
-/// of `jl_gc_pagemeta_t`).
+/// Per-page metadata (`jl_gc_pagemeta_t`, `gc-stock.h:100–128`): the
+/// page-local free list, free count, and the mark/age bookkeeping that lets
+/// the sweep skip or release whole pages without walking them.
 struct Page {
     start: Offset,
     osize: usize,
+    /// Head of this page's free list (slots threaded through their headers).
+    freelist: Offset,
+    /// Free slots remaining on this page (`nfree`).
+    nfree: u32,
+    /// Live objects on this page (maintained at allocation; recounted when
+    /// the page is walked by a sweep — cached for skipped pages).
+    live_n: u32,
+    /// Any cell on this page was marked this cycle (`has_marked`; set during
+    /// marking, cleared by the sweep).
+    has_marked: bool,
+    /// Any young cell was live (or allocated) on this page (`has_young`).
+    has_young: bool,
+    /// Old (`OLD_MARKED`) objects counted by this cycle's marks (`nold`).
+    nold: u32,
+    /// Old objects at the end of the previous full sweep (`prev_nold`).
+    prev_nold: u32,
+    /// Whether the page is in use (false = released to `free_pages`).
+    in_use: bool,
 }
 
 struct Heap {
     pools: UnsafeCell<Vec<Pool>>,
     pages: UnsafeCell<Vec<Page>>,
+    /// Indices of released pages, reusable by any pool (`!has_marked` pages
+    /// are returned whole — `gc-stock.c:882–887`).
+    free_pages: UnsafeCell<Vec<usize>>,
     /// Old objects that have been mutated to reference a young object — the
     /// roots a minor collection must scan in addition to the shadow stack.
     remembered: UnsafeCell<Vec<Value>>,
+    /// Whether the previous sweep was full (`prev_sweep_full`, for the
+    /// quick-sweep skip predicate — `gc-stock.c:890–892`).
+    prev_full: Cell<bool>,
     live: Cell<usize>,
     /// Live + freshly allocated bytes (`gc_heap_stats.heap_size`).
     heap_size: Cell<usize>,
@@ -166,19 +201,24 @@ struct Heap {
     /// The full-vs-quick decision for the next automatic collection
     /// (`next_sweep_full`).
     next_full: Cell<bool>,
+    /// Pages walked by the most recent sweep (test introspection).
+    pages_walked: Cell<usize>,
 }
 // Sound only because the runtime is single-threaded under wasm32 for now.
 unsafe impl Sync for Heap {}
 static HEAP: Heap = Heap {
     pools: UnsafeCell::new(Vec::new()),
     pages: UnsafeCell::new(Vec::new()),
+    free_pages: UnsafeCell::new(Vec::new()),
     remembered: UnsafeCell::new(Vec::new()),
+    prev_full: Cell::new(false),
     live: Cell::new(0),
     heap_size: Cell::new(0),
     heap_target: Cell::new(0),
     promoted: Cell::new(0),
     size_after_full: Cell::new(0),
     next_full: Cell::new(false),
+    pages_walked: Cell::new(0),
 };
 
 /// The minimum collection target (`default_collect_interval`,
@@ -196,6 +236,10 @@ fn pages() -> &'static mut Vec<Page> {
     unsafe { &mut *HEAP.pages.get() }
 }
 
+fn free_pages() -> &'static mut Vec<usize> {
+    unsafe { &mut *HEAP.free_pages.get() }
+}
+
 fn remembered() -> &'static mut Vec<Value> {
     unsafe { &mut *HEAP.remembered.get() }
 }
@@ -204,7 +248,9 @@ fn remembered() -> &'static mut Vec<Value> {
 pub fn reset_heap() {
     pools().clear();
     pages().clear();
+    free_pages().clear();
     remembered().clear();
+    HEAP.prev_full.set(false);
     HEAP.live.set(0);
     HEAP.heap_size.set(0);
     HEAP.heap_target.set(collect_interval_floor());
@@ -271,7 +317,7 @@ fn pool_for(osize: usize) -> usize {
     if let Some(i) = pools().iter().position(|p| p.osize == osize) {
         return i;
     }
-    pools().push(Pool { osize, freelist: region::NULL });
+    pools().push(Pool { osize, page_q: Vec::new() });
     pools().len() - 1
 }
 
@@ -285,41 +331,117 @@ fn set_next_free(slot: Offset, next: Offset) {
     }
 }
 
-/// Obtain a slot of at least `total` bytes from the appropriate pool, carving a
-/// fresh page from the region if the pool's free list is empty. Returns the slot
-/// (header) offset, or [`region::NULL`] if the region cannot supply a new page.
-/// Mirrors `jl_gc_pool_alloc`.
+/// Thread every slot of page `idx` onto its own free list (a fresh or
+/// recycled page).
+fn init_page_freelist(idx: usize) {
+    let (start, osize) = (pages()[idx].start, pages()[idx].osize);
+    let n = PAGE_SIZE / osize;
+    let mut fl = region::NULL;
+    for k in (0..n).rev() {
+        let s = start + (k * osize) as u32;
+        set_next_free(s, fl);
+        fl = s;
+    }
+    let pg = &mut pages()[idx];
+    pg.freelist = fl;
+    pg.nfree = n as u32;
+    pg.live_n = 0;
+    pg.has_marked = false;
+    pg.has_young = false;
+    pg.nold = 0;
+    pg.prev_nold = 0;
+    pg.in_use = true;
+}
+
+/// Obtain a slot of at least `total` bytes from its size-class pool
+/// (`jl_gc_pool_alloc`): pop the page-local free list of a page with room,
+/// recycling a released page or carving a fresh one when the pool has none.
+/// Returns the slot (header) offset, or [`region::NULL`] on exhaustion.
 pub fn alloc_chunk(total: u32) -> Offset {
     let osize = size_class(total);
     let pi = pool_for(osize);
 
-    // Fast path: pop the pool's free list.
-    let head = pools()[pi].freelist;
-    if head != region::NULL {
-        pools()[pi].freelist = next_free(head);
-        HEAP.live.set(HEAP.live.get() + 1);
-        HEAP.heap_size.set(HEAP.heap_size.get() + osize);
-        return head;
-    }
+    // A page with free slots, from the pool's queue — or a recycled/fresh one.
+    let idx = loop {
+        if let Some(&idx) = pools()[pi].page_q.last() {
+            if pages()[idx].nfree > 0 {
+                break idx;
+            }
+            pools()[pi].page_q.pop(); // exhausted page
+            continue;
+        }
+        let idx = if let Some(idx) = free_pages().pop() {
+            pages()[idx].osize = osize; // recycled page joins this class
+            idx
+        } else {
+            let start = region::alloc(PAGE_SIZE);
+            if start == region::NULL {
+                return region::NULL;
+            }
+            pages().push(Page {
+                start,
+                osize,
+                freelist: region::NULL,
+                nfree: 0,
+                live_n: 0,
+                has_marked: false,
+                has_young: false,
+                nold: 0,
+                prev_nold: 0,
+                in_use: true,
+            });
+            pages().len() - 1
+        };
+        init_page_freelist(idx);
+        pools()[pi].page_q.push(idx);
+        break idx;
+    };
 
-    // Slow path: carve a fresh page and thread its slots onto the free list.
-    let page = region::alloc(PAGE_SIZE);
-    if page == region::NULL {
-        return region::NULL;
-    }
-    let mut s = page;
-    for _ in 0..(PAGE_SIZE / osize) {
-        set_next_free(s, pools()[pi].freelist);
-        pools()[pi].freelist = s;
-        s += osize as u32;
-    }
-    pages().push(Page { start: page, osize });
-
-    let head = pools()[pi].freelist;
-    pools()[pi].freelist = next_free(head);
+    let pg = &mut pages()[idx];
+    let head = pg.freelist;
+    pg.freelist = next_free(head);
+    pg.nfree -= 1;
+    pg.live_n += 1;
+    pg.has_young = true; // fresh objects are young
     HEAP.live.set(HEAP.live.get() + 1);
     HEAP.heap_size.set(HEAP.heap_size.get() + osize);
     head
+}
+
+/// The page holding the object whose header is at `off` (binary search —
+/// pages are carved from a monotonic bump allocator, so starts are sorted).
+fn page_of(off: Offset) -> Option<usize> {
+    let ps = pages();
+    let mut lo = 0usize;
+    let mut hi = ps.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if ps[mid].start + PAGE_SIZE as u32 <= off {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo < ps.len() && ps[lo].start <= off && ps[lo].in_use {
+        Some(lo)
+    } else {
+        None
+    }
+}
+
+/// Mark-side page metadata (`gc_setmark_pool_`, `gc-stock.c:291–309`): every
+/// mark sets `has_marked`; a young mark sets `has_young`; an old mark
+/// (2 → 3, the promotion-completion scan) increments `nold`.
+fn on_marked(v: Value, was_old: bool) {
+    if let Some(idx) = page_of(v.raw() - HEADER_SIZE as u32) {
+        let pg = &mut pages()[idx];
+        pg.has_marked = true;
+        if was_old {
+            pg.nold += 1;
+        } else {
+            pg.has_young = true;
+        }
+    }
 }
 
 // --- write barrier ----------------------------------------------------------
@@ -351,6 +473,19 @@ fn queue_root(parent: Value) {
 #[allow(dead_code)]
 pub fn remset_len() -> usize {
     remembered().len()
+}
+
+/// Number of released pages awaiting reuse (introspection for tests).
+#[allow(dead_code)]
+pub fn free_page_count() -> usize {
+    free_pages().len()
+}
+
+/// Pages walked by the most recent sweep (introspection for tests; skipped
+/// and released pages are not walked).
+#[allow(dead_code)]
+pub fn pages_walked_last() -> usize {
+    HEAP.pages_walked.get()
 }
 
 /// Whether `v` is in the old generation.
@@ -450,6 +585,7 @@ fn mark() {
             continue; // marked this cycle (or restored from the remset)
         }
         object::set_gc_bits(v, bits | BIT_MARKED); // 0 → 1, 2 → 3
+        on_marked(v, bits & BIT_OLD != 0);
         trace_fields(v, &mut work);
         if bits & BIT_OLD != 0 && has_young_ref(v) {
             remembered().push(v); // promotion scan found old → young edges
@@ -457,51 +593,100 @@ fn mark() {
     }
 }
 
-fn free_slot(slot: Offset, pool: usize) {
-    set_next_free(slot, pools()[pool].freelist);
-    pools()[pool].freelist = slot;
-}
-
-/// Sweep by walking the pages (the state transitions of `gc-stock.c:164–191`).
-/// Quick sweep: `CLEAN` is freed; `MARKED` young survivors promote (the
-/// one-survival placeholder for Julia's `PROMOTE_AGE`); `OLD` and
-/// `OLD_MARKED` are untouched — old garbage waits for a full collection.
-/// Full sweep: anything with the mark bit clear (`CLEAN` *or* `OLD`) is
-/// freed; survivors promote; `OLD_MARKED` demotes to `OLD`, so the *next*
-/// full cycle re-proves its liveness — old garbage at 3 takes one extra full
-/// cycle to free, as in Julia. Returns the number of live objects.
+/// Sweep page by page (the state transitions of `gc-stock.c:164–191`, the
+/// page protocol of `:878–898`). A page with no marked cell is **released
+/// whole** — no walk, returned for reuse by any pool. A quick sweep **skips**
+/// a page with no young cell whose old count is settled
+/// (`!has_young && (!prev_sweep_full || prev_nold == nold)`), keeping its
+/// free list and counts as they stand. Walked pages rebuild their free list:
+/// `CLEAN` frees; `MARKED` promotes (the pin's promote-at-sweep); on a full
+/// sweep unmarked `OLD` frees and `OLD_MARKED` demotes, giving old garbage
+/// its one-full-cycle lag. Returns (survivors, live bytes, promoted bytes).
 fn sweep(full: bool) -> (usize, usize, usize) {
-    for p in pools().iter_mut() {
-        p.freelist = region::NULL;
-    }
-    // Snapshot (start, osize) so the pages list isn't borrowed while pools mutate.
-    let page_info: Vec<(Offset, usize)> = pages().iter().map(|p| (p.start, p.osize)).collect();
+    let mut survivors = 0usize;
+    let mut live_bytes = 0usize;
+    let mut promoted_bytes = 0usize;
+    let prev_full = HEAP.prev_full.get();
+    let mut walked = 0usize;
 
-    let mut survivors = 0;
-    let mut live_bytes = 0;
-    let mut promoted_bytes = 0;
-    for (start, osize) in page_info {
-        let pi = pool_for(osize);
+    let npages = pages().len();
+    for idx in 0..npages {
+        let (start, osize, in_use, has_marked, has_young, nold, prev_nold, cached_live) = {
+            let pg = &pages()[idx];
+            (pg.start, pg.osize, pg.in_use, pg.has_marked, pg.has_young, pg.nold, pg.prev_nold, pg.live_n)
+        };
+        if !in_use {
+            continue;
+        }
+        // Whole-page release (`gc-stock.c:882–887`): `has_marked` is false
+        // only when nothing on the page is live — it persists from the last
+        // walk for stable all-old pages and is set by any mark this cycle.
+        if !has_marked {
+            let pg = &mut pages()[idx];
+            pg.in_use = false;
+            pg.live_n = 0;
+            free_pages().push(idx);
+            if let Some(pi) = pools().iter().position(|p| p.osize == osize) {
+                pools()[pi].page_q.retain(|&q| q != idx);
+            }
+            continue;
+        }
+        // Quick-sweep page skip (`gc-stock.c:890–897`): no young cell and the
+        // old count settled — the page (free list, counts, flags) stands.
+        if !full && !has_young && (!prev_full || prev_nold == nold) {
+            survivors += cached_live as usize;
+            live_bytes += cached_live as usize * osize;
+            continue;
+        }
+        walked += 1;
+        // Walk the page, rebuilding its free list. On walked pages the pin
+        // frees every unmarked cell — quick sweeps included (`:925–933`),
+        // where unmarked `OLD` garbage dies early; live old objects are
+        // always marked (3) here, the remset machinery guarantees it.
+        let mut fl = region::NULL;
+        let mut nfree = 0u32;
+        let mut live_n = 0u32;
         for k in 0..(PAGE_SIZE / osize) {
             let slot = start + (k * osize) as u32;
             let v = Value(slot + HEADER_SIZE as u32);
             let bits = object::gc_bits(v);
-            let live = bits & BIT_MARKED != 0 || (!full && bits & BIT_OLD != 0);
-            if live {
+            if bits & BIT_MARKED != 0 {
                 if bits == BIT_MARKED {
-                    object::set_gc_bits(v, BIT_OLD); // promote young survivor
+                    object::set_gc_bits(v, BIT_OLD); // promote young survivor (`:935`)
                     promoted_bytes += osize;
-                } else if full && bits == (BIT_OLD | BIT_MARKED) {
-                    object::set_gc_bits(v, BIT_OLD); // demote: re-prove next full cycle
+                } else if full {
+                    object::set_gc_bits(v, BIT_OLD); // demote 3 → 2: re-prove next full
                 }
-                // quick sweep leaves OLD and OLD_MARKED untouched
-                survivors += 1;
-                live_bytes += osize;
+                live_n += 1;
             } else {
-                free_slot(slot, pi);
+                set_next_free(slot, fl);
+                fl = slot;
+                nfree += 1;
+            }
+        }
+        survivors += live_n as usize;
+        live_bytes += live_n as usize * osize;
+        let pg = &mut pages()[idx];
+        pg.freelist = fl;
+        pg.nfree = nfree;
+        pg.live_n = live_n;
+        pg.has_marked = live_n > 0; // recomputed only when walked (`:950`)
+        pg.has_young = false;
+        if full {
+            // every survivor is old now: the settled count for future skips
+            pg.prev_nold = live_n;
+            pg.nold = 0;
+        }
+        if nfree > 0 {
+            let pi = pool_for(osize);
+            if !pools()[pi].page_q.contains(&idx) {
+                pools()[pi].page_q.push(idx);
             }
         }
     }
+
+    HEAP.prev_full.set(full);
+    HEAP.pages_walked.set(walked);
     (survivors, live_bytes, promoted_bytes)
 }
 

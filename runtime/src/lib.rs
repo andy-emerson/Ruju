@@ -1374,6 +1374,37 @@ mod tests {
         assert_eq!(gc::root_count(), 0, "roots balanced");
     }
 
+    // The page protocol (gc-stock.c:878–898): whole-page release on
+    // !has_marked, page reuse across size classes, and the quick-sweep skip
+    // of settled all-old pages.
+    #[test]
+    fn gc_page_protocol() {
+        let _g = serial();
+        rj_init();
+        // Burn through more than a page of one size class as pure garbage.
+        for i in 0..2_000 {
+            let _ = box_int(i); // 16-byte class; a 16 KiB page holds 1024
+        }
+        gc::collect_full();
+        assert!(gc::free_page_count() > 0, "fully-dead pages were released whole");
+
+        // Pages holding young cells are walked; a settled all-old heap is
+        // skipped entirely — quick sweeps touch zero pages.
+        for i in 0..100 {
+            let _ = box_int(i); // young garbage on some page
+        }
+        gc::collect();
+        assert!(gc::pages_walked_last() > 0, "young pages must be walked");
+        gc::collect();
+        assert_eq!(
+            gc::pages_walked_last(),
+            0,
+            "a settled all-old heap is skipped page-for-page"
+        );
+        assert!(gc::live_objects() > 0, "the skipped pages hold the live heap");
+        assert_eq!(gc::root_count(), 0, "roots balanced");
+    }
+
     // The collection policy (gc-stock.c:356, :3032, :3377–3400): proactive
     // heap-target trigger at allocation, overallocation-based target growth.
     #[test]
