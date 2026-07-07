@@ -233,6 +233,26 @@ check("source: 1 / 2 promotes to Float64", evalJuliaF64("1 / 2"), 0.5);
 check("source: 2.0 * 3.0 + 1.0", evalJuliaF64("2.0 * 3.0 + 1.0"), 7.0);
 check("source: float while-loop", evalJuliaF64("x = 0.0\nwhile x < 5.0\nx = x + 0.5\nend\nx"), 5.0);
 
+// --- GenericMemory: the flat buffer under arrays, in linear memory ---
+const memI = x.rj_memory_new(ty(T.Int64), 100);
+check("Memory{Int64}(100) allocates", memI !== 0, true);
+check("memory length", x.rj_memory_len(memI), 100);
+check("memory zero-initialized", x.rj_memory_get_i64(memI, 0), 0n);
+for (let i = 0; i < 100; i++) x.rj_memory_set_i64(memI, i, BigInt(i * i));
+check("memoryref roundtrip [7]", x.rj_memory_get_i64(memI, 7), 49n);
+check("memoryref roundtrip [99]", x.rj_memory_get_i64(memI, 99), 9801n);
+check("memory set out of bounds rejected", x.rj_memory_set_i64(memI, 100, 1n), 0);
+check("Memory{Int64} is uniqued (===)", x.rj_memory_type(ty(T.Int64)) === x.rj_memory_type(ty(T.Int64)), true);
+check(
+  "Memory{Int64} NOT <: Memory{Integer} (invariant)",
+  x.rj_subtype(x.rj_memory_type(ty(T.Int64)), x.rj_memory_type(ty(T.Integer))),
+  0,
+);
+// A raw offset held only by JS is not a root: after a collect the old memory is
+// gone, and allocation stays healthy for fresh ones.
+x.rj_gc_collect();
+check("fresh memory after collect", x.rj_memory_len(x.rj_memory_new(ty(T.Int64), 8)), 8);
+
 // --- invariants ---
 check("rj_root_count() balanced", x.rj_root_count(), 0);
 console.log(`info heap high-water: ${x.rj_heap_used()} bytes, live objects: ${x.rj_live_objects()}`);

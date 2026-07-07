@@ -108,6 +108,10 @@ pub struct Builtins {
     pub box_typename: Offset,
     /// The `TypeName` of the demo two-parameter constructor `Pair{A,B}` (invariant).
     pub pair_typename: Offset,
+    /// The `TypeName` shared by every `GenericMemory{T}` type
+    /// (`jl_genericmemory_typename`), which is how the GC recognizes memory
+    /// objects at mark time (`gc-stock.c:2412`).
+    pub memory_typename: Offset,
 }
 
 struct BuiltinsSlot(Cell<Option<Builtins>>);
@@ -305,6 +309,7 @@ pub fn bootstrap() {
     let tuple_typename = tn("Tuple");
     let box_typename = tn("Box");
     let pair_typename = tn("Pair");
+    let memory_typename = tn("GenericMemory");
 
     // 7. The `nothing` singleton: the sole (zero-size) instance of Nothing,
     //    recorded in the type's `instance` field (jl_datatype_t.instance).
@@ -332,6 +337,7 @@ pub fn bootstrap() {
         tuple_typename,
         box_typename,
         pair_typename,
+        memory_typename,
     }));
 }
 
@@ -538,6 +544,20 @@ pub fn box_type(elem: Offset) -> Offset {
 pub fn pair_type(a: Offset, b: Offset) -> Offset {
     let bi = builtins();
     apply_type(bi.pair_typename, bi.types[id::ANY as usize], &[a, b])
+}
+
+/// Construct `GenericMemory{elem}` (invariant), uniqued. Julia's is
+/// `GenericMemory{kind, T, addrspace}`; ours carries `T` alone — kind is
+/// fixed `:not_atomic` and addrspace `Core.CPU` (a recorded simplification).
+pub fn memory_type(elem: Offset) -> Offset {
+    let bi = builtins();
+    apply_type(bi.memory_typename, bi.types[id::ANY as usize], &[elem])
+}
+
+/// Whether `t` is a `GenericMemory{T}` type — identified by the shared
+/// typename, exactly as the C checks `vt->name == jl_genericmemory_typename`.
+pub fn is_genericmemory(t: Offset) -> bool {
+    is_datatype(t) && name_of(t) == builtins().memory_typename
 }
 
 /// A link in a single-variable-at-a-time substitution environment
@@ -819,7 +839,7 @@ fn unwrap_unionall(mut t: Offset) -> Offset {
 /// Whether instances of `t` are plain bits (`jl_isbits`, faithful subset):
 /// a concrete primitive, or a tuple all of whose element types are isbits.
 /// Parametric constructors like `Box` hold references, so they are not.
-fn is_bits(t: Offset) -> bool {
+pub(crate) fn is_bits(t: Offset) -> bool {
     if !is_datatype(t) || is_abstract(t) {
         return false;
     }

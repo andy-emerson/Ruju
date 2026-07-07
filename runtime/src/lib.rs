@@ -15,6 +15,7 @@ mod gc;
 mod interp;
 mod object;
 mod region;
+mod memory;
 mod subtype;
 mod symbol;
 mod types;
@@ -333,6 +334,44 @@ pub extern "C" fn rj_instantiate(u: u32, p: u32) -> u32 {
     types::instantiate_unionall(u as Offset, p as Offset)
 }
 
+/// Construct the type `GenericMemory{elem}` (invariant, uniqued).
+#[no_mangle]
+pub extern "C" fn rj_memory_type(elem: u32) -> u32 {
+    ensure_init();
+    types::memory_type(elem as Offset)
+}
+
+/// Allocate a `GenericMemory{elem}` of `len` elements, zero-initialized.
+/// Returns the memory value's offset, or 0 on error.
+#[no_mangle]
+pub extern "C" fn rj_memory_new(elem: u32, len: u32) -> u32 {
+    ensure_init();
+    memory::alloc(elem as Offset, len).map_or(0, |m| m.raw())
+}
+
+/// The element count of the memory at `m`.
+#[no_mangle]
+pub extern "C" fn rj_memory_len(m: u32) -> u32 {
+    memory::len(Value(m))
+}
+
+/// Read element `i` of the memory at `m` as an `Int64` payload (unboxing the
+/// element), or 0 on error — a host convenience over `memoryrefget`.
+#[no_mangle]
+pub extern "C" fn rj_memory_get_i64(m: u32, i: u32) -> i64 {
+    memory::get(Value(m), i).map_or(0, crate::value::unbox_int)
+}
+
+/// Store `v` into element `i` of the `GenericMemory{Int64}` at `m` (boxing the
+/// payload). Returns 1 on success, 0 on error.
+#[no_mangle]
+pub extern "C" fn rj_memory_set_i64(m: u32, i: u32, v: i64) -> u32 {
+    let mem = Value(m);
+    let _r = gc::Rooted::new(mem); // keep the memory alive across the boxing
+    let b = crate::value::box_int(v);
+    memory::set(mem, i, b).is_ok() as u32
+}
+
 /// Construct a `TypeVar` `lb <: T <: ub` named "T". Pass `0` for `lb`/`ub` to
 /// default them to `Union{}` and `Any` respectively.
 #[no_mangle]
@@ -564,6 +603,81 @@ mod tests {
         assert_eq!(inst(uall(zt, types::box_type(int)), bool_), types::box_type(int));
 
         assert_eq!(gc::root_count(), 0, "roots released after instantiation");
+    }
+
+    #[test]
+    fn memory_bits_elements_roundtrip() {
+        let _g = serial();
+        rj_init();
+        let int = types::builtin(id::INT64);
+        let m = memory::alloc(int, 5).unwrap();
+        let _r = gc::Rooted::new(m);
+        assert_eq!(memory::len(m), 5);
+        // Zero-initialized, like object::alloc generally.
+        assert_eq!(crate::value::unbox_int(memory::get(m, 0).unwrap()), 0);
+        for i in 0..5u32 {
+            memory::set(m, i, box_int(10 + i as i64)).unwrap();
+        }
+        for i in 0..5u32 {
+            assert_eq!(crate::value::unbox_int(memory::get(m, i).unwrap()), 10 + i as i64);
+        }
+        // Bounds are checked on both sides of the ref.
+        assert!(memory::get(m, 5).is_err());
+        assert!(memory::set(m, 5, box_int(0)).is_err());
+        // The element type is enforced (jl_memoryrefset's isa check).
+        assert!(memory::set(m, 0, crate::value::box_float64(1.5)).is_err());
+        // Memory{T} is uniqued and invariant.
+        assert_eq!(types::memory_type(int), types::memory_type(int));
+        assert!(!types::issubtype(
+            types::memory_type(int),
+            types::memory_type(types::builtin(id::INTEGER))
+        ));
+        assert!(types::issubtype(types::memory_type(int), types::builtin(id::ANY)));
+        drop(_r);
+        assert_eq!(gc::root_count(), 0);
+    }
+
+    #[test]
+    fn memory_boxed_elements_traced_and_barriered() {
+        let _g = serial();
+        rj_init();
+        let any = types::builtin(id::ANY);
+        let m = memory::alloc(any, 3).unwrap();
+        let root = gc::Rooted::new(m);
+        // An unset boxed slot is an UndefRefError, not a null deref.
+        assert!(memory::get(m, 0).is_err());
+        // Boxed elements keep identity: get returns the same object.
+        let b = box_int(77);
+        memory::set(m, 0, b).unwrap();
+        assert_eq!(memory::get(m, 0).unwrap(), b);
+        // Elements survive a full collection only through the memory's trace.
+        memory::set(m, 1, box_int(88)).unwrap();
+        gc::collect_full();
+        assert_eq!(crate::value::unbox_int(memory::get(root.get(), 0).unwrap()), 77);
+        assert_eq!(crate::value::unbox_int(memory::get(root.get(), 1).unwrap()), 88);
+        // Promote the memory old (marked survivors promote at sweep), then store
+        // a young value: the write barrier must remember the old->young edge or
+        // a minor collection frees the element out from under us.
+        gc::collect();
+        gc::collect();
+        memory::set(root.get(), 2, box_int(99)).unwrap();
+        gc::collect(); // minor: reaches the young box via the remset alone
+        rj_alloc_garbage(64); // stomp anything wrongly freed
+        assert_eq!(crate::value::unbox_int(memory::get(root.get(), 2).unwrap()), 99);
+        drop(root);
+        // Unrooted, the memory is reclaimed — after two full sweeps: it was
+        // promoted old above, and old garbage has the pin's one-full-cycle lag
+        // (a full sweep demotes OLD_MARKED to OLD; the next one frees it).
+        let live0 = {
+            gc::collect_full();
+            gc::collect_full();
+            rj_live_objects()
+        };
+        let m2 = memory::alloc(any, 64).unwrap();
+        let _ = m2;
+        gc::collect_full();
+        assert_eq!(rj_live_objects(), live0, "unrooted memory must be reclaimed");
+        assert_eq!(gc::root_count(), 0);
     }
 
     #[test]

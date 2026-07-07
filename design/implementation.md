@@ -571,13 +571,13 @@ strategy's "GC exactness & tuning" frontier item).**
 | Method definitions (`jl_method_t`) | Partial | Faithful | Rust-side method bodies |
 | OpaqueClosure | Planned | Faithful | — |
 
-## Arrays & memory — `array.c`, `genericmemory.c`
+## Arrays & memory — `array.c`, `genericmemory.c` vs `memory.rs`
 
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
-| `GenericMemory` | Planned | Faithful | — |
-| `Array` | Planned | Faithful | — |
-| `arrayref`/`arrayset`/`length`/`push!` | Planned | Faithful | — |
+| `GenericMemory` | Partial | Faithful | core landed (arrays slice 1, 2026-07), `memory.rs`: the `jl_genericmemory_t` shape `[length, ptr]` + inline data with `ptr` a real field aimed at the object's own body — the C's pooled path (`jl_alloc_genericmemory_unchecked`, `genericmemory.c:41–52`); overflow-checked, **explicitly zero-initialized** allocation (`_new_genericmemory_`, `:56–74` — a recycled chunk carries stale bytes, so the `memset` is load-bearing for boxed slots); `memoryrefget`/`memoryrefset` for the non-atomic subset (`:343,446`): boxed elements by reference with `UndefRefError` on unset and the **write barrier on the memory object** on store (`:463`), primitive-bits elements inline with `jl_new_bits` re-box on read, zero-size singletons via `instance` (`:361–364`); element-type `isa` check on set; GC marks boxed elements via the typename special-case exactly as `gc-stock.c:2412,2448–2456` (remset/`has_young_ref` flow through the same path, so old-memory→young-element edges work — pinned by a promote-then-store test). The buffer lives in linear memory in Julia's layout — the arrays carry-forward constraint (`design/roadmap.md`) is **honored**: element access is `region[ptr + i*elsz]`. Simplified: data always inline (no `MALLOCD`/string-owned buffers in the bounded region); inline storage for *primitive* isbits only (isbits structs/tuples/unions stay boxed); single type parameter (kind fixed `:not_atomic`, addrspace CPU); no zero-length singleton instance; no `memoryref` object (`jl_genericmemoryref_t`) — get/set take `(mem, i)` directly |
+| `Array` | Planned | Faithful | the `jl_array_t` wrapper (`ref + dimsize`) over `GenericMemory`; growth (`push!`) lands here |
+| `arrayref`/`arrayset`/`length`/`push!` | Planned | Faithful | over the landed memory core |
 
 ## Serialization & system image — `staticdata.c`, `precompile.c`
 
