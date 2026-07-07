@@ -302,9 +302,10 @@ pub fn bootstrap() {
     types[id::TVAR as usize] = new_type(datatype, tn("TypeVar"), any, 12, 0, &[0, 4, 8]);
     types[id::UNIONALL as usize] = new_type(datatype, tn("UnionAll"), any, 8, 0, &[0, 4]);
     // `Vararg` (jl_vararg_t) is the type of a `Vararg{T}` object — the covariant
-    // tail of a tuple type. We represent only the unbounded form (element T@0,
-    // the count parameter N absent); `Vararg{T,N}` is not yet modelled.
-    types[id::VARARG as usize] = new_type(datatype, tn("Vararg"), any, 4, 0, &[0]);
+    // tail of a tuple type: element T@0, count N@4 (a boxed Int64, or NULL for
+    // the unbounded form). A typevar-valued N (the C's JL_VARARG_BOUND kind)
+    // is not yet modelled.
+    types[id::VARARG as usize] = new_type(datatype, tn("Vararg"), any, 8, 0, &[0, 4]);
     // `Module` (jl_module_t subset): name Symbol, parent Module, bindings
     // Array — all references, so ordinary layout-driven GC tracing suffices.
     types[id::MODULE as usize] = new_type(datatype, tn("Module"), any, 12, 0, &[0, 4, 8]);
@@ -533,9 +534,22 @@ pub fn apply_type(typename: Offset, super_: Offset, params: &[Offset]) -> Offset
     v.raw()
 }
 
-/// Construct the tuple type `Tuple{elems...}` (covariant), uniqued.
+/// Construct the tuple type `Tuple{elems...}` (covariant), uniqued. A trailing
+/// `Vararg{T,N}` with a concrete `N` expands into `N` copies of `T`
+/// (`inst_datatype_inner`; hence `Tuple{Int,Vararg{Int,2}} === Tuple{Int,Int,Int}`,
+/// `test/subtype.jl:63-67`); unbounded varargs stay as the tuple's tail.
 pub fn tuple_type(elems: &[Offset]) -> Offset {
     let b = builtins();
+    if let Some(&last) = elems.last() {
+        if is_vararg(last) && vararg_num(last) != NULL {
+            let n = crate::value::unbox_int(object::Value(vararg_num(last)));
+            assert!(n >= 0, "Vararg length must be non-negative");
+            let elem = vararg_elem(last);
+            let mut expanded = elems[..elems.len() - 1].to_vec();
+            expanded.extend(core::iter::repeat(elem).take(n as usize));
+            return apply_type(b.tuple_typename, b.types[id::ANY as usize], &expanded);
+        }
+    }
     apply_type(b.tuple_typename, b.types[id::ANY as usize], elems)
 }
 
@@ -964,14 +978,36 @@ pub fn unionall_body(u: Offset) -> Offset {
 }
 
 /// Allocate an unbounded `Vararg{elem}` (`jl_vararg_t` with `N` absent): the
-/// covariant element type at `@0`. Appears only as the last parameter of a tuple
-/// type. Bounded `Vararg{T,N}` is not yet represented (`design/implementation.md`),
-/// and — like Julia's `jl_wrap_vararg` results — these are not uniqued.
+/// covariant element type at `@0`, `N` at `@4` left `NULL`. Appears only as the
+/// last parameter of a tuple type. Like Julia's `jl_wrap_vararg` results,
+/// varargs are not uniqued.
 pub fn vararg_type(elem: Offset) -> Offset {
     let _r = Rooted::new(object::Value(elem));
-    let v = object::alloc(builtin(id::VARARG), 4).raw();
+    let v = object::alloc(builtin(id::VARARG), 8).raw();
     write_ref(v, 0, elem);
+    write_ref(v, 4, NULL);
     v
+}
+
+/// Allocate `Vararg{elem, n}` with a concrete integer count (`jl_wrap_vararg`
+/// with a boxed `Long` N — the C's `JL_VARARG_INT` kind). A trailing fixed-N
+/// vararg never survives into a tuple type: [`tuple_type`] expands it, exactly
+/// as `inst_datatype_inner` does, which is why
+/// `Tuple{Int,Vararg{Int,2}} === Tuple{Int,Int,Int}` (`test/subtype.jl:63-67`).
+pub fn vararg_type_n(elem: Offset, n: i64) -> Offset {
+    let _r = Rooted::new(object::Value(elem));
+    let boxed = crate::value::box_int(n).raw();
+    let _rn = Rooted::new(object::Value(boxed));
+    let v = object::alloc(builtin(id::VARARG), 8).raw();
+    write_ref(v, 0, elem);
+    write_ref(v, 4, boxed);
+    v
+}
+
+/// The count `N` of a `Vararg{T,N}` as a boxed value, or `NULL` when unbounded
+/// (`jl_unwrap_vararg_num`).
+pub fn vararg_num(t: Offset) -> Offset {
+    read_ref(t, 4)
 }
 
 /// Whether the value at `t` is a `Vararg` (`jl_is_vararg`).

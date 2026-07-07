@@ -38,10 +38,12 @@ const Tuple = (...ts) => {
     case 1: return x.rj_tuple_type1(ts[0]);
     case 2: return x.rj_tuple_type2(ts[0], ts[1]);
     case 3: return x.rj_tuple_type3(ts[0], ts[1], ts[2]);
+    case 4: return x.rj_tuple_type4(ts[0], ts[1], ts[2], ts[3]);
     default: throw new Error(`no ABI for ${ts.length}-tuples`);
   }
 };
 const Vararg = (t) => x.rj_vararg(t); // unbounded Vararg{t}
+const VarargN = (t, n) => x.rj_vararg_n(t, BigInt(n)); // Vararg{t, n}
 const Pair = (a, b) => x.rj_pair_type(a, b); // two-parameter invariant type
 const Union = (a, b) => x.rj_union_type(a, b);
 const tvar = (lb, ub) => x.rj_typevar(lb ?? 0, ub ?? 0); // 0 => Bottom / Any
@@ -80,6 +82,14 @@ const cases = [
   ["L592 !issub(Tuple{Vararg{Int32}}, Tuple{Int32})", "notsub", () => [Tuple(Vararg(Int32)), Tuple(Int32)]],
   ["L593 !issub(Tuple{Vararg{Int32}}, Tuple{Number,Integer})", "notsub", () => [Tuple(Vararg(Int32)), Tuple(Number, Integer)]],
   ["L594 !issub(Tuple{Vararg{Integer}}, Tuple{Integer,Integer,Vararg{Integer}})", "notsub", () => [Tuple(Vararg(Integer)), Tuple(Integer, Integer, Vararg(Integer))]],
+
+  // --- fixed-count Vararg{T,N}: expands at construction (test_1) ---
+  ["L61 isequal_type(Tuple{Int,Int}, Tuple{Vararg{Int,2}})", "equal", () => [Tuple(Int, Int), Tuple(VarargN(Int, 2))]],
+  ["L63 Tuple{Int,Vararg{Int,2}} == Tuple{Int,Int,Int}", "equal", () => [Tuple(Int, VarargN(Int, 2)), Tuple(Int, Int, Int)]],
+  ["L64 Tuple{Int,Vararg{Int,2}} === Tuple{Int,Int,Int}", "identical", () => [Tuple(Int, VarargN(Int, 2)), Tuple(Int, Int, Int)]],
+  ["L65 Tuple{Any,Any} === Tuple{Vararg{Any,2}}", "identical", () => [Tuple(Any, Any), Tuple(VarargN(Any, 2))]],
+  ["L67 Tuple{Int,Vararg{Int,2}} == Tuple{Int,Int,Int,Vararg{Int,0}}", "equal", () => [Tuple(Int, VarargN(Int, 2)), Tuple(Int, Int, Int, VarargN(Int, 0))]],
+  ["L68 !(Tuple{Int,Vararg{Int,2}} <: Tuple{Int,Int,Int,Vararg{Int,1}})", "notsub", () => [Tuple(Int, VarargN(Int, 2)), Tuple(Int, Int, Int, VarargN(Int, 1))]],
 
   // --- two-parameter parametrics: invariance, where, diagonal (test_3) ---
   ["L206 issub_strict((@UnionAll T Pair{T,T}), Pair)", "strict", () => {
@@ -339,7 +349,9 @@ const knownDivergences = [
   }],
 ];
 
-const pred = { strict, equal, sub: (a, b) => sub(a, b), notsub: (a, b) => !sub(a, b), noteq: (a, b) => !equal(a, b) };
+// `identical` is Julia's `===` on types: with hash-consed construction, equal
+// tuples are the same object.
+const pred = { strict, equal, sub: (a, b) => sub(a, b), notsub: (a, b) => !sub(a, b), noteq: (a, b) => !equal(a, b), identical: (a, b) => a === b };
 
 let pass = 0, fail = 0;
 for (const [src, kind, build] of cases) {

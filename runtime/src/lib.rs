@@ -301,12 +301,27 @@ pub extern "C" fn rj_tuple_type3(a: u32, b: u32, c: u32) -> u32 {
     types::tuple_type(&[a as Offset, b as Offset, c as Offset])
 }
 
+/// Construct the tuple type `Tuple{a, b, c, d}`.
+#[no_mangle]
+pub extern "C" fn rj_tuple_type4(a: u32, b: u32, c: u32, d: u32) -> u32 {
+    ensure_init();
+    types::tuple_type(&[a as Offset, b as Offset, c as Offset, d as Offset])
+}
+
 /// Construct an unbounded `Vararg{elem}`, for use as the last element of a tuple
-/// type. Bounded `Vararg{T,N}` is not yet supported.
+/// type.
 #[no_mangle]
 pub extern "C" fn rj_vararg(elem: u32) -> u32 {
     ensure_init();
     types::vararg_type(elem as Offset)
+}
+
+/// Construct `Vararg{elem, n}` with a concrete count; a trailing one expands
+/// when the enclosing tuple type is built.
+#[no_mangle]
+pub extern "C" fn rj_vararg_n(elem: u32, n: i64) -> u32 {
+    ensure_init();
+    types::vararg_type_n(elem as Offset, n)
 }
 
 /// Construct `Union{a, b}`.
