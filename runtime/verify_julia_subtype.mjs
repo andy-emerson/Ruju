@@ -42,6 +42,7 @@ const Tuple = (...ts) => {
   }
 };
 const Vararg = (t) => x.rj_vararg(t); // unbounded Vararg{t}
+const Pair = (a, b) => x.rj_pair_type(a, b); // two-parameter invariant type
 const Union = (a, b) => x.rj_union_type(a, b);
 const tvar = (lb, ub) => x.rj_typevar(lb ?? 0, ub ?? 0); // 0 => Bottom / Any
 const where = (v, body) => x.rj_unionall(v, body);
@@ -79,6 +80,40 @@ const cases = [
   ["L592 !issub(Tuple{Vararg{Int32}}, Tuple{Int32})", "notsub", () => [Tuple(Vararg(Int32)), Tuple(Int32)]],
   ["L593 !issub(Tuple{Vararg{Int32}}, Tuple{Number,Integer})", "notsub", () => [Tuple(Vararg(Int32)), Tuple(Number, Integer)]],
   ["L594 !issub(Tuple{Vararg{Integer}}, Tuple{Integer,Integer,Vararg{Integer}})", "notsub", () => [Tuple(Vararg(Integer)), Tuple(Integer, Integer, Vararg(Integer))]],
+
+  // --- two-parameter parametrics: invariance, where, diagonal (test_3) ---
+  ["L206 issub_strict((@UnionAll T Pair{T,T}), Pair)", "strict", () => {
+    const T = tvar(), A = tvar(), B = tvar();
+    return [where(T, Pair(T, T)), where(A, where(B, Pair(A, B)))];
+  }],
+  ["L207 issub(Pair{Int,Int8}, Pair)", "sub", () => {
+    const A = tvar(), B = tvar();
+    return [Pair(Int, Int8), where(A, where(B, Pair(A, B)))];
+  }],
+  ["L208 issub(Pair{Int,Int8}, Pair{Int,S} where S)", "sub", () => {
+    const S = tvar();
+    return [Pair(Int, Int8), where(S, Pair(Int, S))];
+  }],
+  ["L232 !issub((@UnionAll T Pair{T,T}), Pair{Int,Int8})", "notsub", () => {
+    const T = tvar();
+    return [where(T, Pair(T, T)), Pair(Int, Int8)];
+  }],
+  ["L233 !issub((@UnionAll T Pair{T,T}), Pair{Int,Int})", "notsub", () => {
+    const T = tvar();
+    return [where(T, Pair(T, T)), Pair(Int, Int)];
+  }],
+  ["L262 !issub(Pair{Int,Int8}, (@UnionAll T Pair{T,T}))", "notsub", () => {
+    const T = tvar();
+    return [Pair(Int, Int8), where(T, Pair(T, T))];
+  }],
+  ["L270 !issub(Pair{Vector{Int},Integer}, @UnionAll T Pair{Vector{T},T})", "notsub", () => {
+    const T = tvar();
+    return [Pair(Ref(Int), Integer), where(T, Pair(Ref(T), T))];
+  }],
+  ["L271 issub(Pair{Vector{Int},Int}, @UnionAll T Pair{Vector{T},T})", "sub", () => {
+    const T = tvar();
+    return [Pair(Ref(Int), Int), where(T, Pair(Ref(T), T))];
+  }],
 
   // --- existential vs universal (test_3) ---
   ["L99 issub_strict(Tuple{R,R} where R, Tuple{T,S} where {T,S})", "strict", () => {

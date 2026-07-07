@@ -106,6 +106,8 @@ pub struct Builtins {
     pub tuple_typename: Offset,
     /// The `TypeName` of the demo parametric constructor `Box{T}` (invariant).
     pub box_typename: Offset,
+    /// The `TypeName` of the demo two-parameter constructor `Pair{A,B}` (invariant).
+    pub pair_typename: Offset,
 }
 
 struct BuiltinsSlot(Cell<Option<Builtins>>);
@@ -302,6 +304,7 @@ pub fn bootstrap() {
     //    parametric constructor (an invariant single-parameter type).
     let tuple_typename = tn("Tuple");
     let box_typename = tn("Box");
+    let pair_typename = tn("Pair");
 
     // 7. The `nothing` singleton: the sole (zero-size) instance of Nothing,
     //    recorded in the type's `instance` field (jl_datatype_t.instance).
@@ -328,6 +331,7 @@ pub fn bootstrap() {
         false_instance,
         tuple_typename,
         box_typename,
+        pair_typename,
     }));
 }
 
@@ -525,6 +529,15 @@ pub fn tuple_type(elems: &[Offset]) -> Offset {
 pub fn box_type(elem: Offset) -> Offset {
     let b = builtins();
     apply_type(b.box_typename, b.types[id::ANY as usize], &[elem])
+}
+
+/// Construct the demo two-parameter type `Pair{a, b}` (invariant), uniqued —
+/// like `Box`, a stand-in for a nominal parametric type, with two invariant
+/// parameters so the oracle can exercise multi-parameter `where` and diagonal
+/// cases. Subtyping reuses the invariant-parametric path unchanged.
+pub fn pair_type(a: Offset, b: Offset) -> Offset {
+    let bi = builtins();
+    apply_type(bi.pair_typename, bi.types[id::ANY as usize], &[a, b])
 }
 
 pub(crate) fn parameters_of(t: Offset) -> Offset {

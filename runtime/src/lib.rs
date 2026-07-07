@@ -319,6 +319,13 @@ pub extern "C" fn rj_box_type(elem: u32) -> u32 {
     types::box_type(elem as Offset)
 }
 
+/// Construct the demo two-parameter type `Pair{a, b}` (invariant, uniqued).
+#[no_mangle]
+pub extern "C" fn rj_pair_type(a: u32, b: u32) -> u32 {
+    ensure_init();
+    types::pair_type(a as Offset, b as Offset)
+}
+
 /// Construct a `TypeVar` `lb <: T <: ub` named "T". Pass `0` for `lb`/`ub` to
 /// default them to `Union{}` and `Any` respectively.
 #[no_mangle]
@@ -505,6 +512,36 @@ mod tests {
         assert!(!types::issubtype(t(id::INT64), t(id::FLOAT64)));
         assert!(!types::issubtype(t(id::INT64), t(id::UNSIGNED)));
         assert!(!types::issubtype(t(id::NUMBER), t(id::INT64)));
+    }
+
+    #[test]
+    fn pair_invariant_and_diagonal_subtyping() {
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+        let pair = types::pair_type;
+        let uall = types::unionall_type;
+        let tv = || types::make_typevar("T", types::builtin(id::BOTTOM), t(id::ANY));
+        let sub = types::issubtype;
+        let (int, int8) = (t(id::INT64), t(id::INT8));
+
+        // `Pair{Int,Int8} <: Pair{T,S} where {T,S}` but the diagonal
+        // `Pair{T,T} where T` excludes it (test/subtype.jl:207,262).
+        let a = tv();
+        let b = tv();
+        let bare_pair = uall(a, uall(b, pair(a, b)));
+        assert!(sub(pair(int, int8), bare_pair));
+        let d = tv();
+        let diag_pair = uall(d, pair(d, d));
+        assert!(!sub(pair(int, int8), diag_pair));
+        // `Pair{T,T} where T <: Pair{Int,Int}` is false: no single T is both
+        // invariantly (subtype.jl:233).
+        assert!(!sub(diag_pair, pair(int, int)));
+        // Invariance: distinct instantiations are unrelated but reflexive.
+        assert!(!sub(pair(int, int8), pair(t(id::INTEGER), t(id::SIGNED))));
+        assert!(sub(pair(int, int8), pair(int, int8)));
+
+        assert_eq!(gc::root_count(), 0, "roots released after subtype queries");
     }
 
     #[test]
