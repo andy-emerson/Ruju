@@ -94,3 +94,39 @@ Three increments carry nearly all the uncertainty. Every wave estimate past
   Julia's dynamic, open-world semantics is an unsolved problem upstream too,
   not merely a large one. This is the row to interrogate before trusting any
   wave to the right of it.
+
+## AOT-readiness carry-forward
+
+The interpreter and the eventual AOT'd code are two front-ends over **one**
+heap, one IR, and one dispatch service (`strategy.md`). Most of what makes an
+increment "AOT-ready" costs almost nothing while that increment is being built
+the first time, and becomes a rewrite once the backend depends on it. The rows
+below are those constraints, each **bound to the increment that owns it** —
+recorded here so the constraint travels with the work when it is picked from
+the frontier. Per `methodology.md`, a row graduates into an `implementation.md`
+obligation at build time; the point is that **no separate "make X AOT-ready"
+item is ever created — the retrofit item is avoided, not scheduled.**
+
+The litmus behind every row: *could a compiled function, running as raw WASM
+with no interpreter present, do this by touching only linear memory and
+defined runtime entry points?* If meaning lives in a host-side Rust structure
+instead, the compiler has nothing to emit.
+
+| Carry-forward constraint | Owning increment | Cost now | Risk if deferred |
+| - | - | - | - |
+| `GenericMemory` backed by a linear-memory buffer in Julia's layout — **not** a host `Vec` — so `arrayref`/`arrayset` lower to a bounds check + `load`/`store` | Arrays & GenericMemory | ~none (it is how you build it once you know) | **high** — array access is the hottest path; a host-`Vec` backing kills the perf thesis at the array boundary and forces a full rewrite |
+| `enter`/`leave` modeled as an explicit handler stack **in linear memory** (not a Rust `Result`/`panic`) so compiled and interpreted code unwind through one mechanism | Exceptions | low | **high** — a compiled function cannot return a Rust `Result`; the wrong mechanism means rewriting unwinding |
+| Interpreter consumes the **same** `CodeInfo` shape the backend will (retiring `frontend.rs`'s ad-hoc IR) | Real lowering | already the plan | medium — otherwise two IRs and a permanent translation layer |
+| Method resolution is a pure, reusable `(f, argtypes) → method` query, plus a defined stable **world** to compile against, so the backend can devirtualize at build time and share the runtime fallback | Dispatch hardening | low–med | medium — no build-time devirtualization means most AOT speed is left on the table |
+| A defined **calling convention** for a method — gcframe threading, which args arrive boxed vs. unboxed, how the result returns — shared by interpreter and compiled methods | Dispatch hardening / AOT backend | low | medium — marshalling at every interpreter↔compiled fallback boundary otherwise |
+| The gcframe / shadow-stack layout **frozen as a documented ABI contract** (compiled code must emit it byte-for-byte) | freeze now, while the surface is tiny | ~none | medium — changing it after the backend emits it churns codegen |
+| Region base kept cheaply reachable by compiled code (a known global), so `base + offset` is a two-instruction address | `rj_` ABI | ~none | low–med — otherwise a call per dereference |
+| Intrinsics stay pure and value-typed; nothing relies on **heap identity** for primitives (egal-by-bits already holds) so the backend is free to unbox into `i64`/`f64` locals | standing invariant | none (already true) | low — cheap to violate by accident, and a violation blocks unboxing wholesale |
+| Layout features the backend will need before it can compile those field cases: inline isbits unions (selector bytes), inline immutables containing pointers (`hasptr`/`first_ptr`), atomics | Structs layout tail | med | medium — the backend cannot compile those field accesses until the layout supports them |
+
+**How this reduces the backlog.** Every row above is an item that *does not
+get added* if the owning increment honors it the first time. The cheapest way
+to shrink the total is therefore not to find new quick wins but to refuse to
+manufacture retrofit work — build each pre-AOT increment AOT-consciously, and
+the AOT stage inherits a runtime it can compile against instead of one it must
+first repair.
