@@ -90,7 +90,8 @@ pub mod id {
     pub const TYPENAME: u32 = 29; // jl_typename_t: a DataType's name object
     pub const TVAR: u32 = 30; // jl_tvar_t: a `where` type variable
     pub const UNIONALL: u32 = 31; // jl_unionall_t: a `T where ...` type
-    pub const COUNT: usize = 32;
+    pub const VARARG: u32 = 32; // jl_vararg_t: the `Vararg{T}` tail of a tuple type
+    pub const COUNT: usize = 33;
 }
 
 /// Offsets of the bootstrapped core types and the immortal value permboxes.
@@ -291,6 +292,10 @@ pub fn bootstrap() {
     // body type (var@0, body@4). Together they are the `where` machinery.
     types[id::TVAR as usize] = new_type(datatype, tn("TypeVar"), any, 12, 0, &[0, 4, 8]);
     types[id::UNIONALL as usize] = new_type(datatype, tn("UnionAll"), any, 8, 0, &[0, 4]);
+    // `Vararg` (jl_vararg_t) is the type of a `Vararg{T}` object — the covariant
+    // tail of a tuple type. We represent only the unbounded form (element T@0,
+    // the count parameter N absent); `Vararg{T,N}` is not yet modelled.
+    types[id::VARARG as usize] = new_type(datatype, tn("Vararg"), any, 4, 0, &[0]);
 
     // 6. The shared tuple TypeName: every Tuple{...} type has this `name`, which
     //    is how tuples are identified (jl_tuple_typename). `Box` is a demo
@@ -785,6 +790,27 @@ pub fn unionall_var(u: Offset) -> Offset {
 /// A `UnionAll`'s body type.
 pub fn unionall_body(u: Offset) -> Offset {
     read_ref(u, 4)
+}
+
+/// Allocate an unbounded `Vararg{elem}` (`jl_vararg_t` with `N` absent): the
+/// covariant element type at `@0`. Appears only as the last parameter of a tuple
+/// type. Bounded `Vararg{T,N}` is not yet represented (`design/implementation.md`),
+/// and — like Julia's `jl_wrap_vararg` results — these are not uniqued.
+pub fn vararg_type(elem: Offset) -> Offset {
+    let _r = Rooted::new(object::Value(elem));
+    let v = object::alloc(builtin(id::VARARG), 4).raw();
+    write_ref(v, 0, elem);
+    v
+}
+
+/// Whether the value at `t` is a `Vararg` (`jl_is_vararg`).
+pub fn is_vararg(t: Offset) -> bool {
+    object::type_of(object::Value(t)) == builtin(id::VARARG)
+}
+
+/// The element type `T` of `Vararg{T}` (`jl_unwrap_vararg`).
+pub fn vararg_elem(t: Offset) -> Offset {
+    read_ref(t, 0)
 }
 
 // --- source-defined struct registry -------------------------------------------

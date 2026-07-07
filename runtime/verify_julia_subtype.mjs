@@ -30,8 +30,18 @@ const ty = (id) => x.rj_builtin_type(id);
 // Julia type constructors mapped onto the runtime ABI.
 const Int = ty(ID.Int64), Integer = ty(ID.Integer), Real = ty(ID.Real), Number = ty(ID.Number);
 const Int8 = ty(ID.Int8), Int16 = ty(ID.Int16), Int32 = ty(ID.Int32), Any = ty(ID.Any), Bottom = ty(ID.Bottom);
+const Float64 = ty(ID.Float64);
 const Ref = (t) => x.rj_box_type(t);
-const Tuple = (...ts) => (ts.length === 1 ? x.rj_tuple_type1(ts[0]) : x.rj_tuple_type2(ts[0], ts[1]));
+const Tuple = (...ts) => {
+  switch (ts.length) {
+    case 0: return x.rj_tuple_type0();
+    case 1: return x.rj_tuple_type1(ts[0]);
+    case 2: return x.rj_tuple_type2(ts[0], ts[1]);
+    case 3: return x.rj_tuple_type3(ts[0], ts[1], ts[2]);
+    default: throw new Error(`no ABI for ${ts.length}-tuples`);
+  }
+};
+const Vararg = (t) => x.rj_vararg(t); // unbounded Vararg{t}
 const Union = (a, b) => x.rj_union_type(a, b);
 const tvar = (lb, ub) => x.rj_typevar(lb ?? 0, ub ?? 0); // 0 => Bottom / Any
 const where = (v, body) => x.rj_unionall(v, body);
@@ -48,6 +58,27 @@ const cases = [
   ["L30 issub_strict(Tuple{Int,Int}, Tuple{Integer,Integer})", "strict", () => [Tuple(Int, Int), Tuple(Integer, Integer)]],
   ["L35 !issub(Tuple{Int,Int}, Tuple{Int})", "notsub", () => [Tuple(Int, Int), Tuple(Int)]],
   ["L38 !issub(Vector{Int}, Vector{Integer})", "notsub", () => [Ref(Int), Ref(Integer)]],
+
+  // --- unbounded Vararg in tuples (test_1 varargs; test at L587-594) ---
+  ["L43 issub_strict(Tuple{Int,Int}, Tuple{Vararg{Int}})", "strict", () => [Tuple(Int, Int), Tuple(Vararg(Int))]],
+  ["L44 issub_strict(Tuple{Int,Int}, Tuple{Int,Vararg{Int}})", "strict", () => [Tuple(Int, Int), Tuple(Int, Vararg(Int))]],
+  ["L45 issub_strict(Tuple{Int,Int}, Tuple{Int,Vararg{Integer}})", "strict", () => [Tuple(Int, Int), Tuple(Int, Vararg(Integer))]],
+  ["L46 issub_strict(Tuple{Int,Int}, Tuple{Int,Int,Vararg{Integer}})", "strict", () => [Tuple(Int, Int), Tuple(Int, Int, Vararg(Integer))]],
+  ["L47 issub_strict(Tuple{Int,Vararg{Int}}, Tuple{Vararg{Int}})", "strict", () => [Tuple(Int, Vararg(Int)), Tuple(Vararg(Int))]],
+  ["L48 issub_strict(Tuple{Int,Int,Int}, Tuple{Vararg{Int}})", "strict", () => [Tuple(Int, Int, Int), Tuple(Vararg(Int))]],
+  ["L49 issub_strict(Tuple{Int,Int,Int}, Tuple{Integer,Vararg{Int}})", "strict", () => [Tuple(Int, Int, Int), Tuple(Integer, Vararg(Int))]],
+  ["L51 issub_strict(Tuple{}, Tuple{Vararg{Any}})", "strict", () => [Tuple(), Tuple(Vararg(Any))]],
+  ["L54 isequal_type(Tuple{Vararg{Integer}}, Tuple{Vararg{Integer}})", "equal", () => [Tuple(Vararg(Integer)), Tuple(Vararg(Integer))]],
+  ["L56 !issub(Tuple{}, Tuple{Int,Vararg{Int}})", "notsub", () => [Tuple(), Tuple(Int, Vararg(Int))]],
+  ["L57 !issub(Tuple{Int}, Tuple{Int,Int,Vararg{Int}})", "notsub", () => [Tuple(Int), Tuple(Int, Int, Vararg(Int))]],
+  ["L587 issub(Tuple{Integer,Vararg{Integer}}, Tuple{Integer,Vararg{Real}})", "sub", () => [Tuple(Integer, Vararg(Integer)), Tuple(Integer, Vararg(Real))]],
+  ["L588 issub(Tuple{Integer,Float64,Vararg{Integer}}, Tuple{Integer,Vararg{Number}})", "sub", () => [Tuple(Integer, Float64, Vararg(Integer)), Tuple(Integer, Vararg(Number))]],
+  ["L589 issub(Tuple{Integer,Float64}, Tuple{Integer,Vararg{Number}})", "sub", () => [Tuple(Integer, Float64), Tuple(Integer, Vararg(Number))]],
+  ["L590 issub(Tuple{Int32}, Tuple{Vararg{Number}})", "sub", () => [Tuple(Int32), Tuple(Vararg(Number))]],
+  ["L591 issub(Tuple{}, Tuple{Vararg{Number}})", "sub", () => [Tuple(), Tuple(Vararg(Number))]],
+  ["L592 !issub(Tuple{Vararg{Int32}}, Tuple{Int32})", "notsub", () => [Tuple(Vararg(Int32)), Tuple(Int32)]],
+  ["L593 !issub(Tuple{Vararg{Int32}}, Tuple{Number,Integer})", "notsub", () => [Tuple(Vararg(Int32)), Tuple(Number, Integer)]],
+  ["L594 !issub(Tuple{Vararg{Integer}}, Tuple{Integer,Integer,Vararg{Integer}})", "notsub", () => [Tuple(Vararg(Integer)), Tuple(Integer, Integer, Vararg(Integer))]],
 
   // --- existential vs universal (test_3) ---
   ["L99 issub_strict(Tuple{R,R} where R, Tuple{T,S} where {T,S})", "strict", () => {

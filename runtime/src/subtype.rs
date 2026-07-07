@@ -359,6 +359,10 @@ fn var_occurs_invariant(v: Offset, var: Offset, inside: bool) -> bool {
         return var_occurs_invariant(types::union_a(v), var, inside)
             || var_occurs_invariant(types::union_b(v), var, inside);
     }
+    if types::is_vararg(v) {
+        // A `Vararg`'s element is covariant (a tuple tail): keep `inside`.
+        return var_occurs_invariant(types::vararg_elem(v), var, inside);
+    }
     if types::is_unionall(v) {
         let uv = types::unionall_var(v);
         if uv == var {
@@ -424,21 +428,117 @@ fn datatype_subtype(x: Offset, y: Offset, e: &mut Env, param: Param) -> bool {
     ans
 }
 
-/// Covariant tuple subtyping: equal arity, elementwise `<:` in covariant
-/// position.
+/// Covariant tuple subtyping (`subtype_tuple`, `subtype.c:1837`): a length
+/// classification prefix, then the elementwise tail. Handles a trailing
+/// unbounded `Vararg` on either side; bounded `Vararg{T,N}` is not yet
+/// represented, so the `JL_VARARG_INT`/`JL_VARARG_BOUND` classifications and the
+/// length-equation branches are absent (a faithful partial).
 fn tuple_subtype(x: Offset, y: Offset, e: &mut Env) -> bool {
     let px = types::parameters_of(x);
     let py = types::parameters_of(y);
-    let n = types::svec_len(px);
-    if n != types::svec_len(py) {
-        return false;
+    let lx = if px == NULL { 0 } else { types::svec_len(px) };
+    let ly = if py == NULL { 0 } else { types::svec_len(py) };
+    if lx == 0 && ly == 0 {
+        return true;
     }
-    for i in 0..n {
-        if !sub(types::svec_ref(px, i), types::svec_ref(py, i), e, Param::Covariant) {
-            return false;
+    // A trailing unbounded `Vararg` is Julia's `JL_VARARG_UNBOUND`; anything else
+    // last is `JL_VARARG_NONE`.
+    let vvx = lx > 0 && types::is_vararg(types::svec_ref(px, lx - 1));
+    let vvy = ly > 0 && types::is_vararg(types::svec_ref(py, ly - 1));
+    // Length classification (`subtype.c:1860-1894`, unbounded subset).
+    if vvx {
+        // Unbounded on the left includes `N == 0` (`subtype.c:1862-1867`).
+        if !vvy {
+            return false; // right side is fixed-length
+        }
+        if lx < ly {
+            return false; // both unbounded, but x's prefix is shorter
+        }
+    } else {
+        let nx = lx;
+        let ny = if vvy { ly - 1 } else { ly };
+        if !vvy {
+            if nx != ny {
+                return false; // both fixed: arities must match
+            }
+        } else if ny > nx {
+            return false; // x too short to cover y's fixed prefix
         }
     }
+    subtype_tuple_tail(px, py, lx, ly, e)
+}
+
+/// The elementwise tail walk (`subtype_tuple_tail`, `subtype.c:1740`), for the
+/// unbounded-`Vararg` subset. `vx`/`vy` count how far into a trailing `Vararg`
+/// each side has advanced; once both are inside one, `subtype_tuple_varargs`
+/// finishes the comparison.
+fn subtype_tuple_tail(px: Offset, py: Offset, lx: u32, ly: u32, e: &mut Env) -> bool {
+    let (mut i, mut j) = (0u32, 0u32);
+    let (mut vx, mut vy) = (0u32, 0u32);
+    loop {
+        let mut xi = NULL;
+        if i < lx {
+            xi = types::svec_ref(px, i);
+            if i == lx - 1 && (vx > 0 || types::is_vararg(xi)) {
+                vx += 1;
+            }
+        }
+        let mut yi = NULL;
+        if j < ly {
+            yi = types::svec_ref(py, j);
+            if j == ly - 1 && (vy > 0 || types::is_vararg(yi)) {
+                vy += 1;
+            }
+        }
+        if i >= lx {
+            break;
+        }
+
+        let mut all_varargs = vx > 0 && vy > 0;
+        if !all_varargs && vy == 1 && types::vararg_elem(yi) == types::builtin(id::ANY) {
+            // `Tuple{...} <: Tuple{..., Vararg{Any}}`: the remaining left elements
+            // are all `<: Any`, so match the tails directly (`subtype.c:1767`).
+            let xlast = types::svec_ref(px, lx - 1);
+            if types::is_vararg(xlast) {
+                all_varargs = true;
+                xi = xlast;
+                vx = 1;
+            } else {
+                break;
+            }
+        }
+        if all_varargs {
+            return subtype_tuple_varargs(xi, yi, e);
+        }
+        if j >= ly {
+            return vx > 0;
+        }
+        let xii = if vx > 0 { types::vararg_elem(xi) } else { xi };
+        let yii = if vy > 0 { types::vararg_elem(yi) } else { yi };
+        if !sub(xii, yii, e, Param::Covariant) {
+            return false;
+        }
+        if i < lx - 1 || vx == 0 {
+            i += 1;
+        }
+        if j < ly - 1 || vy == 0 {
+            j += 1;
+        }
+    }
+    // With only unbounded varargs there is no `N` length equation to discharge
+    // (`subtype.c:1828-1832` handled the bounded case).
     true
+}
+
+/// `Tuple{..., Vararg{S}} <: Tuple{..., Vararg{T}}` for unbounded varargs
+/// (`subtype_tuple_varargs`, `subtype.c:1587`, `N`-absent path): reduce to
+/// `S <: T`, checked twice so a diagonal variable in `S` is constrained as it
+/// must be across ≥2 arguments (`subtype.c:1651-1656`). The repeated-element and
+/// separable fast paths are omitted as pure optimizations.
+fn subtype_tuple_varargs(vtx: Offset, vty: Offset, e: &mut Env) -> bool {
+    let xp0 = types::vararg_elem(vtx);
+    let yp0 = types::vararg_elem(vty);
+    sub(xp0, yp0, e, Param::Covariant) && sub(xp0, yp0, e, Param::Covariant)
 }
 
 /// Invariant equality of two type parameters (`forall_exists_equal`): subtype in

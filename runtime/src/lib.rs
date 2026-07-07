@@ -269,6 +269,13 @@ pub extern "C" fn rj_types_egal(a: u32, b: u32) -> u32 {
     builtins::types_egal(a as Offset, b as Offset) as u32
 }
 
+/// Construct the empty tuple type `Tuple{}`.
+#[no_mangle]
+pub extern "C" fn rj_tuple_type0() -> u32 {
+    ensure_init();
+    types::tuple_type(&[])
+}
+
 /// Construct the tuple type `Tuple{a}`.
 #[no_mangle]
 pub extern "C" fn rj_tuple_type1(a: u32) -> u32 {
@@ -281,6 +288,21 @@ pub extern "C" fn rj_tuple_type1(a: u32) -> u32 {
 pub extern "C" fn rj_tuple_type2(a: u32, b: u32) -> u32 {
     ensure_init();
     types::tuple_type(&[a as Offset, b as Offset])
+}
+
+/// Construct the tuple type `Tuple{a, b, c}`.
+#[no_mangle]
+pub extern "C" fn rj_tuple_type3(a: u32, b: u32, c: u32) -> u32 {
+    ensure_init();
+    types::tuple_type(&[a as Offset, b as Offset, c as Offset])
+}
+
+/// Construct an unbounded `Vararg{elem}`, for use as the last element of a tuple
+/// type. Bounded `Vararg{T,N}` is not yet supported.
+#[no_mangle]
+pub extern "C" fn rj_vararg(elem: u32) -> u32 {
+    ensure_init();
+    types::vararg_type(elem as Offset)
 }
 
 /// Construct `Union{a, b}`.
@@ -483,6 +505,38 @@ mod tests {
         assert!(!types::issubtype(t(id::INT64), t(id::FLOAT64)));
         assert!(!types::issubtype(t(id::INT64), t(id::UNSIGNED)));
         assert!(!types::issubtype(t(id::NUMBER), t(id::INT64)));
+    }
+
+    #[test]
+    fn tuple_varargs_subtyping() {
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+        let tup = |elems: &[Offset]| types::tuple_type(elems);
+        let va = types::vararg_type;
+        let sub = types::issubtype;
+        let (int, integer, real, any) =
+            (t(id::INT64), t(id::INTEGER), t(id::REAL), t(id::ANY));
+
+        // A fixed tuple is a strict subtype of a matching Vararg tail
+        // (test/subtype.jl:43,47).
+        assert!(sub(tup(&[int, int]), tup(&[va(int)])));
+        assert!(!sub(tup(&[va(int)]), tup(&[int, int])));
+        assert!(sub(tup(&[int, va(int)]), tup(&[va(int)])));
+        // Element subtyping flows through the vararg (L45); width widens (L44).
+        assert!(sub(tup(&[int, int]), tup(&[int, va(integer)])));
+        // The empty tuple is under any unbounded Vararg (L51,591).
+        assert!(sub(tup(&[]), tup(&[va(any)])));
+        // Unbounded left, fixed/short right is rejected (L592,594).
+        assert!(!sub(tup(&[va(int)]), tup(&[int])));
+        assert!(!sub(tup(&[va(integer)]), tup(&[integer, integer, va(integer)])));
+        // A non-matching element still fails through the vararg (L593).
+        assert!(!sub(tup(&[va(int)]), tup(&[t(id::NUMBER), integer])));
+        // Vararg{S} <: Vararg{T} reduces to S <: T, strictly (L587 analog).
+        assert!(sub(tup(&[integer, va(integer)]), tup(&[integer, va(real)])));
+        assert!(!sub(tup(&[integer, va(real)]), tup(&[integer, va(integer)])));
+
+        assert_eq!(gc::root_count(), 0, "roots released after subtype queries");
     }
 
     #[test]

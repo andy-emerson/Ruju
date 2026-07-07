@@ -341,20 +341,21 @@ mapping is real: per-var `lb`/`ub` narrowing through
 
 Oracle: `runtime/verify_julia_subtype.mjs` runs assertions copied verbatim
 from JuliaLang/julia's own `test/subtype.jl` (mapping `Ref{T}`→`Box{T}`,
-`Int`→`Int64`) — currently 53/53, plus 1 tracked known divergence
+`Int`→`Int64`) — currently 72/72 (the unbounded-varargs slice added 19 cases
+from `test/subtype.jl:43–59,587–594`, 2026-07), plus 1 tracked known divergence
 (tuple-over-union distributivity, which needs Julia's global union-decision
 machine; it self-reports if a fix makes it pass).
 
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
-| `jl_subtype` structural core | Partial | Faithful | reflexive/`Any`/`Bottom`, Union forall–exists, covariant tuples, nominal, invariant parametrics, `UnionAll`/`TypeVar` via the env. Audit 2026-06 fixes landed: free-vs-free typevars now unconditionally false; `forall_exists_equal` reverse check at `PARAM_NONE` + same-name-datatype fast path. Remaining divergences: unions split before typevar/UnionAll handling (Julia prioritizes the latter, `subtype.c:1934–1948`); no two-union greedy path; local union backtracking vs the global decision machine (see oracle's known divergence) |
+| `jl_subtype` structural core | Partial | Faithful | reflexive/`Any`/`Bottom`, Union forall–exists, covariant tuples (incl. an unbounded-`Vararg` tail — `subtype_tuple`/`subtype_tuple_tail`/`subtype_tuple_varargs` length classification + tail walk, `subtype.c:1740–1899`, varargs slice 2026-07), nominal, invariant parametrics, `UnionAll`/`TypeVar` via the env. Audit 2026-06 fixes landed: free-vs-free typevars now unconditionally false; `forall_exists_equal` reverse check at `PARAM_NONE` + same-name-datatype fast path. Remaining divergences: unions split before typevar/UnionAll handling (Julia prioritizes the latter, `subtype.c:1934–1948`); no two-union greedy path; local union backtracking vs the global decision machine (see oracle's known divergence) |
 | Existential env (`jl_stenv_t`) | Partial | Faithful | `var_lt`/`var_gt` narrow per-var `lb`/`ub`; ∀/∃ via the `existential` flag; `invdepth`/`depth0` order interacting existentials (`var_outside`, ∀∃-vs-∃∀). No `where`-var renaming or `innervars` leak handling |
 | Diagonal rule | Partial | Faithful | `occurs_cov` + `cov_diag` consistency-scope folding (`subtype_ccheck`), static `var_occurs_invariant`, `is_leaf_bound`; `ccheck` enters at `PARAM_NONE` (fixed, audit 2026-06); typevar lower bounds accepted (fixed — Julia also propagates `concrete=1` to that var, `subtype.c:1411–1415`, which we still don't); pinned C has newer machinery the port predates (`Intersect` #61917, `push_forall_bound_scope`, `Loffset`) |
 | Union backtracking | Partial | Faithful | env save/restore on the exists branch; not Julia's `Lunions`/`Runions` bit-stack iterator (`forall_exists_subtype`, `subtype.c:2383`) |
 | `simple_meet` / `simple_join` | Partial | Faithful | join defers to the normalized `union_type` (keeps free vars, so `S>:T` survives); meet over-estimates to `b` for typevar operands (no `Intersect` node) |
 | `jl_type_intersection` | Planned | Faithful | — |
 | `jl_type_morespecific` | Partial | Faithful | subtype-based approximation |
-| Varargs | Planned | Faithful | `Vararg{T,N}` in tuple types |
+| Varargs | Partial | Faithful | unbounded `Vararg{T}` in tuple tails (varargs slice 2026-07): its own `jl_vararg_t`-analog value kind (element `T@0`, `N` absent), the `subtype_tuple` length classification (`JL_VARARG_UNBOUND` vs `NONE`) and `subtype_tuple_tail`/`subtype_tuple_varargs` walk (`subtype.c:1740–1899`), and a `Vararg` arm in `var_occurs_invariant`. Omitted: bounded `Vararg{T,N}` (the `INT`/`BOUND` kinds, `N` length algebra, `check_vararg_length`), vararg uniquing, and the repeated-element/separable tail fast paths |
 | Fast paths (`obviously_egal`) | Planned | Faithful | — |
 
 ## Method dispatch — `gf.c`, `typemap.c` vs `dispatch.rs`
