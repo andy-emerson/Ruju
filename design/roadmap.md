@@ -34,7 +34,7 @@ genuinely unknowable up front.
 
 | Increment | Stream | Size | Waves | Depends on | Notes |
 | - | - | - | - | - | - |
-| GC exactness tail | breadth | S | W1–W2 | GC core | deferred sweep, `newpages` |
+| GC exactness tail | breadth | S | W1–W2 | GC core | ~~done 2026-07~~: `newpages` landed; "deferred sweep" was a mischaracterized pin (finding 21) |
 | Arrays & GenericMemory | breadth | L | W1–W3 | structs | `genericmemory.c`, `array.c` |
 | Modules & bindings | breadth | M | W2–W4 | structs | `module.c`, `toplevel.c` |
 | Exceptions (`enter`/`leave`) | breadth | M | W2–W3 | interpreter core | `interpreter.c`, `rtutils.c` |
