@@ -200,6 +200,17 @@ check("source: -8 >> 1", evalJulia("-8 >> 1"), -4n);
 check("source: 1 << 62", evalJulia("1 << 62"), 4611686018427387904n);
 check("source: 6 ⊻ 3", evalJulia("6 ⊻ 3"), 5n);
 check("source: 1 ÷ 0 is DivideError (reads 0)", evalJulia("1 ÷ 0"), 0n);
+// try/catch from source: a DivideError inside the try is recovered in the catch.
+check(
+  "source: try 1÷0 catch -> 999",
+  evalJulia("x = 0\ntry\nx = 1 ÷ 0\ncatch\nx = 999\nend\nx"),
+  999n,
+);
+check(
+  "source: try with no error runs body, skips catch",
+  evalJulia("x = 0\ntry\nx = 6 ÷ 2\ncatch\nx = 999\nend\nx"),
+  3n,
+);
 // Structs from source: definition, construction, field access, mutation.
 check(
   "source: struct Point; p.x*p.x + p.y*p.y",
@@ -221,6 +232,64 @@ check("source: 1.5 + 2.0", evalJuliaF64("1.5 + 2.0"), 3.5);
 check("source: 1 / 2 promotes to Float64", evalJuliaF64("1 / 2"), 0.5);
 check("source: 2.0 * 3.0 + 1.0", evalJuliaF64("2.0 * 3.0 + 1.0"), 7.0);
 check("source: float while-loop", evalJuliaF64("x = 0.0\nwhile x < 5.0\nx = x + 0.5\nend\nx"), 5.0);
+
+// --- GenericMemory: the flat buffer under arrays, in linear memory ---
+const memI = x.rj_memory_new(ty(T.Int64), 100);
+check("Memory{Int64}(100) allocates", memI !== 0, true);
+check("memory length", x.rj_memory_len(memI), 100);
+check("memory zero-initialized", x.rj_memory_get_i64(memI, 0), 0n);
+for (let i = 0; i < 100; i++) x.rj_memory_set_i64(memI, i, BigInt(i * i));
+check("memoryref roundtrip [7]", x.rj_memory_get_i64(memI, 7), 49n);
+check("memoryref roundtrip [99]", x.rj_memory_get_i64(memI, 99), 9801n);
+check("memory set out of bounds rejected", x.rj_memory_set_i64(memI, 100, 1n), 0);
+check("Memory{Int64} is uniqued (===)", x.rj_memory_type(ty(T.Int64)) === x.rj_memory_type(ty(T.Int64)), true);
+check(
+  "Memory{Int64} NOT <: Memory{Integer} (invariant)",
+  x.rj_subtype(x.rj_memory_type(ty(T.Int64)), x.rj_memory_type(ty(T.Integer))),
+  0,
+);
+// A raw offset held only by JS is not a root: after a collect the old memory is
+// gone, and allocation stays healthy for fresh ones.
+x.rj_gc_collect();
+check("fresh memory after collect", x.rj_memory_len(x.rj_memory_new(ty(T.Int64), 8)), 8);
+
+// Top-level globals: bindings in Main persist across separate rj_eval calls.
+check("source: global gx = 41", evalJulia("gx = 41"), 41n);
+check("source: gx visible in a later eval", evalJulia("gx + 1"), 42n);
+
+// throw/catch e from source: the thrown value binds to the catch variable.
+check(
+  "source: throw(42) caught, e bound",
+  evalJulia("x = 0\ntry\nthrow(42)\ncatch e\nx = e\nend\nx"),
+  42n,
+);
+
+// Arrays from source: literals, 1-based indexing, push!/length, growth.
+check("source: [10,20,30][2]", evalJulia("a = [10, 20, 30]\na[2]"), 20n);
+check(
+  "source: push!-driven sum of squares",
+  evalJulia("a = []\ni = 1\nwhile i <= 20\npush!(a, i * i)\ni = i + 1\nend\ns = 0\nj = 1\nwhile j <= length(a)\ns = s + a[j]\nj = j + 1\nend\ns"),
+  2870n,
+);
+check(
+  "source: BoundsError caught by try/catch",
+  evalJulia("a = [1]\nx = 0\ntry\nx = a[2]\ncatch\nx = 777\nend\nx"),
+  777n,
+);
+
+// --- Array{T}: the growable wrapper over GenericMemory ---
+const arr = x.rj_array_new(ty(T.Int64), 0);
+check("Array{Int64}() allocates empty", x.rj_array_len(arr), 0);
+for (let i = 0; i < 50; i++) x.rj_array_push_i64(arr, BigInt(i * 3));
+check("push! grows length to 50", x.rj_array_len(arr), 50);
+check("arrayref [0]", x.rj_array_get_i64(arr, 0), 0n);
+check("arrayref [49] across regrowth", x.rj_array_get_i64(arr, 49), 147n);
+x.rj_array_set_i64(arr, 10, 999n);
+check("arrayset [10]", x.rj_array_get_i64(arr, 10), 999n);
+check("array bounds: set at len rejected", x.rj_array_set_i64(arr, 50, 1n), 0);
+x.rj_array_del_end(arr, 45);
+check("del_end shrinks to 5", x.rj_array_len(arr), 5);
+check("Array{Int64} is uniqued (===)", x.rj_array_type(ty(T.Int64)) === x.rj_array_type(ty(T.Int64)), true);
 
 // --- invariants ---
 check("rj_root_count() balanced", x.rj_root_count(), 0);

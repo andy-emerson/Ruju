@@ -7,8 +7,9 @@
 //   Ref{T}   -> Box{T}     (both are single-parameter invariant types)
 //   Int      -> Int64
 //   Vector{T} used only for invariance also maps to Box{T}
-// Cases needing Vararg, Type{}, Pair (2-param), String, or a parameter-sharing
-// supertype (AbstractVector) are out of scope for the current ABI and omitted.
+// Vararg (unbounded and fixed-count), Type{}, and Pair are all expressible.
+// Cases needing String, typevar-count Vararg{T,N}, or a parameter-sharing
+// supertype (AbstractVector) remain out of scope for the current ABI.
 //
 //   node runtime/verify_julia_subtype.mjs
 // (build first: cargo build -p ruju-runtime --target wasm32-unknown-unknown --release)
@@ -24,14 +25,28 @@ const x = instance.exports;
 x.rj_init();
 
 // Builtin type ids (match runtime/src/types.rs `id`).
-const ID = { Any: 0, Number: 1, Real: 2, Integer: 3, Signed: 4, Float64: 21, Bool: 8, Int8: 9, Int16: 10, Int32: 11, Int64: 12, Char: 22, Bottom: 26 };
+const ID = { Any: 0, Number: 1, Real: 2, Integer: 3, Signed: 4, Float64: 21, Bool: 8, Int8: 9, Int16: 10, Int32: 11, Int64: 12, Char: 22, Bottom: 26, DataType: 25, UnionT: 28, TypeVarT: 30, UnionAllT: 31, Type: 34 };
 const ty = (id) => x.rj_builtin_type(id);
 
 // Julia type constructors mapped onto the runtime ABI.
 const Int = ty(ID.Int64), Integer = ty(ID.Integer), Real = ty(ID.Real), Number = ty(ID.Number);
 const Int8 = ty(ID.Int8), Int16 = ty(ID.Int16), Int32 = ty(ID.Int32), Any = ty(ID.Any), Bottom = ty(ID.Bottom);
+const Float64 = ty(ID.Float64);
 const Ref = (t) => x.rj_box_type(t);
-const Tuple = (...ts) => (ts.length === 1 ? x.rj_tuple_type1(ts[0]) : x.rj_tuple_type2(ts[0], ts[1]));
+const Tuple = (...ts) => {
+  switch (ts.length) {
+    case 0: return x.rj_tuple_type0();
+    case 1: return x.rj_tuple_type1(ts[0]);
+    case 2: return x.rj_tuple_type2(ts[0], ts[1]);
+    case 3: return x.rj_tuple_type3(ts[0], ts[1], ts[2]);
+    case 4: return x.rj_tuple_type4(ts[0], ts[1], ts[2], ts[3]);
+    default: throw new Error(`no ABI for ${ts.length}-tuples`);
+  }
+};
+const Vararg = (t) => x.rj_vararg(t); // unbounded Vararg{t}
+const VarargN = (t, n) => x.rj_vararg_n(t, BigInt(n)); // Vararg{t, n}
+const Pair = (a, b) => x.rj_pair_type(a, b); // two-parameter invariant type
+const TypeT = (t) => x.rj_type_type(t); // Type{t}
 const Union = (a, b) => x.rj_union_type(a, b);
 const tvar = (lb, ub) => x.rj_typevar(lb ?? 0, ub ?? 0); // 0 => Bottom / Any
 const where = (v, body) => x.rj_unionall(v, body);
@@ -48,6 +63,135 @@ const cases = [
   ["L30 issub_strict(Tuple{Int,Int}, Tuple{Integer,Integer})", "strict", () => [Tuple(Int, Int), Tuple(Integer, Integer)]],
   ["L35 !issub(Tuple{Int,Int}, Tuple{Int})", "notsub", () => [Tuple(Int, Int), Tuple(Int)]],
   ["L38 !issub(Vector{Int}, Vector{Integer})", "notsub", () => [Ref(Int), Ref(Integer)]],
+
+  // --- unbounded Vararg in tuples (test_1 varargs; test at L587-594) ---
+  ["L43 issub_strict(Tuple{Int,Int}, Tuple{Vararg{Int}})", "strict", () => [Tuple(Int, Int), Tuple(Vararg(Int))]],
+  ["L44 issub_strict(Tuple{Int,Int}, Tuple{Int,Vararg{Int}})", "strict", () => [Tuple(Int, Int), Tuple(Int, Vararg(Int))]],
+  ["L45 issub_strict(Tuple{Int,Int}, Tuple{Int,Vararg{Integer}})", "strict", () => [Tuple(Int, Int), Tuple(Int, Vararg(Integer))]],
+  ["L46 issub_strict(Tuple{Int,Int}, Tuple{Int,Int,Vararg{Integer}})", "strict", () => [Tuple(Int, Int), Tuple(Int, Int, Vararg(Integer))]],
+  ["L47 issub_strict(Tuple{Int,Vararg{Int}}, Tuple{Vararg{Int}})", "strict", () => [Tuple(Int, Vararg(Int)), Tuple(Vararg(Int))]],
+  ["L48 issub_strict(Tuple{Int,Int,Int}, Tuple{Vararg{Int}})", "strict", () => [Tuple(Int, Int, Int), Tuple(Vararg(Int))]],
+  ["L49 issub_strict(Tuple{Int,Int,Int}, Tuple{Integer,Vararg{Int}})", "strict", () => [Tuple(Int, Int, Int), Tuple(Integer, Vararg(Int))]],
+  ["L51 issub_strict(Tuple{}, Tuple{Vararg{Any}})", "strict", () => [Tuple(), Tuple(Vararg(Any))]],
+  ["L54 isequal_type(Tuple{Vararg{Integer}}, Tuple{Vararg{Integer}})", "equal", () => [Tuple(Vararg(Integer)), Tuple(Vararg(Integer))]],
+  ["L56 !issub(Tuple{}, Tuple{Int,Vararg{Int}})", "notsub", () => [Tuple(), Tuple(Int, Vararg(Int))]],
+  ["L57 !issub(Tuple{Int}, Tuple{Int,Int,Vararg{Int}})", "notsub", () => [Tuple(Int), Tuple(Int, Int, Vararg(Int))]],
+  ["L587 issub(Tuple{Integer,Vararg{Integer}}, Tuple{Integer,Vararg{Real}})", "sub", () => [Tuple(Integer, Vararg(Integer)), Tuple(Integer, Vararg(Real))]],
+  ["L588 issub(Tuple{Integer,Float64,Vararg{Integer}}, Tuple{Integer,Vararg{Number}})", "sub", () => [Tuple(Integer, Float64, Vararg(Integer)), Tuple(Integer, Vararg(Number))]],
+  ["L589 issub(Tuple{Integer,Float64}, Tuple{Integer,Vararg{Number}})", "sub", () => [Tuple(Integer, Float64), Tuple(Integer, Vararg(Number))]],
+  ["L590 issub(Tuple{Int32}, Tuple{Vararg{Number}})", "sub", () => [Tuple(Int32), Tuple(Vararg(Number))]],
+  ["L591 issub(Tuple{}, Tuple{Vararg{Number}})", "sub", () => [Tuple(), Tuple(Vararg(Number))]],
+  ["L592 !issub(Tuple{Vararg{Int32}}, Tuple{Int32})", "notsub", () => [Tuple(Vararg(Int32)), Tuple(Int32)]],
+  ["L593 !issub(Tuple{Vararg{Int32}}, Tuple{Number,Integer})", "notsub", () => [Tuple(Vararg(Int32)), Tuple(Number, Integer)]],
+  ["L594 !issub(Tuple{Vararg{Integer}}, Tuple{Integer,Integer,Vararg{Integer}})", "notsub", () => [Tuple(Vararg(Integer)), Tuple(Integer, Integer, Vararg(Integer))]],
+
+  // --- Type{T} kinds (test at L536-551) ---
+  ["L536 issub_strict(DataType, Type)", "strict", () => [ty(ID.DataType), ty(ID.Type)]],
+  ["L537 issub_strict(Union, Type)", "strict", () => [ty(ID.UnionT), ty(ID.Type)]],
+  ["L538 issub_strict(UnionAll, Type)", "strict", () => [ty(ID.UnionAllT), ty(ID.Type)]],
+  ["L540 !issub(TypeVar, Type)", "notsub", () => [ty(ID.TypeVarT), ty(ID.Type)]],
+  ["L541 !issub(Type, TypeVar)", "notsub", () => [ty(ID.Type), ty(ID.TypeVarT)]],
+  ["L542 !issub(DataType, @UnionAll T<:Number Type{T})", "notsub", () => {
+    const T = tvar(0, Number);
+    return [ty(ID.DataType), where(T, TypeT(T))];
+  }],
+  ["L543 issub_strict(Type{Int}, DataType)", "strict", () => [TypeT(Int), ty(ID.DataType)]],
+  ["L544 !issub((@UnionAll T<:Integer Type{T}), DataType)", "notsub", () => {
+    const T = tvar(0, Integer);
+    return [where(T, TypeT(T)), ty(ID.DataType)];
+  }],
+  ["L546 !issub(Type{Int}, Type{Integer})", "notsub", () => [TypeT(Int), TypeT(Integer)]],
+  ["L547 issub((@UnionAll T<:Integer Type{T}), (@UnionAll T<:Number Type{T}))", "sub", () => {
+    const T = tvar(0, Integer), S = tvar(0, Number);
+    return [where(T, TypeT(T)), where(S, TypeT(S))];
+  }],
+  ["L551 !(DataType <: (@UnionAll T<:Type Type{T}))", "notsub", () => {
+    const T = tvar(0, ty(ID.Type));
+    return [ty(ID.DataType), where(T, TypeT(T))];
+  }],
+
+  // --- fixed-count Vararg{T,N}: expands at construction (test_1) ---
+  ["L61 isequal_type(Tuple{Int,Int}, Tuple{Vararg{Int,2}})", "equal", () => [Tuple(Int, Int), Tuple(VarargN(Int, 2))]],
+  ["L63 Tuple{Int,Vararg{Int,2}} == Tuple{Int,Int,Int}", "equal", () => [Tuple(Int, VarargN(Int, 2)), Tuple(Int, Int, Int)]],
+  ["L64 Tuple{Int,Vararg{Int,2}} === Tuple{Int,Int,Int}", "identical", () => [Tuple(Int, VarargN(Int, 2)), Tuple(Int, Int, Int)]],
+  ["L65 Tuple{Any,Any} === Tuple{Vararg{Any,2}}", "identical", () => [Tuple(Any, Any), Tuple(VarargN(Any, 2))]],
+  ["L67 Tuple{Int,Vararg{Int,2}} == Tuple{Int,Int,Int,Vararg{Int,0}}", "equal", () => [Tuple(Int, VarargN(Int, 2)), Tuple(Int, Int, Int, VarargN(Int, 0))]],
+  ["L68 !(Tuple{Int,Vararg{Int,2}} <: Tuple{Int,Int,Int,Vararg{Int,1}})", "notsub", () => [Tuple(Int, VarargN(Int, 2)), Tuple(Int, Int, Int, VarargN(Int, 1))]],
+
+  // --- two-parameter parametrics: invariance, where, diagonal (test_3) ---
+  ["L206 issub_strict((@UnionAll T Pair{T,T}), Pair)", "strict", () => {
+    const T = tvar(), A = tvar(), B = tvar();
+    return [where(T, Pair(T, T)), where(A, where(B, Pair(A, B)))];
+  }],
+  ["L207 issub(Pair{Int,Int8}, Pair)", "sub", () => {
+    const A = tvar(), B = tvar();
+    return [Pair(Int, Int8), where(A, where(B, Pair(A, B)))];
+  }],
+  ["L208 issub(Pair{Int,Int8}, Pair{Int,S} where S)", "sub", () => {
+    const S = tvar();
+    return [Pair(Int, Int8), where(S, Pair(Int, S))];
+  }],
+  ["L232 !issub((@UnionAll T Pair{T,T}), Pair{Int,Int8})", "notsub", () => {
+    const T = tvar();
+    return [where(T, Pair(T, T)), Pair(Int, Int8)];
+  }],
+  ["L233 !issub((@UnionAll T Pair{T,T}), Pair{Int,Int})", "notsub", () => {
+    const T = tvar();
+    return [where(T, Pair(T, T)), Pair(Int, Int)];
+  }],
+  ["L262 !issub(Pair{Int,Int8}, (@UnionAll T Pair{T,T}))", "notsub", () => {
+    const T = tvar();
+    return [Pair(Int, Int8), where(T, Pair(T, T))];
+  }],
+  ["L270 !issub(Pair{Vector{Int},Integer}, @UnionAll T Pair{Vector{T},T})", "notsub", () => {
+    const T = tvar();
+    return [Pair(Ref(Int), Integer), where(T, Pair(Ref(T), T))];
+  }],
+  ["L271 issub(Pair{Vector{Int},Int}, @UnionAll T Pair{Vector{T},T})", "sub", () => {
+    const T = tvar();
+    return [Pair(Ref(Int), Int), where(T, Pair(Ref(T), T))];
+  }],
+
+  // --- tuple-over-union with a bound var (test_2/test_3) ---
+  ["L413 !issub(Tuple{Union{Vector{Int},Vector{Int8}},Vector{Int}}, @UnionAll T Tuple{Vector{T},Vector{T}})", "notsub", () => {
+    const T = tvar();
+    return [Tuple(Union(Ref(Int), Ref(Int8)), Ref(Int)), where(T, Tuple(Ref(T), Ref(T)))];
+  }],
+  ["L416 !issub(Tuple{Union{Vector{Int},Vector{Int8}},Vector{Int8}}, @UnionAll T Tuple{Vector{T},Vector{T}})", "notsub", () => {
+    const T = tvar();
+    return [Tuple(Union(Ref(Int), Ref(Int8)), Ref(Int8)), where(T, Tuple(Ref(T), Ref(T)))];
+  }],
+
+  // --- more existential / bounded / diagonal cases (test_3) ---
+  ["L205 issub_strict(Vector{Int}, @UnionAll T Vector{T})", "strict", () => {
+    const T = tvar();
+    return [Ref(Int), where(T, Ref(T))];
+  }],
+  ["L214 !issub(@UnionAll T<:Integer @UnionAll S<:Number Tuple{T,S}, ...Tuple{S,T})", "notsub", () => {
+    const T = tvar(0, Integer), S = tvar(0, Number);
+    const T2 = tvar(0, Integer), S2 = tvar(0, Number);
+    return [where(T, where(S, Tuple(T, S))), where(T2, where(S2, Tuple(S2, T2)))];
+  }],
+  ["L238 issub(Tuple{Vector{Integer},Int}, @UnionAll T<:Integer @UnionAll S<:T Tuple{Vector{T},S})", "sub", () => {
+    const T = tvar(0, Integer), S = tvar(0, T); // S <: T
+    return [Tuple(Ref(Integer), Int), where(T, where(S, Tuple(Ref(T), S)))];
+  }],
+  ["L241 !issub(Tuple{Vector{Integer},Real}, @UnionAll T<:Integer Tuple{Vector{T},T})", "notsub", () => {
+    const T = tvar(0, Integer);
+    return [Tuple(Ref(Integer), Real), where(T, Tuple(Ref(T), T))];
+  }],
+  ["L264 !issub(Tuple{Vector{Int},Integer}, @UnionAll T<:Integer Tuple{Vector{T},T})", "notsub", () => {
+    const T = tvar(0, Integer);
+    return [Tuple(Ref(Int), Integer), where(T, Tuple(Ref(T), T))];
+  }],
+  ["L267 !issub(Tuple{Integer,Vector{Int}}, @UnionAll T<:Integer Tuple{T,Vector{T}})", "notsub", () => {
+    const T = tvar(0, Integer);
+    return [Tuple(Integer, Ref(Int)), where(T, Tuple(T, Ref(T)))];
+  }],
+  ["L273 issub(Tuple{Integer,Int}, @UnionAll T<:Integer @UnionAll S<:T Tuple{T,S})", "sub", () => {
+    const T = tvar(0, Integer), S = tvar(0, T);
+    return [Tuple(Integer, Int), where(T, where(S, Tuple(T, S)))];
+  }],
 
   // --- existential vs universal (test_3) ---
   ["L99 issub_strict(Tuple{R,R} where R, Tuple{T,S} where {T,S})", "strict", () => {
@@ -223,9 +367,18 @@ const cases = [
 const knownDivergences = [
   ["L371 isequal_type(Tuple{Union{Int,Int8},Int16}, Union{Tuple{Int,Int16},Tuple{Int8,Int16}})", "equal", () =>
     [Tuple(Union(Int, Int8), Int16), Union(Tuple(Int, Int16), Tuple(Int8, Int16))]],
+  // Same family as L371: Tuple{Union{...}} <: (Tuple{Ref{T}} where T) needs a
+  // per-union-branch choice of T, which the global union-decision machine makes
+  // but local backtracking cannot. (test/subtype.jl:410, ≡ :449 under Ref->Box.)
+  ["L410 issub(Tuple{Union{Vector{Int},Vector{Int8}}}, @UnionAll T Tuple{Vector{T}})", "sub", () => {
+    const T = tvar();
+    return [Tuple(Union(Ref(Int), Ref(Int8))), where(T, Tuple(Ref(T)))];
+  }],
 ];
 
-const pred = { strict, equal, sub: (a, b) => sub(a, b), notsub: (a, b) => !sub(a, b), noteq: (a, b) => !equal(a, b) };
+// `identical` is Julia's `===` on types: with hash-consed construction, equal
+// tuples are the same object.
+const pred = { strict, equal, sub: (a, b) => sub(a, b), notsub: (a, b) => !sub(a, b), noteq: (a, b) => !equal(a, b), identical: (a, b) => a === b };
 
 let pass = 0, fail = 0;
 for (const [src, kind, build] of cases) {

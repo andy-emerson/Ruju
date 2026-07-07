@@ -90,7 +90,16 @@ pub mod id {
     pub const TYPENAME: u32 = 29; // jl_typename_t: a DataType's name object
     pub const TVAR: u32 = 30; // jl_tvar_t: a `where` type variable
     pub const UNIONALL: u32 = 31; // jl_unionall_t: a `T where ...` type
-    pub const COUNT: usize = 32;
+    pub const VARARG: u32 = 32; // jl_vararg_t: the `Vararg{T}` tail of a tuple type
+    pub const MODULE: u32 = 33; // jl_module_t: name, parent, bindings
+    pub const TYPE: u32 = 34; // the abstract `Type`; `Type{T}` shares its TypeName
+    pub const EXCEPTION: u32 = 35; // abstract Exception (boot.jl)
+    pub const DIVIDEERROR: u32 = 36; // struct DivideError <: Exception (singleton)
+    pub const UNDEFREFERROR: u32 = 37; // struct UndefRefError <: Exception (singleton)
+    pub const OUTOFMEMORYERROR: u32 = 38; // struct OutOfMemoryError <: Exception (singleton)
+    pub const BOUNDSERROR: u32 = 39; // struct BoundsError <: Exception (a, i)
+    pub const ERROREXCEPTION: u32 = 40; // struct ErrorException <: Exception (msg)
+    pub const COUNT: usize = 41;
 }
 
 /// Offsets of the bootstrapped core types and the immortal value permboxes.
@@ -105,6 +114,14 @@ pub struct Builtins {
     pub tuple_typename: Offset,
     /// The `TypeName` of the demo parametric constructor `Box{T}` (invariant).
     pub box_typename: Offset,
+    /// The `TypeName` of the demo two-parameter constructor `Pair{A,B}` (invariant).
+    pub pair_typename: Offset,
+    /// The `TypeName` shared by every `GenericMemory{T}` type
+    /// (`jl_genericmemory_typename`), which is how the GC recognizes memory
+    /// objects at mark time (`gc-stock.c:2412`).
+    pub memory_typename: Offset,
+    /// The `TypeName` shared by every `Array{T}` type (`jl_array_typename`).
+    pub array_typename: Offset,
 }
 
 struct BuiltinsSlot(Cell<Option<Builtins>>);
@@ -291,12 +308,54 @@ pub fn bootstrap() {
     // body type (var@0, body@4). Together they are the `where` machinery.
     types[id::TVAR as usize] = new_type(datatype, tn("TypeVar"), any, 12, 0, &[0, 4, 8]);
     types[id::UNIONALL as usize] = new_type(datatype, tn("UnionAll"), any, 8, 0, &[0, 4]);
+    // `Vararg` (jl_vararg_t) is the type of a `Vararg{T}` object — the covariant
+    // tail of a tuple type: element T@0, count N@4 (a boxed Int64, or NULL for
+    // the unbounded form). A typevar-valued N (the C's JL_VARARG_BOUND kind)
+    // is not yet modelled.
+    types[id::VARARG as usize] = new_type(datatype, tn("Vararg"), any, 8, 0, &[0, 4]);
+    // `Module` (jl_module_t subset): name Symbol, parent Module, bindings
+    // Array — all references, so ordinary layout-driven GC tracing suffices.
+    types[id::MODULE as usize] = new_type(datatype, tn("Module"), any, 12, 0, &[0, 4, 8]);
+
+    // The abstract `Type`, and the kinds under it: Julia's `DataType`, `Union`,
+    // and `UnionAll` are subtypes of `Type` (boot.jl; `jl_type_type`). Ours is
+    // a bare abstract `Type` whose TypeName is shared by every `Type{T}`
+    // instantiation; the C's bare `Type` is `Type{T} where T` (recorded).
+    // The kinds' supertypes are patched here, after `Type` exists.
+    types[id::TYPE as usize] = new_type(datatype, tn("Type"), any, 0, FLAG_ABSTRACT, &[]);
+    for k in [id::DATATYPE, id::UNION, id::UNIONALL] {
+        unsafe {
+            (*dt(types[k as usize])).super_ = types[id::TYPE as usize];
+        }
+    }
 
     // 6. The shared tuple TypeName: every Tuple{...} type has this `name`, which
     //    is how tuples are identified (jl_tuple_typename). `Box` is a demo
     //    parametric constructor (an invariant single-parameter type).
     let tuple_typename = tn("Tuple");
     let box_typename = tn("Box");
+    let pair_typename = tn("Pair");
+    let memory_typename = tn("GenericMemory");
+    let array_typename = tn("Array");
+
+    // 6b. Exception types (boot.jl:373-400, rtutils.c throws them as values):
+    //    the abstract Exception, three fieldless singletons, BoundsError{a,i}
+    //    (two reference fields), and ErrorException{msg} — msg is an interned
+    //    Symbol until a String type exists (recorded adaptation).
+    types[id::EXCEPTION as usize] = new_type(datatype, tn("Exception"), any, 0, FLAG_ABSTRACT, &[]);
+    let exc = types[id::EXCEPTION as usize];
+    types[id::DIVIDEERROR as usize] = new_type(datatype, tn("DivideError"), exc, 0, 0, &[]);
+    types[id::UNDEFREFERROR as usize] = new_type(datatype, tn("UndefRefError"), exc, 0, 0, &[]);
+    types[id::OUTOFMEMORYERROR as usize] = new_type(datatype, tn("OutOfMemoryError"), exc, 0, 0, &[]);
+    types[id::BOUNDSERROR as usize] = new_type(datatype, tn("BoundsError"), exc, 8, 0, &[0, 4]);
+    types[id::ERROREXCEPTION as usize] = new_type(datatype, tn("ErrorException"), exc, 4, 0, &[0]);
+    for k in [id::DIVIDEERROR, id::UNDEFREFERROR, id::OUTOFMEMORYERROR] {
+        let inst = object::alloc(types[k as usize], 0).raw();
+        // Fresh bootstrap objects: direct instance write, as for `nothing` below.
+        unsafe {
+            (*dt(types[k as usize])).instance = inst;
+        }
+    }
 
     // 7. The `nothing` singleton: the sole (zero-size) instance of Nothing,
     //    recorded in the type's `instance` field (jl_datatype_t.instance).
@@ -323,6 +382,9 @@ pub fn bootstrap() {
         false_instance,
         tuple_typename,
         box_typename,
+        pair_typename,
+        memory_typename,
+        array_typename,
     }));
 }
 
@@ -510,9 +572,22 @@ pub fn apply_type(typename: Offset, super_: Offset, params: &[Offset]) -> Offset
     v.raw()
 }
 
-/// Construct the tuple type `Tuple{elems...}` (covariant), uniqued.
+/// Construct the tuple type `Tuple{elems...}` (covariant), uniqued. A trailing
+/// `Vararg{T,N}` with a concrete `N` expands into `N` copies of `T`
+/// (`inst_datatype_inner`; hence `Tuple{Int,Vararg{Int,2}} === Tuple{Int,Int,Int}`,
+/// `test/subtype.jl:63-67`); unbounded varargs stay as the tuple's tail.
 pub fn tuple_type(elems: &[Offset]) -> Offset {
     let b = builtins();
+    if let Some(&last) = elems.last() {
+        if is_vararg(last) && vararg_num(last) != NULL {
+            let n = crate::value::unbox_int(object::Value(vararg_num(last)));
+            assert!(n >= 0, "Vararg length must be non-negative");
+            let elem = vararg_elem(last);
+            let mut expanded = elems[..elems.len() - 1].to_vec();
+            expanded.extend(core::iter::repeat(elem).take(n as usize));
+            return apply_type(b.tuple_typename, b.types[id::ANY as usize], &expanded);
+        }
+    }
     apply_type(b.tuple_typename, b.types[id::ANY as usize], elems)
 }
 
@@ -520,6 +595,182 @@ pub fn tuple_type(elems: &[Offset]) -> Offset {
 pub fn box_type(elem: Offset) -> Offset {
     let b = builtins();
     apply_type(b.box_typename, b.types[id::ANY as usize], &[elem])
+}
+
+/// Construct the demo two-parameter type `Pair{a, b}` (invariant), uniqued —
+/// like `Box`, a stand-in for a nominal parametric type, with two invariant
+/// parameters so the oracle can exercise multi-parameter `where` and diagonal
+/// cases. Subtyping reuses the invariant-parametric path unchanged.
+pub fn pair_type(a: Offset, b: Offset) -> Offset {
+    let bi = builtins();
+    apply_type(bi.pair_typename, bi.types[id::ANY as usize], &[a, b])
+}
+
+/// Construct `GenericMemory{elem}` (invariant), uniqued. Julia's is
+/// `GenericMemory{kind, T, addrspace}`; ours carries `T` alone — kind is
+/// fixed `:not_atomic` and addrspace `Core.CPU` (a recorded simplification).
+pub fn memory_type(elem: Offset) -> Offset {
+    let bi = builtins();
+    apply_type(bi.memory_typename, bi.types[id::ANY as usize], &[elem])
+}
+
+/// Whether `t` is a `GenericMemory{T}` type — identified by the shared
+/// typename, exactly as the C checks `vt->name == jl_genericmemory_typename`.
+pub fn is_genericmemory(t: Offset) -> bool {
+    is_datatype(t) && name_of(t) == builtins().memory_typename
+}
+
+/// Construct `Array{elem}` (invariant), uniqued. Julia's is `Array{T,N}`;
+/// ours is one-dimensional, so `N` is fixed at 1 (a recorded simplification).
+pub fn array_type(elem: Offset) -> Offset {
+    let bi = builtins();
+    apply_type(bi.array_typename, bi.types[id::ANY as usize], &[elem])
+}
+
+/// Whether `t` is an `Array{T}` type (`a->name == jl_array_typename`).
+pub fn is_array(t: Offset) -> bool {
+    is_datatype(t) && name_of(t) == builtins().array_typename
+}
+
+/// Construct `Type{t}` (invariant in `t`), uniqued on the shared `Type`
+/// TypeName; its nominal supertype is the abstract `Type`.
+pub fn type_type(t: Offset) -> Offset {
+    let ty = builtin(id::TYPE);
+    apply_type(name_of(ty), ty, &[t])
+}
+
+/// Whether `t` is a `Type{T}` instantiation (`jl_is_type_type`): the shared
+/// `Type` TypeName *with* a parameter — the bare abstract `Type` is excluded.
+pub fn is_type_type(t: Offset) -> bool {
+    is_datatype(t)
+        && name_of(t) == name_of(builtin(id::TYPE))
+        && parameters_of(t) != NULL
+        && svec_len(parameters_of(t)) > 0
+}
+
+/// Whether `t` is a kind (`jl_is_kind`): the type of a type — `DataType`,
+/// `Union`, or `UnionAll` (Julia also counts `TypeofBottom`, which we do not
+/// model; our `Bottom` is a plain DataType, recorded).
+pub fn is_kind(t: Offset) -> bool {
+    t == builtin(id::DATATYPE) || t == builtin(id::UNION) || t == builtin(id::UNIONALL)
+}
+
+/// A link in a single-variable-at-a-time substitution environment
+/// (`jl_typeenv_t`): bind `var` to `val`, chained to `prev`.
+struct SubstEnv<'a> {
+    var: Offset,
+    val: Offset,
+    prev: Option<&'a SubstEnv<'a>>,
+}
+
+/// `inst_type_w_` (`jltypes.c:2752`), the core of type instantiation, for the
+/// type forms Ruju represents. Substitutes the environment's bound variables
+/// throughout `t`, rebuilding (and re-uniquing) any parametric type whose
+/// parameters change. Every `t` handled here is a subterm of the originally
+/// rooted body, so only the *fresh* intermediate results are rooted across the
+/// allocations that follow them (mirroring the C's `JL_GC_PUSH`).
+///
+/// Simplified vs the reference (recorded in `design/implementation.md`): no
+/// recursive-type `stack`, no `check`/`nothrow` bound validation, and the
+/// nominal supertype is carried through unchanged rather than re-instantiated
+/// (Ruju's demo parametrics have `Any` supers; parameter-sharing supertypes
+/// arrive with a later slice).
+fn inst_type(t: Offset, env: Option<&SubstEnv>) -> Offset {
+    if is_typevar(t) {
+        let mut e = env;
+        while let Some(link) = e {
+            if link.var == t {
+                return link.val;
+            }
+            e = link.prev;
+        }
+        return t;
+    }
+    if is_unionall(t) {
+        let uvar = unionall_var(t);
+        let (old_lb, old_ub) = (tvar_lb(uvar), tvar_ub(uvar));
+        let lb = inst_type(old_lb, env);
+        let _rlb = Rooted::new(object::Value(lb));
+        let ub = inst_type(old_ub, env);
+        let _rub = Rooted::new(object::Value(ub));
+        // A bound variable whose bounds moved becomes a fresh variable; the body
+        // is then instantiated with the old→new remapping in scope.
+        let newvar = if lb != old_lb || ub != old_ub {
+            typevar(tvar_name(uvar), lb, ub)
+        } else {
+            uvar
+        };
+        let _rvar = Rooted::new(object::Value(newvar));
+        let newenv = SubstEnv { var: uvar, val: newvar, prev: env };
+        let body = unionall_body(t);
+        let newbody = inst_type(body, Some(&newenv));
+        if newbody == body && newvar == uvar {
+            return t;
+        }
+        return unionall_type(newvar, newbody);
+    }
+    if is_union(t) {
+        let (oa, ob) = (union_a(t), union_b(t));
+        let a = inst_type(oa, env);
+        let _ra = Rooted::new(object::Value(a));
+        let b = inst_type(ob, env);
+        let _rb = Rooted::new(object::Value(b));
+        if a == oa && b == ob {
+            return t;
+        }
+        return union_of(&[a, b]);
+    }
+    if is_vararg(t) {
+        let oe = vararg_elem(t);
+        let ne = inst_type(oe, env);
+        if ne == oe {
+            return t;
+        }
+        return vararg_type(ne);
+    }
+    if is_datatype(t) {
+        let p = parameters_of(t);
+        if p == NULL || svec_len(p) == 0 {
+            return t;
+        }
+        let n = svec_len(p);
+        let mut params: Vec<Offset> = Vec::with_capacity(n as usize);
+        // Root each rebuilt parameter across the remaining recursive allocations.
+        let mut roots: Vec<Rooted> = Vec::with_capacity(n as usize);
+        let mut changed = false;
+        for i in 0..n {
+            let pi = svec_ref(p, i);
+            let ni = inst_type(pi, env);
+            roots.push(Rooted::new(object::Value(ni)));
+            params.push(ni);
+            if ni != pi {
+                changed = true;
+            }
+        }
+        let result = if changed {
+            apply_type(name_of(t), supertype(t), &params)
+        } else {
+            t
+        };
+        // Release the parameter roots in LIFO order (the shadow stack requires
+        // it); `Vec<Rooted>` would otherwise drop them oldest-first.
+        while roots.pop().is_some() {}
+        return result;
+    }
+    t
+}
+
+/// `jl_instantiate_unionall` (`jltypes.c:1606`): instantiate the `UnionAll` `u`'s
+/// bound variable with `p`, substituting throughout its body.
+pub fn instantiate_unionall(u: Offset, p: Offset) -> Offset {
+    let _ru = Rooted::new(object::Value(u));
+    let _rp = Rooted::new(object::Value(p));
+    let env = SubstEnv {
+        var: unionall_var(u),
+        val: p,
+        prev: None,
+    };
+    inst_type(unionall_body(u), Some(&env))
 }
 
 pub(crate) fn parameters_of(t: Offset) -> Offset {
@@ -683,7 +934,7 @@ fn unwrap_unionall(mut t: Offset) -> Offset {
 /// Whether instances of `t` are plain bits (`jl_isbits`, faithful subset):
 /// a concrete primitive, or a tuple all of whose element types are isbits.
 /// Parametric constructors like `Box` hold references, so they are not.
-fn is_bits(t: Offset) -> bool {
+pub(crate) fn is_bits(t: Offset) -> bool {
     if !is_datatype(t) || is_abstract(t) {
         return false;
     }
@@ -785,6 +1036,49 @@ pub fn unionall_var(u: Offset) -> Offset {
 /// A `UnionAll`'s body type.
 pub fn unionall_body(u: Offset) -> Offset {
     read_ref(u, 4)
+}
+
+/// Allocate an unbounded `Vararg{elem}` (`jl_vararg_t` with `N` absent): the
+/// covariant element type at `@0`, `N` at `@4` left `NULL`. Appears only as the
+/// last parameter of a tuple type. Like Julia's `jl_wrap_vararg` results,
+/// varargs are not uniqued.
+pub fn vararg_type(elem: Offset) -> Offset {
+    let _r = Rooted::new(object::Value(elem));
+    let v = object::alloc(builtin(id::VARARG), 8).raw();
+    write_ref(v, 0, elem);
+    write_ref(v, 4, NULL);
+    v
+}
+
+/// Allocate `Vararg{elem, n}` with a concrete integer count (`jl_wrap_vararg`
+/// with a boxed `Long` N — the C's `JL_VARARG_INT` kind). A trailing fixed-N
+/// vararg never survives into a tuple type: [`tuple_type`] expands it, exactly
+/// as `inst_datatype_inner` does, which is why
+/// `Tuple{Int,Vararg{Int,2}} === Tuple{Int,Int,Int}` (`test/subtype.jl:63-67`).
+pub fn vararg_type_n(elem: Offset, n: i64) -> Offset {
+    let _r = Rooted::new(object::Value(elem));
+    let boxed = crate::value::box_int(n).raw();
+    let _rn = Rooted::new(object::Value(boxed));
+    let v = object::alloc(builtin(id::VARARG), 8).raw();
+    write_ref(v, 0, elem);
+    write_ref(v, 4, boxed);
+    v
+}
+
+/// The count `N` of a `Vararg{T,N}` as a boxed value, or `NULL` when unbounded
+/// (`jl_unwrap_vararg_num`).
+pub fn vararg_num(t: Offset) -> Offset {
+    read_ref(t, 4)
+}
+
+/// Whether the value at `t` is a `Vararg` (`jl_is_vararg`).
+pub fn is_vararg(t: Offset) -> bool {
+    object::type_of(object::Value(t)) == builtin(id::VARARG)
+}
+
+/// The element type `T` of `Vararg{T}` (`jl_unwrap_vararg`).
+pub fn vararg_elem(t: Offset) -> Offset {
+    read_ref(t, 0)
 }
 
 // --- source-defined struct registry -------------------------------------------

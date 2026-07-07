@@ -15,6 +15,10 @@ mod gc;
 mod interp;
 mod object;
 mod region;
+mod array;
+mod errors;
+mod memory;
+mod module;
 mod subtype;
 mod symbol;
 mod types;
@@ -35,6 +39,7 @@ fn init_runtime() {
     gc::reset_heap();
     dispatch::reset();
     types::bootstrap();
+    module::init_main();
     install_methods();
 }
 
@@ -269,6 +274,13 @@ pub extern "C" fn rj_types_egal(a: u32, b: u32) -> u32 {
     builtins::types_egal(a as Offset, b as Offset) as u32
 }
 
+/// Construct the empty tuple type `Tuple{}`.
+#[no_mangle]
+pub extern "C" fn rj_tuple_type0() -> u32 {
+    ensure_init();
+    types::tuple_type(&[])
+}
+
 /// Construct the tuple type `Tuple{a}`.
 #[no_mangle]
 pub extern "C" fn rj_tuple_type1(a: u32) -> u32 {
@@ -283,6 +295,36 @@ pub extern "C" fn rj_tuple_type2(a: u32, b: u32) -> u32 {
     types::tuple_type(&[a as Offset, b as Offset])
 }
 
+/// Construct the tuple type `Tuple{a, b, c}`.
+#[no_mangle]
+pub extern "C" fn rj_tuple_type3(a: u32, b: u32, c: u32) -> u32 {
+    ensure_init();
+    types::tuple_type(&[a as Offset, b as Offset, c as Offset])
+}
+
+/// Construct the tuple type `Tuple{a, b, c, d}`.
+#[no_mangle]
+pub extern "C" fn rj_tuple_type4(a: u32, b: u32, c: u32, d: u32) -> u32 {
+    ensure_init();
+    types::tuple_type(&[a as Offset, b as Offset, c as Offset, d as Offset])
+}
+
+/// Construct an unbounded `Vararg{elem}`, for use as the last element of a tuple
+/// type.
+#[no_mangle]
+pub extern "C" fn rj_vararg(elem: u32) -> u32 {
+    ensure_init();
+    types::vararg_type(elem as Offset)
+}
+
+/// Construct `Vararg{elem, n}` with a concrete count; a trailing one expands
+/// when the enclosing tuple type is built.
+#[no_mangle]
+pub extern "C" fn rj_vararg_n(elem: u32, n: i64) -> u32 {
+    ensure_init();
+    types::vararg_type_n(elem as Offset, n)
+}
+
 /// Construct `Union{a, b}`.
 #[no_mangle]
 pub extern "C" fn rj_union_type(a: u32, b: u32) -> u32 {
@@ -295,6 +337,116 @@ pub extern "C" fn rj_union_type(a: u32, b: u32) -> u32 {
 pub extern "C" fn rj_box_type(elem: u32) -> u32 {
     ensure_init();
     types::box_type(elem as Offset)
+}
+
+/// Construct the demo two-parameter type `Pair{a, b}` (invariant, uniqued).
+#[no_mangle]
+pub extern "C" fn rj_pair_type(a: u32, b: u32) -> u32 {
+    ensure_init();
+    types::pair_type(a as Offset, b as Offset)
+}
+
+/// Construct `Type{t}` (invariant, uniqued).
+#[no_mangle]
+pub extern "C" fn rj_type_type(t: u32) -> u32 {
+    ensure_init();
+    types::type_type(t as Offset)
+}
+
+/// Instantiate the `UnionAll` at `u` with the type `p` (`jl_instantiate_unionall`).
+#[no_mangle]
+pub extern "C" fn rj_instantiate(u: u32, p: u32) -> u32 {
+    ensure_init();
+    types::instantiate_unionall(u as Offset, p as Offset)
+}
+
+/// Construct the type `Array{elem}` (invariant, uniqued).
+#[no_mangle]
+pub extern "C" fn rj_array_type(elem: u32) -> u32 {
+    ensure_init();
+    types::array_type(elem as Offset)
+}
+
+/// Allocate an `Array{elem}` of `len` elements over a fresh zeroed buffer.
+/// Returns the array value's offset, or 0 on error.
+#[no_mangle]
+pub extern "C" fn rj_array_new(elem: u32, len: u32) -> u32 {
+    ensure_init();
+    array::alloc_1d(elem as Offset, len).map_or(0, |a| a.raw())
+}
+
+/// The element count of the array at `a`.
+#[no_mangle]
+pub extern "C" fn rj_array_len(a: u32) -> u32 {
+    array::len(Value(a))
+}
+
+/// Read element `i` (0-based) as an `Int64` payload, or 0 on error.
+#[no_mangle]
+pub extern "C" fn rj_array_get_i64(a: u32, i: u32) -> i64 {
+    array::aref(Value(a), i).map_or(0, crate::value::unbox_int)
+}
+
+/// Store `v` into element `i` (0-based), boxing the payload. 1 on success.
+#[no_mangle]
+pub extern "C" fn rj_array_set_i64(a: u32, i: u32, v: i64) -> u32 {
+    let arr = Value(a);
+    let _r = gc::Rooted::new(arr);
+    let b = crate::value::box_int(v);
+    array::aset(arr, i, b).is_ok() as u32
+}
+
+/// Delete the last `dec` elements, zeroing the vacated tail. 1 on success.
+#[no_mangle]
+pub extern "C" fn rj_array_del_end(a: u32, dec: u32) -> u32 {
+    array::del_end(Value(a), dec).is_ok() as u32
+}
+
+/// Append `v` (boxed) to the array, growing its buffer as needed. 1 on success.
+#[no_mangle]
+pub extern "C" fn rj_array_push_i64(a: u32, v: i64) -> u32 {
+    let arr = Value(a);
+    let _r = gc::Rooted::new(arr);
+    let b = crate::value::box_int(v);
+    array::push(arr, b).is_ok() as u32
+}
+
+/// Construct the type `GenericMemory{elem}` (invariant, uniqued).
+#[no_mangle]
+pub extern "C" fn rj_memory_type(elem: u32) -> u32 {
+    ensure_init();
+    types::memory_type(elem as Offset)
+}
+
+/// Allocate a `GenericMemory{elem}` of `len` elements, zero-initialized.
+/// Returns the memory value's offset, or 0 on error.
+#[no_mangle]
+pub extern "C" fn rj_memory_new(elem: u32, len: u32) -> u32 {
+    ensure_init();
+    memory::alloc(elem as Offset, len).map_or(0, |m| m.raw())
+}
+
+/// The element count of the memory at `m`.
+#[no_mangle]
+pub extern "C" fn rj_memory_len(m: u32) -> u32 {
+    memory::len(Value(m))
+}
+
+/// Read element `i` of the memory at `m` as an `Int64` payload (unboxing the
+/// element), or 0 on error — a host convenience over `memoryrefget`.
+#[no_mangle]
+pub extern "C" fn rj_memory_get_i64(m: u32, i: u32) -> i64 {
+    memory::get(Value(m), i).map_or(0, crate::value::unbox_int)
+}
+
+/// Store `v` into element `i` of the `GenericMemory{Int64}` at `m` (boxing the
+/// payload). Returns 1 on success, 0 on error.
+#[no_mangle]
+pub extern "C" fn rj_memory_set_i64(m: u32, i: u32, v: i64) -> u32 {
+    let mem = Value(m);
+    let _r = gc::Rooted::new(mem); // keep the memory alive across the boxing
+    let b = crate::value::box_int(v);
+    memory::set(mem, i, b).is_ok() as u32
 }
 
 /// Construct a `TypeVar` `lb <: T <: ub` named "T". Pass `0` for `lb`/`ub` to
@@ -483,6 +635,513 @@ mod tests {
         assert!(!types::issubtype(t(id::INT64), t(id::FLOAT64)));
         assert!(!types::issubtype(t(id::INT64), t(id::UNSIGNED)));
         assert!(!types::issubtype(t(id::NUMBER), t(id::INT64)));
+    }
+
+    #[test]
+    fn type_kind_subtyping() {
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+        let sub = types::issubtype;
+        let tt = types::type_type;
+        let (int, integer, datatype, ty) = (t(id::INT64), t(id::INTEGER), t(id::DATATYPE), t(id::TYPE));
+
+        // The kinds sit under Type (test/subtype.jl:536-538); TypeVar does not (:540).
+        assert!(sub(datatype, ty) && !sub(ty, datatype));
+        assert!(sub(t(id::UNION), ty));
+        assert!(sub(t(id::UNIONALL), ty));
+        assert!(!sub(t(id::TVAR), ty) && !sub(ty, t(id::TVAR)));
+        // Type{Int} dispatches as typeof(Int) (:543) and is invariant (:546).
+        assert!(sub(tt(int), datatype) && !sub(datatype, tt(int)));
+        assert!(!sub(tt(int), tt(integer)));
+        assert!(sub(tt(int), ty)); // Type{Int} <: Type via the shared name
+        assert_eq!(tt(int), tt(int)); // uniqued
+        // Type{T} where T<:Integer is not under DataType — a union's Type is
+        // not a DataType (:544); and Type{Int} binds an existential T (:547-ish).
+        let v = types::make_typevar("T", t(id::BOTTOM), integer);
+        let ua = types::unionall_type(v, tt(v));
+        assert!(!sub(ua, datatype));
+        assert!(sub(tt(int), {
+            let s = types::make_typevar("S", t(id::BOTTOM), t(id::ANY));
+            types::unionall_type(s, tt(s))
+        }));
+        assert_eq!(gc::root_count(), 0);
+    }
+
+    #[test]
+    fn unionall_instantiation_matches_direct_construction() {
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+        let uall = types::unionall_type;
+        let inst = types::instantiate_unionall;
+        let tv = || types::make_typevar("T", types::builtin(id::BOTTOM), t(id::ANY));
+        let (int, int8, bool_) = (t(id::INT64), t(id::INT8), t(id::BOOL));
+
+        // Uniquing makes instantiation === direct construction: identical offsets.
+        // Box{T} where T  @Int  ==  Box{Int}
+        let bt = tv();
+        assert_eq!(inst(uall(bt, types::box_type(bt)), int), types::box_type(int));
+        // Tuple{T,T} where T  @Int  ==  Tuple{Int,Int}
+        let tt = tv();
+        assert_eq!(
+            inst(uall(tt, types::tuple_type(&[tt, tt])), int),
+            types::tuple_type(&[int, int])
+        );
+        // Nested parametric: Tuple{T, Box{T}} where T  @Int
+        let nt = tv();
+        assert_eq!(
+            inst(uall(nt, types::tuple_type(&[nt, types::box_type(nt)])), int),
+            types::tuple_type(&[int, types::box_type(int)])
+        );
+        // Union member: Union{T,Int8} where T  @Int  ==  Union{Int,Int8}. Unions
+        // are not interned, so compare structurally rather than by offset.
+        let ut = tv();
+        let inst_u = inst(uall(ut, types::union_type(ut, int8)), int);
+        let direct_u = types::union_type(int, int8);
+        assert!(types::issubtype(inst_u, direct_u) && types::issubtype(direct_u, inst_u));
+        // Second parameter of a Pair: Pair{Int,S} where S  @Bool
+        let st = tv();
+        assert_eq!(
+            inst(uall(st, types::pair_type(int, st)), bool_),
+            types::pair_type(int, bool_)
+        );
+        // A variable that does not occur leaves the body identical.
+        let zt = tv();
+        assert_eq!(inst(uall(zt, types::box_type(int)), bool_), types::box_type(int));
+
+        assert_eq!(gc::root_count(), 0, "roots released after instantiation");
+    }
+
+    #[test]
+    fn array_growth_follows_the_c_sequence() {
+        let _g = serial();
+        rj_init();
+        let int = types::builtin(id::INT64);
+        let a = array::alloc_1d(int, 0).unwrap();
+        let root = gc::Rooted::new(a);
+        assert_eq!(array::len(a), 0);
+        // Push 0..100: contents stay intact across every buffer reallocation.
+        for i in 0..100i64 {
+            array::push(root.get(), box_int(i)).unwrap();
+        }
+        assert_eq!(array::len(root.get()), 100);
+        for i in 0..100u32 {
+            assert_eq!(
+                crate::value::unbox_int(array::aref(root.get(), i).unwrap()),
+                i as i64
+            );
+        }
+        // Capacity followed 0 -> 4 -> 6 -> 9 -> 13 -> ... (grow-by-half below
+        // 48, by a fifth above): strictly more than 100, well under 2x.
+        let cap = memory::len(array::mem_of(root.get()));
+        assert!(cap >= 100 && cap < 200, "capacity {} out of the C's envelope", cap);
+        // aset/aref respect the array's length, not the buffer's.
+        assert!(array::aref(root.get(), 100).is_err());
+        assert!(array::aset(root.get(), cap - 1, box_int(0)).is_err());
+        // del_end shrinks and zeroes the tail.
+        array::del_end(root.get(), 90).unwrap();
+        assert_eq!(array::len(root.get()), 10);
+        assert!(array::aref(root.get(), 10).is_err());
+        drop(root);
+        assert_eq!(gc::root_count(), 0);
+    }
+
+    #[test]
+    fn array_boxed_elements_survive_growth_and_collection() {
+        let _g = serial();
+        rj_init();
+        let any = types::builtin(id::ANY);
+        let a = array::alloc_1d(any, 0).unwrap();
+        let root = gc::Rooted::new(a);
+        // Interleave pushes with collections: the array roots its buffer, the
+        // buffer roots the elements, growth swaps buffers mid-stream.
+        for i in 0..40i64 {
+            array::push(root.get(), box_int(1000 + i)).unwrap();
+            if i % 10 == 9 {
+                gc::collect_full();
+            }
+        }
+        for i in 0..40u32 {
+            assert_eq!(
+                crate::value::unbox_int(array::aref(root.get(), i).unwrap()),
+                1000 + i as i64
+            );
+        }
+        // Promote the array old, then push young: grow_end swaps the mem field
+        // through the write barrier, and a minor collect must keep everything.
+        gc::collect();
+        gc::collect();
+        array::push(root.get(), box_int(4242)).unwrap();
+        gc::collect();
+        rj_alloc_garbage(64);
+        assert_eq!(
+            crate::value::unbox_int(array::aref(root.get(), 40).unwrap()),
+            4242
+        );
+        // A deleted boxed tail reads as unset (zeroed, not dangling).
+        array::del_end(root.get(), 1).unwrap();
+        array::grow_end(root.get(), 1).unwrap();
+        assert!(array::aref(root.get(), 40).is_err(), "cleared slot must be unset");
+        drop(root);
+        assert_eq!(gc::root_count(), 0);
+    }
+
+    #[test]
+    fn memory_bits_elements_roundtrip() {
+        let _g = serial();
+        rj_init();
+        let int = types::builtin(id::INT64);
+        let m = memory::alloc(int, 5).unwrap();
+        let _r = gc::Rooted::new(m);
+        assert_eq!(memory::len(m), 5);
+        // Zero-initialized, like object::alloc generally.
+        assert_eq!(crate::value::unbox_int(memory::get(m, 0).unwrap()), 0);
+        for i in 0..5u32 {
+            memory::set(m, i, box_int(10 + i as i64)).unwrap();
+        }
+        for i in 0..5u32 {
+            assert_eq!(crate::value::unbox_int(memory::get(m, i).unwrap()), 10 + i as i64);
+        }
+        // Bounds are checked on both sides of the ref.
+        assert!(memory::get(m, 5).is_err());
+        assert!(memory::set(m, 5, box_int(0)).is_err());
+        // The element type is enforced (jl_memoryrefset's isa check).
+        assert!(memory::set(m, 0, crate::value::box_float64(1.5)).is_err());
+        // Memory{T} is uniqued and invariant.
+        assert_eq!(types::memory_type(int), types::memory_type(int));
+        assert!(!types::issubtype(
+            types::memory_type(int),
+            types::memory_type(types::builtin(id::INTEGER))
+        ));
+        assert!(types::issubtype(types::memory_type(int), types::builtin(id::ANY)));
+        drop(_r);
+        assert_eq!(gc::root_count(), 0);
+    }
+
+    #[test]
+    fn memory_boxed_elements_traced_and_barriered() {
+        let _g = serial();
+        rj_init();
+        let any = types::builtin(id::ANY);
+        let m = memory::alloc(any, 3).unwrap();
+        let root = gc::Rooted::new(m);
+        // An unset boxed slot is an UndefRefError, not a null deref.
+        assert!(memory::get(m, 0).is_err());
+        // Boxed elements keep identity: get returns the same object.
+        let b = box_int(77);
+        memory::set(m, 0, b).unwrap();
+        assert_eq!(memory::get(m, 0).unwrap(), b);
+        // Elements survive a full collection only through the memory's trace.
+        memory::set(m, 1, box_int(88)).unwrap();
+        gc::collect_full();
+        assert_eq!(crate::value::unbox_int(memory::get(root.get(), 0).unwrap()), 77);
+        assert_eq!(crate::value::unbox_int(memory::get(root.get(), 1).unwrap()), 88);
+        // Promote the memory old (marked survivors promote at sweep), then store
+        // a young value: the write barrier must remember the old->young edge or
+        // a minor collection frees the element out from under us.
+        gc::collect();
+        gc::collect();
+        memory::set(root.get(), 2, box_int(99)).unwrap();
+        gc::collect(); // minor: reaches the young box via the remset alone
+        rj_alloc_garbage(64); // stomp anything wrongly freed
+        assert_eq!(crate::value::unbox_int(memory::get(root.get(), 2).unwrap()), 99);
+        drop(root);
+        // Unrooted, the memory is reclaimed — after two full sweeps: it was
+        // promoted old above, and old garbage has the pin's one-full-cycle lag
+        // (a full sweep demotes OLD_MARKED to OLD; the next one frees it).
+        let live0 = {
+            gc::collect_full();
+            gc::collect_full();
+            rj_live_objects()
+        };
+        let m2 = memory::alloc(any, 64).unwrap();
+        let _ = m2;
+        gc::collect_full();
+        assert_eq!(rj_live_objects(), live0, "unrooted memory must be reclaimed");
+        assert_eq!(gc::root_count(), 0);
+    }
+
+    #[test]
+    fn recycled_page_sweep_stops_at_the_bump_cursor() {
+        let _g = serial();
+        rj_init();
+        // Fill pages with garbage, then release them whole (no walk): the dead
+        // cells keep their stale headers.
+        rj_alloc_garbage(2000);
+        gc::collect_full();
+        // A recycled page joins a pool with only its bump cursor: allocate one
+        // live object on it, leaving stale headers in the virgin tail.
+        let v = box_int(31415);
+        let root = gc::Rooted::new(v);
+        // Walk the page (the object is marked): the sweep must stop at the
+        // cursor rather than misread the stale tail as free-listable cells.
+        gc::collect_full();
+        gc::collect_full();
+        assert_eq!(crate::value::unbox_int(root.get()), 31415);
+        // Allocation through the rebuilt free lists and cursors stays sound.
+        rj_alloc_garbage(2000);
+        gc::collect_full();
+        assert_eq!(crate::value::unbox_int(root.get()), 31415);
+        drop(root);
+        assert_eq!(gc::root_count(), 0);
+    }
+
+    #[test]
+    fn parametric_typenames_survive_collection() {
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+        // Note the Pair TypeName's offset, then drop every reference to Pair
+        // types: the typename (and its instantiation cache) must survive on the
+        // pinned-roots list alone. A swept object's header becomes a freelist
+        // link, so `type_of` detects a wrongly-freed typename deterministically.
+        let tn = types::name_of(types::pair_type(t(id::INT64), t(id::INT8)));
+        gc::collect_full();
+        gc::collect_full();
+        assert_eq!(
+            type_of(Value(tn)),
+            types::builtin(id::TYPENAME),
+            "the Pair TypeName must not be swept while unreferenced"
+        );
+        // The instantiation cache also survives: uniquing still holds.
+        let p1 = types::pair_type(t(id::INT64), t(id::INT8));
+        assert_eq!(crate::symbol::as_str(types::type_sym(p1)), "Pair");
+        assert_eq!(p1, types::pair_type(t(id::INT64), t(id::INT8)));
+        assert_eq!(gc::root_count(), 0);
+    }
+
+    #[test]
+    fn pair_invariant_and_diagonal_subtyping() {
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+        let pair = types::pair_type;
+        let uall = types::unionall_type;
+        let tv = || types::make_typevar("T", types::builtin(id::BOTTOM), t(id::ANY));
+        let sub = types::issubtype;
+        let (int, int8) = (t(id::INT64), t(id::INT8));
+
+        // `Pair{Int,Int8} <: Pair{T,S} where {T,S}` but the diagonal
+        // `Pair{T,T} where T` excludes it (test/subtype.jl:207,262).
+        let a = tv();
+        let b = tv();
+        let bare_pair = uall(a, uall(b, pair(a, b)));
+        assert!(sub(pair(int, int8), bare_pair));
+        let d = tv();
+        let diag_pair = uall(d, pair(d, d));
+        assert!(!sub(pair(int, int8), diag_pair));
+        // `Pair{T,T} where T <: Pair{Int,Int}` is false: no single T is both
+        // invariantly (subtype.jl:233).
+        assert!(!sub(diag_pair, pair(int, int)));
+        // Invariance: distinct instantiations are unrelated but reflexive.
+        assert!(!sub(pair(int, int8), pair(t(id::INTEGER), t(id::SIGNED))));
+        assert!(sub(pair(int, int8), pair(int, int8)));
+
+        assert_eq!(gc::root_count(), 0, "roots released after subtype queries");
+    }
+
+    #[test]
+    fn tuple_varargs_subtyping() {
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+        let tup = |elems: &[Offset]| types::tuple_type(elems);
+        let va = types::vararg_type;
+        let sub = types::issubtype;
+        let (int, integer, real, any) =
+            (t(id::INT64), t(id::INTEGER), t(id::REAL), t(id::ANY));
+
+        // A fixed tuple is a strict subtype of a matching Vararg tail
+        // (test/subtype.jl:43,47).
+        assert!(sub(tup(&[int, int]), tup(&[va(int)])));
+        assert!(!sub(tup(&[va(int)]), tup(&[int, int])));
+        assert!(sub(tup(&[int, va(int)]), tup(&[va(int)])));
+        // Element subtyping flows through the vararg (L45); width widens (L44).
+        assert!(sub(tup(&[int, int]), tup(&[int, va(integer)])));
+        // The empty tuple is under any unbounded Vararg (L51,591).
+        assert!(sub(tup(&[]), tup(&[va(any)])));
+        // Unbounded left, fixed/short right is rejected (L592,594).
+        assert!(!sub(tup(&[va(int)]), tup(&[int])));
+        assert!(!sub(tup(&[va(integer)]), tup(&[integer, integer, va(integer)])));
+        // A non-matching element still fails through the vararg (L593).
+        assert!(!sub(tup(&[va(int)]), tup(&[t(id::NUMBER), integer])));
+        // Vararg{S} <: Vararg{T} reduces to S <: T, strictly (L587 analog).
+        assert!(sub(tup(&[integer, va(integer)]), tup(&[integer, va(real)])));
+        assert!(!sub(tup(&[integer, va(real)]), tup(&[integer, va(integer)])));
+
+        assert_eq!(gc::root_count(), 0, "roots released after subtype queries");
+    }
+
+    #[test]
+    fn interpreter_try_catch_transfers_control() {
+        use crate::interp::{eval, Body, Builtin, Op, Stmt};
+        let _g = serial();
+        rj_init();
+        // try; slot0 = a ÷ b; catch; return 999; end; return slot0
+        let mk = |a: i64, b: i64| Body {
+            nslots: 1,
+            code: vec![
+                Stmt::Enter(5),                                        // 0: catch at ip 5
+                Stmt::Call(Builtin::IDiv, vec![Op::Int(a), Op::Int(b)]), // 1: throws if b==0
+                Stmt::Assign(0, Op::Ssa(1)),                          // 2: slot0 = quotient
+                Stmt::Leave(1),                                       // 3: normal: pop handler
+                Stmt::Return(Op::Slot(0)),                            // 4: normal return
+                Stmt::Return(Op::Int(999)),                           // 5: catch: recover
+            ],
+        };
+        // b == 0 raises DivideError inside the try; control lands in the catch.
+        let caught = eval(&mk(1, 0)).expect("catch recovers");
+        assert_eq!(crate::value::unbox_int(caught), 999);
+        // No throw: Leave pops the handler and the normal path returns the quotient.
+        let normal = eval(&mk(6, 2)).expect("normal path");
+        assert_eq!(crate::value::unbox_int(normal), 3);
+        assert_eq!(gc::root_count(), 0, "roots released after eval");
+    }
+
+    #[test]
+    fn interpreter_catch_binds_the_exception() {
+        use crate::interp::{eval, Body, Op, Stmt};
+        let _g = serial();
+        rj_init();
+        // try; throw(42); catch e; return e; end
+        let body = Body {
+            nslots: 0,
+            code: vec![
+                Stmt::Enter(2),         // 0: catch at ip 2
+                Stmt::Throw(Op::Int(42)), // 1: throw 42 -> ip 2
+                Stmt::Caught,           // 2: (catch) ssa2 = the exception
+                Stmt::Return(Op::Ssa(2)), // 3: return e
+            ],
+        };
+        let e = eval(&body).expect("the caught exception is bound");
+        assert_eq!(crate::value::unbox_int(e), 42);
+        // An uncaught throw propagates out of the frame.
+        let uncaught = Body {
+            nslots: 0,
+            code: vec![Stmt::Throw(Op::Int(7))],
+        };
+        assert!(eval(&uncaught).is_err());
+        assert_eq!(gc::root_count(), 0, "roots released after eval");
+    }
+
+    #[test]
+    fn toplevel_globals_persist_in_main() {
+        let _g = serial();
+        rj_init();
+        let run = |s: &str| crate::value::unbox_int(crate::frontend::eval_source(s).unwrap());
+        // A top-level assignment binds a Main global that later evals see.
+        assert_eq!(run("gx = 41"), 41);
+        assert_eq!(run("gx + 1"), 42);
+        // Rebinding replaces the value; heap values (arrays) persist too, and
+        // survive the collections later evals may trigger.
+        assert_eq!(run("gx = 5"), 5);
+        assert_eq!(run("ga = [1, 2, 3]\nga[3]"), 3);
+        gc::collect_full();
+        assert_eq!(run("push!(ga, gx)\nga[4] + length(ga)"), 9);
+        // The module API agrees with what source-level eval sees.
+        let main = Value(crate::module::main_offset());
+        let sym = crate::symbol::intern(types::builtin(id::SYMBOL), "gx");
+        let v = crate::module::get_global(main, sym).expect("gx is bound");
+        assert_eq!(crate::value::unbox_int(v), 5);
+        // Unbound names are None, not garbage.
+        let missing = crate::symbol::intern(types::builtin(id::SYMBOL), "nope");
+        assert!(crate::module::get_global(main, missing).is_none());
+        assert_eq!(gc::root_count(), 0);
+    }
+
+    #[test]
+    fn source_arrays_end_to_end() {
+        let _g = serial();
+        rj_init();
+        let run = |s: &str| crate::value::unbox_int(crate::frontend::eval_source(s).unwrap());
+        // Literal, 1-based indexing, and setindex!.
+        assert_eq!(run("a = [10, 20, 30]\na[2]"), 20);
+        assert_eq!(run("a = [1, 2, 3]\na[1] = 99\na[1] + a[3]"), 102);
+        // length and push! (whose statement value is the array).
+        assert_eq!(run("a = [1, 2]\nlength(a)"), 2);
+        assert_eq!(run("a = [5]\npush!(a, 6)\npush!(a, 7)\na[3] * length(a)"), 21);
+        // A push!-driven sum loop: literals + growth + indexing together.
+        assert_eq!(
+            run("a = []\ni = 1\nwhile i <= 50\npush!(a, i * i)\ni = i + 1\nend\ns = 0\nj = 1\nwhile j <= length(a)\ns = s + a[j]\nj = j + 1\nend\ns"),
+            (1..=50i64).map(|k| k * k).sum::<i64>()
+        );
+        // An out-of-bounds read is a catchable BoundsError.
+        assert_eq!(run("a = [1]\nx = 0\ntry\nx = a[2]\ncatch\nx = 777\nend\nx"), 777);
+        assert_eq!(gc::root_count(), 0, "roots released after eval");
+    }
+
+    #[test]
+    fn source_try_catch_recovers() {
+        let _g = serial();
+        rj_init();
+        let run = |s: &str| crate::value::unbox_int(crate::frontend::eval_source(s).unwrap());
+        // A DivideError inside the try is recovered in the catch.
+        assert_eq!(run("x = 0\ntry\nx = 1 ÷ 0\ncatch\nx = 999\nend\nx"), 999);
+        // No error: the body runs and the catch is skipped.
+        assert_eq!(run("x = 0\ntry\nx = 6 ÷ 2\ncatch\nx = 999\nend\nx"), 3);
+        // throw(v) from source; catch e binds the thrown value.
+        assert_eq!(run("x = 0\ntry\nthrow(42)\ncatch e\nx = e\nend\nx"), 42);
+        // A thrown value can carry data through the handler.
+        assert_eq!(run("x = 0\ntry\nthrow(6 * 7)\ncatch e\nx = e + 1\nend\nx"), 43);
+        // An uncaught throw propagates out as an eval error.
+        assert!(crate::frontend::eval_source("throw(1)").is_err());
+        // A builtin error binds its reified exception object to `catch e` —
+        // and never a stale earlier exception.
+        let v = crate::frontend::eval_source(
+            "x = 0\ntry\nthrow(5)\ncatch e\nx = e\nend\ntry\nx = 1 ÷ 0\ncatch e\nx = e\nend\nx",
+        )
+        .unwrap();
+        assert_eq!(
+            v.raw(),
+            types::instance_of(types::builtin(id::DIVIDEERROR)),
+            "a DivideError binds its singleton to catch e"
+        );
+        assert_eq!(gc::root_count(), 0, "roots released after eval");
+    }
+
+    #[test]
+    fn exceptions_are_reified_objects() {
+        let _g = serial();
+        rj_init();
+        let run = |s: &str| crate::frontend::eval_source(s).unwrap();
+        // An out-of-bounds index binds a BoundsError carrying the array and
+        // the offending 1-based index as its `a`/`i` fields (boot.jl:378).
+        let e = run("a = [1, 2]\nc = 0\ntry\nc = a[5]\ncatch e\ne\nend\ntry\nc = a[5]\ncatch err\nc = err\nend\nc");
+        assert_eq!(type_of(e), types::builtin(id::BOUNDSERROR));
+        let carried_a = crate::object::get_ref(e, 0);
+        let carried_i = crate::object::get_ref(e, 4);
+        assert!(types::is_array(type_of(carried_a)), "BoundsError.a is the array");
+        assert_eq!(crate::value::unbox_int(carried_i), 5, "BoundsError.i is 1-based");
+        // An uncaught exception formats at the host boundary.
+        let msg = crate::frontend::eval_source("[1][3]").unwrap_err();
+        assert!(msg.starts_with("BoundsError"), "host rendering: {}", msg);
+        let msg = crate::frontend::eval_source("1 ÷ 0").unwrap_err();
+        assert_eq!(msg, "DivideError");
+        assert_eq!(gc::root_count(), 0);
+    }
+
+    #[test]
+    fn source_finally_runs_on_both_paths() {
+        let _g = serial();
+        rj_init();
+        let run = |s: &str| crate::value::unbox_int(crate::frontend::eval_source(s).unwrap());
+        // Normal path: cleanup runs after the body.
+        assert_eq!(run("x = 0\ntry\nx = x + 1\nfinally\nx = x + 10\nend\nx"), 11);
+        // Exception path: cleanup runs, then the exception resumes unwinding
+        // and the outer catch binds it.
+        assert_eq!(
+            run("x = 0\ntry\ntry\nthrow(5)\nfinally\nx = x + 10\nend\ncatch e\nx = x + e\nend\nx"),
+            15
+        );
+        // Combined try/catch/finally desugars: handler and cleanup both run.
+        assert_eq!(
+            run("x = 0\ntry\nthrow(7)\ncatch e\nx = e\nfinally\nx = x + 100\nend\nx"),
+            107
+        );
+        // An uncaught rethrow after finally propagates out.
+        assert!(crate::frontend::eval_source("try\nthrow(1)\nfinally\nend").is_err());
+        assert_eq!(gc::root_count(), 0);
     }
 
     #[test]

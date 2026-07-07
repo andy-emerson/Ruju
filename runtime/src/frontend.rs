@@ -6,8 +6,11 @@
 //! Until the runtime can host them (AOT-compiled, much later), this hand-written
 //! Rust front-end lets real Julia source execute. It covers integer and float
 //! literals, variables, assignment, arithmetic (`+ - * / ÷ %`), bitwise ops
-//! (`& | << >> >>>`), comparisons (incl. `===`), `if`/`elseif`/`else`, and
-//! `while`. `/` always yields `Float64`, as in Julia.
+//! (`& | << >> >>>`), comparisons (incl. `===`), `if`/`elseif`/`else`,
+//! `while`, `struct`/`mutable struct` with field access, array literals with
+//! 1-based indexing plus `push!`/`length`, `try`/`catch [e]`/`finally` and
+//! `throw`, and top-level globals (`Main` bindings persisting across evals).
+//! `/` always yields `Float64`, as in Julia.
 
 use std::collections::HashMap;
 
@@ -42,6 +45,8 @@ enum Tok {
     Assign,
     LParen,
     RParen,
+    LBracket,
+    RBracket,
     Dot,
     Comma,
     ColonColon,
@@ -53,6 +58,9 @@ enum Tok {
     Elseif,
     End,
     While,
+    Try,
+    Catch,
+    Finally,
     Eof,
 }
 
@@ -129,6 +137,14 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 out.push(Tok::RParen);
                 i += 1;
             }
+            b'[' => {
+                out.push(Tok::LBracket);
+                i += 1;
+            }
+            b']' => {
+                out.push(Tok::RBracket);
+                i += 1;
+            }
             b'<' => {
                 if b.get(i + 1) == Some(&b'<') {
                     out.push(Tok::Shl);
@@ -191,12 +207,19 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
                     i += 1;
                 }
+                // Julia identifiers may end in `!` (mutating convention: push!).
+                while i < b.len() && b[i] == b'!' {
+                    i += 1;
+                }
                 out.push(match &src[s..i] {
                     "if" => Tok::If,
                     "else" => Tok::Else,
                     "elseif" => Tok::Elseif,
                     "end" => Tok::End,
                     "while" => Tok::While,
+                    "try" => Tok::Try,
+                    "catch" => Tok::Catch,
+                    "finally" => Tok::Finally,
                     "struct" => Tok::Struct,
                     "mutable" => Tok::Mutable,
                     w => Tok::Ident(w.to_string()),
@@ -242,6 +265,10 @@ enum Expr {
     Call(String, Vec<Expr>),
     /// `base.field` — field access.
     Field(Box<Expr>, String),
+    /// `[e1, e2, ...]` — a 1-D array literal.
+    ArrayLit(Vec<Expr>),
+    /// `base[index]` — 1-based indexing.
+    Index(Box<Expr>, Box<Expr>),
 }
 
 enum SrcStmt {
@@ -251,6 +278,15 @@ enum SrcStmt {
     Expr(Expr),
     If(Expr, Vec<SrcStmt>, Vec<SrcStmt>),
     While(Expr, Vec<SrcStmt>),
+    /// `try <body> catch [e] <handler> end`; the optional name binds the caught
+    /// exception.
+    Try(Vec<SrcStmt>, Option<String>, Vec<SrcStmt>),
+    /// `try <body> finally <cleanup> end`: the cleanup runs on both the normal
+    /// and the exception path (which then rethrows). A combined
+    /// `try/catch/finally` desugars to `TryFinally([Try(..)], cleanup)`.
+    TryFinally(Vec<SrcStmt>, Vec<SrcStmt>),
+    /// `var[index] = expr` (1-based `setindex!`).
+    IndexAssign(String, Expr, Expr),
     /// `[mutable] struct Name; field[::Type]...; end`.
     StructDef { name: String, mutabl: bool, fields: Vec<(String, Option<String>)> },
 }
@@ -302,7 +338,7 @@ impl Parser {
         loop {
             self.skip_seps();
             match self.peek() {
-                Tok::End | Tok::Else | Tok::Elseif | Tok::Eof => break,
+                Tok::End | Tok::Else | Tok::Elseif | Tok::Catch | Tok::Finally | Tok::Eof => break,
                 _ => out.push(self.parse_stmt()?),
             }
         }
@@ -346,10 +382,55 @@ impl Parser {
                 self.next();
                 self.parse_if()
             }
+            Tok::Try => {
+                self.next();
+                let body = self.parse_block()?;
+                if *self.peek() == Tok::Finally {
+                    self.next();
+                    let cleanup = self.parse_block()?;
+                    self.expect(&Tok::End)?;
+                    return Ok(SrcStmt::TryFinally(body, cleanup));
+                }
+                self.expect(&Tok::Catch)?;
+                // `catch e` — an identifier before the newline names the exception.
+                let var = match self.peek().clone() {
+                    Tok::Ident(name) => {
+                        self.next();
+                        Some(name)
+                    }
+                    _ => None,
+                };
+                let handler = self.parse_block()?;
+                if *self.peek() == Tok::Finally {
+                    self.next();
+                    let cleanup = self.parse_block()?;
+                    self.expect(&Tok::End)?;
+                    return Ok(SrcStmt::TryFinally(vec![SrcStmt::Try(body, var, handler)], cleanup));
+                }
+                self.expect(&Tok::End)?;
+                Ok(SrcStmt::Try(body, var, handler))
+            }
             Tok::Ident(name) if self.toks.get(self.pos + 1) == Some(&Tok::Assign) => {
                 self.next(); // identifier
                 self.next(); // `=`
                 Ok(SrcStmt::Assign(name, self.parse_expr()?))
+            }
+            // `var[index] = expr` — tried speculatively: if no `=` follows the
+            // closing `]`, rewind and let the expression path have it.
+            Tok::Ident(name) if self.toks.get(self.pos + 1) == Some(&Tok::LBracket) => {
+                let save = self.pos;
+                self.next(); // identifier
+                self.next(); // `[`
+                let idx = self.parse_expr()?;
+                if *self.peek() == Tok::RBracket
+                    && self.toks.get(self.pos + 1) == Some(&Tok::Assign)
+                {
+                    self.next(); // `]`
+                    self.next(); // `=`
+                    return Ok(SrcStmt::IndexAssign(name, idx, self.parse_expr()?));
+                }
+                self.pos = save;
+                Ok(SrcStmt::Expr(self.parse_expr()?))
             }
             _ => Ok(SrcStmt::Expr(self.parse_expr()?)),
         }
@@ -467,6 +548,12 @@ impl Parser {
                         t => return Err(format!("expected field name after `.`, found {:?}", t)),
                     }
                 }
+                Tok::LBracket => {
+                    self.next();
+                    let idx = self.parse_expr()?;
+                    self.expect(&Tok::RBracket)?;
+                    e = Expr::Index(Box::new(e), Box::new(idx));
+                }
                 _ => break,
             }
         }
@@ -502,6 +589,22 @@ impl Parser {
                 let e = self.parse_expr()?;
                 self.expect(&Tok::RParen)?;
                 Ok(e)
+            }
+            Tok::LBracket => {
+                let mut elems = Vec::new();
+                if *self.peek() == Tok::RBracket {
+                    self.next();
+                } else {
+                    loop {
+                        elems.push(self.parse_expr()?);
+                        match self.next() {
+                            Tok::Comma => continue,
+                            Tok::RBracket => break,
+                            t => return Err(format!("expected `,` or `]`, found {:?}", t)),
+                        }
+                    }
+                }
+                Ok(Expr::ArrayLit(elems))
             }
             Tok::Minus => Ok(Expr::Bin(BinOp::Sub, Box::new(Expr::Int(0)), Box::new(self.parse_atom()?))),
             t => Err(format!("unexpected token {:?}", t)),
@@ -601,6 +704,19 @@ impl Lower {
                 let (a0, a1) = if swap { (ro, lo) } else { (lo, ro) };
                 Op::Ssa(self.emit(Stmt::Call(b, vec![a0, a1])))
             }
+            Expr::Call(name, args) if name == "throw" && args.len() == 1 => {
+                let v = self.lower_expr(&args[0])?;
+                Op::Ssa(self.emit(Stmt::Throw(v)))
+            }
+            Expr::Call(name, args) if name == "push!" && args.len() == 2 => {
+                let a = self.lower_expr(&args[0])?;
+                let v = self.lower_expr(&args[1])?;
+                Op::Ssa(self.emit(Stmt::Push(a, v)))
+            }
+            Expr::Call(name, args) if name == "length" && args.len() == 1 => {
+                let a = self.lower_expr(&args[0])?;
+                Op::Ssa(self.emit(Stmt::Len(a)))
+            }
             Expr::Call(name, args) => {
                 let t = resolve_type(name)?;
                 let ops = args.iter().map(|a| self.lower_expr(a)).collect::<Result<Vec<_>, _>>()?;
@@ -610,6 +726,15 @@ impl Lower {
                 let b = self.lower_expr(base)?;
                 let sym = crate::symbol::intern(crate::types::builtin(crate::types::id::SYMBOL), fname);
                 Op::Ssa(self.emit(Stmt::GetField(b, sym)))
+            }
+            Expr::ArrayLit(elems) => {
+                let ops = elems.iter().map(|e| self.lower_expr(e)).collect::<Result<Vec<_>, _>>()?;
+                Op::Ssa(self.emit(Stmt::ArrayLit(ops)))
+            }
+            Expr::Index(base, idx) => {
+                let b = self.lower_expr(base)?;
+                let i = self.lower_expr(idx)?;
+                Op::Ssa(self.emit(Stmt::ArrayRef(b, i)))
             }
         })
     }
@@ -637,6 +762,29 @@ impl Lower {
                 self.emit(Stmt::SetField(obj, sym, rhs));
                 Some(rhs)
             }
+            SrcStmt::TryFinally(body, cleanup) => {
+                // Julia lowers `finally` by duplicating the cleanup on both
+                // paths; the exception path rethrows after it runs.
+                let enter = self.emit(Stmt::Enter(0));
+                self.lower_block(body)?;
+                self.emit(Stmt::Leave(1));
+                self.lower_block(cleanup)?; // normal path
+                let gend = self.emit(Stmt::Goto(0));
+                let catch_start = self.code.len();
+                self.patch(enter, catch_start);
+                self.lower_block(cleanup)?; // exception path
+                self.emit(Stmt::Rethrow);
+                let end = self.code.len();
+                self.patch(gend, end);
+                None
+            }
+            SrcStmt::IndexAssign(var, idx, e) => {
+                let i = self.lower_expr(idx)?;
+                let rhs = self.lower_expr(e)?;
+                let a = Op::Slot(self.slot(var));
+                self.emit(Stmt::ArraySet(a, i, rhs));
+                Some(rhs)
+            }
             SrcStmt::Expr(e) => Some(self.lower_expr(e)?),
             SrcStmt::If(cond, then, els) => {
                 let c = self.lower_expr(cond)?;
@@ -660,6 +808,27 @@ impl Lower {
                 self.patch(gif, end);
                 None
             }
+            SrcStmt::Try(body, var, handler) => {
+                // Enter pushes the handler; on normal completion Leave pops it and
+                // Goto skips the catch block. A throw inside the body diverts to
+                // `catch_start` (patched below), where `catch e` binds the
+                // exception before the handler runs.
+                let enter = self.emit(Stmt::Enter(0));
+                self.lower_block(body)?;
+                self.emit(Stmt::Leave(1));
+                let gend = self.emit(Stmt::Goto(0));
+                let catch_start = self.code.len();
+                self.patch(enter, catch_start);
+                if let Some(name) = var {
+                    let c = self.emit(Stmt::Caught);
+                    let slot = self.slot(name);
+                    self.emit(Stmt::Assign(slot, Op::Ssa(c)));
+                }
+                self.lower_block(handler)?;
+                let end = self.code.len();
+                self.patch(gend, end);
+                None
+            }
             // A struct definition is a lowering-time side effect (a top-level
             // form); it contributes no IR and its value is not an expression.
             SrcStmt::StructDef { name, mutabl, fields } => {
@@ -681,13 +850,13 @@ impl Lower {
 
     fn patch(&mut self, idx: usize, target: usize) {
         match &mut self.code[idx] {
-            Stmt::Goto(t) | Stmt::GotoIfNot(_, t) => *t = target,
+            Stmt::Goto(t) | Stmt::GotoIfNot(_, t) | Stmt::Enter(t) => *t = target,
             _ => {}
         }
     }
 }
 
-fn lower_program(stmts: &[SrcStmt]) -> Result<Body, String> {
+fn lower_program(stmts: &[SrcStmt]) -> Result<(Body, HashMap<String, usize>), String> {
     let mut l = Lower {
         code: Vec::new(),
         slots: HashMap::new(),
@@ -696,10 +865,13 @@ fn lower_program(stmts: &[SrcStmt]) -> Result<Body, String> {
     let last = l.lower_block(stmts)?;
     let ret = last.unwrap_or(Op::Int(0));
     l.emit(Stmt::Return(ret));
-    Ok(Body {
-        nslots: l.nslots,
-        code: l.code,
-    })
+    Ok((
+        Body {
+            nslots: l.nslots,
+            code: l.code,
+        },
+        l.slots,
+    ))
 }
 
 /// Resolve a type name from source: the builtin tower by name, then the
@@ -737,9 +909,37 @@ fn resolve_type(name: &str) -> Result<crate::region::Offset, String> {
 }
 
 /// Parse, lower, and evaluate a Julia source string, returning its value.
+///
+/// Top-level variables are `Main` globals, REPL-style: named slots seed from
+/// existing bindings before evaluation and flush back on success
+/// (`jl_get_global`/`jl_set_global`), so state persists across `rj_eval`
+/// calls. Real toplevel scoping (`toplevel.c`, hard/soft scope) arrives with
+/// real lowering — this is the bootstrap front-end's divergence.
 pub fn eval_source(src: &str) -> Result<Value, String> {
     let toks = lex(src)?;
     let mut parser = Parser { toks, pos: 0 };
     let program = parser.parse_program()?;
-    interp::eval(&lower_program(&program)?)
+    let (body, names) = lower_program(&program)?;
+    let main = Value(crate::module::main_offset());
+    let symbol_t = crate::types::builtin(crate::types::id::SYMBOL);
+    let mut seed: Vec<(usize, Value)> = Vec::new();
+    for (name, &slot) in &names {
+        let sym = crate::symbol::intern(symbol_t, name);
+        if let Some(v) = crate::module::get_global(main, sym) {
+            seed.push((slot, v));
+        }
+    }
+    interp::eval_toplevel(&body, &seed, |frame| {
+        for (name, &slot) in &names {
+            let v = frame.get(slot);
+            if !v.is_null() {
+                let sym = crate::symbol::intern(symbol_t, name);
+                crate::module::set_global(main, sym, v)?;
+            }
+        }
+        Ok(())
+    })
+    // Exceptions travel as values inside the runtime; the host boundary
+    // renders an uncaught one (the embedding surface formats, as in Julia).
+    .map_err(crate::errors::format)
 }

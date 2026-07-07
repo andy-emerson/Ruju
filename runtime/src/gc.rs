@@ -174,6 +174,13 @@ struct Page {
     prev_nold: u32,
     /// Whether the page is in use (false = released to `free_pages`).
     in_use: bool,
+    /// The next never-used cell — the page's share of the pin's `newpages`
+    /// bump cursor (`jl_gc_small_alloc_inner`, `gc-stock.c:758–775`): cells at
+    /// or past it have never held an object, so allocation takes them by
+    /// advancing the cursor instead of pre-threading a free list, and sweeps
+    /// must not read them (`lim_newpages`, `:869–871` — on a recycled page
+    /// they hold stale headers).
+    bump: Offset,
 }
 
 struct Heap {
@@ -379,18 +386,15 @@ fn set_next_free(slot: Offset, next: Offset) {
 
 /// Thread every slot of page `idx` onto its own free list (a fresh or
 /// recycled page).
-fn init_page_freelist(idx: usize) {
-    let (start, osize) = (pages()[idx].start, pages()[idx].osize);
-    let n = PAGE_SIZE / osize;
-    let mut fl = region::NULL;
-    for k in (0..n).rev() {
-        let s = start + (k * osize) as u32;
-        set_next_free(s, fl);
-        fl = s;
-    }
+/// Reset a fresh or recycled page for allocation (`gc_reset_page`): no free
+/// list is built — the whole page is virgin, reachable through the bump
+/// cursor. This is the pin's `newpages` design: cold memory is touched only
+/// when an object is actually allocated there.
+fn reset_page(idx: usize) {
     let pg = &mut pages()[idx];
-    pg.freelist = fl;
-    pg.nfree = n as u32;
+    pg.freelist = region::NULL;
+    pg.bump = pg.start;
+    pg.nfree = (PAGE_SIZE / pg.osize) as u32;
     pg.live_n = 0;
     pg.has_marked = false;
     pg.has_young = false;
@@ -438,17 +442,28 @@ pub fn alloc_chunk(total: u32) -> Offset {
                 nold: 0,
                 prev_nold: 0,
                 in_use: true,
+                bump: start,
             });
             pages().len() - 1
         };
-        init_page_freelist(idx);
+        reset_page(idx);
         pools()[pi].page_q.push(idx);
         break idx;
     };
 
+    // Free list first; otherwise bump through the virgin tail
+    // (`jl_gc_small_alloc_inner`, `gc-stock.c:741–775`).
     let pg = &mut pages()[idx];
-    let head = pg.freelist;
-    pg.freelist = next_free(head);
+    let head = if pg.freelist != region::NULL {
+        let h = pg.freelist;
+        pg.freelist = next_free(h);
+        h
+    } else {
+        debug_assert!(pg.bump + osize as u32 <= pg.start + PAGE_SIZE as u32);
+        let h = pg.bump;
+        pg.bump += osize as u32;
+        h
+    };
     pg.nfree -= 1;
     pg.live_n += 1;
     pg.has_young = true; // fresh objects are young
@@ -557,6 +572,12 @@ fn push_roots(work: &mut Vec<Value>) {
     work.push(Value(b.false_instance));
     work.push(Value(b.tuple_typename)); // shared across all tuple types
     work.push(Value(b.box_typename)); // demo parametric constructor
+    work.push(Value(b.pair_typename)); // demo two-parameter constructor
+    work.push(Value(b.memory_typename)); // shared across all GenericMemory types
+    work.push(Value(b.array_typename)); // shared across all Array types
+    if crate::module::main_offset() != region::NULL {
+        work.push(Value(crate::module::main_offset())); // the Main module
+    }
     crate::symbol::each_interned(|s| work.push(Value(s))); // symbols are immortal
     crate::dispatch::each_sig(|s| work.push(Value(s))); // method signatures
     crate::types::each_registered_struct(|t| work.push(Value(t))); // source-defined types
@@ -573,6 +594,15 @@ fn each_ref(v: Value, mut f: impl FnMut(Value)) {
         for i in 0..types::svec_len(v.raw()) {
             f(Value(types::svec_ref(v.raw(), i)));
         }
+    } else if types::is_genericmemory(t) {
+        // Variable-length object: trace the boxed elements, as the C's
+        // typename special-case does (`gc-stock.c:2412,2448–2456`).
+        crate::memory::each_element_ref(v, f);
+    } else if types::is_array(t) {
+        // An array's one reference is its buffer (`a->ref.mem`). In the C this
+        // is ordinary layout-driven marking; our parametric instantiations
+        // carry no layouts yet, so the typename routes it (recorded).
+        f(crate::array::mem_of(v));
     } else {
         for i in 0..types::layout_npointers(t) {
             f(object::get_ref(v, types::layout_ptr_offset(t, i)));
@@ -660,9 +690,9 @@ fn sweep(full: bool) -> (usize, usize, usize) {
 
     let npages = pages().len();
     for idx in 0..npages {
-        let (start, osize, in_use, has_marked, has_young, nold, prev_nold, cached_live) = {
+        let (start, osize, in_use, has_marked, has_young, nold, prev_nold, cached_live, bump) = {
             let pg = &pages()[idx];
-            (pg.start, pg.osize, pg.in_use, pg.has_marked, pg.has_young, pg.nold, pg.prev_nold, pg.live_n)
+            (pg.start, pg.osize, pg.in_use, pg.has_marked, pg.has_young, pg.nold, pg.prev_nold, pg.live_n, pg.bump)
         };
         if !in_use {
             continue;
@@ -695,7 +725,12 @@ fn sweep(full: bool) -> (usize, usize, usize) {
         let mut fl = region::NULL;
         let mut nfree = 0u32;
         let mut live_n = 0u32;
-        for k in 0..(PAGE_SIZE / osize) {
+        // Walk only cells below the bump cursor (`lim_newpages`,
+        // `gc-stock.c:869–871,914,927`): virgin cells have never held an
+        // object (and hold stale headers on a recycled page); they stay
+        // reachable through the cursor rather than the free list.
+        let used = ((bump - start) as usize) / osize;
+        for k in 0..used {
             let slot = start + (k * osize) as u32;
             let v = Value(slot + HEADER_SIZE as u32);
             let bits = object::gc_bits(v);
@@ -717,7 +752,7 @@ fn sweep(full: bool) -> (usize, usize, usize) {
         live_bytes += live_n as usize * osize;
         let pg = &mut pages()[idx];
         pg.freelist = fl;
-        pg.nfree = nfree;
+        pg.nfree = nfree + (PAGE_SIZE / osize - used) as u32; // freed + virgin
         pg.live_n = live_n;
         pg.has_marked = live_n > 0; // recomputed only when walked (`:950`)
         pg.has_young = false;

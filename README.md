@@ -26,9 +26,13 @@ acc
 ```
 
 The bootstrap front-end covers integer and float literals, variables,
-assignment, `+ - *`, comparisons, and `if`/`elseif`/`else`/`while`. Underneath
-it sit the real subsystems: a tagged object model, a generational GC, the type
-system with Julia's subtype algorithm, and multiple dispatch.
+assignment, arithmetic and bitwise operators (incl. `===`),
+`if`/`elseif`/`else`/`while`, `struct` definitions and field access, array
+literals with 1-based indexing and `push!`/`length`, `try`/`catch`/`finally`
+with real exception values, and top-level globals that persist across
+evaluations. Underneath it sit the real subsystems: a tagged object model, a
+generational GC, the type system with Julia's subtype algorithm, and multiple
+dispatch.
 
 ## Motivation
 
@@ -61,10 +65,14 @@ A working runtime exists and runs via WebAssembly:
 
 - a tagged object model and a generational, pooled mark-sweep GC with
   shadow-stack rooting;
-- the type system — DataTypes, tuples, unions, parametrics, and the `where`
-  machinery (`UnionAll`/`TypeVar`) — with a subtype algorithm checked against
-  JuliaLang/julia's `test/subtype.jl`;
-- multiple dispatch and a tree-walking interpreter over lowered IR;
+- the type system — DataTypes, tuples (incl. varargs), unions, parametrics,
+  `Type{T}` kinds, and the `where` machinery (`UnionAll`/`TypeVar`) — with a
+  subtype algorithm checked against 106 assertions from JuliaLang/julia's
+  `test/subtype.jl`;
+- multiple dispatch and a tree-walking interpreter over lowered IR, with
+  exception handling (`try`/`catch`/`finally`, reified exception objects);
+- `GenericMemory`/`Array` buffers living in linear memory, with growth;
+- a `Main` module with global bindings that persist across evaluations;
 - a hand-written bootstrap front-end that runs a subset of real Julia source.
 
 The AOT compiler that will turn the Julia-written layers into WASM is the next
