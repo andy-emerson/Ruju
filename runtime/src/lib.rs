@@ -809,6 +809,31 @@ mod tests {
     }
 
     #[test]
+    fn recycled_page_sweep_stops_at_the_bump_cursor() {
+        let _g = serial();
+        rj_init();
+        // Fill pages with garbage, then release them whole (no walk): the dead
+        // cells keep their stale headers.
+        rj_alloc_garbage(2000);
+        gc::collect_full();
+        // A recycled page joins a pool with only its bump cursor: allocate one
+        // live object on it, leaving stale headers in the virgin tail.
+        let v = box_int(31415);
+        let root = gc::Rooted::new(v);
+        // Walk the page (the object is marked): the sweep must stop at the
+        // cursor rather than misread the stale tail as free-listable cells.
+        gc::collect_full();
+        gc::collect_full();
+        assert_eq!(crate::value::unbox_int(root.get()), 31415);
+        // Allocation through the rebuilt free lists and cursors stays sound.
+        rj_alloc_garbage(2000);
+        gc::collect_full();
+        assert_eq!(crate::value::unbox_int(root.get()), 31415);
+        drop(root);
+        assert_eq!(gc::root_count(), 0);
+    }
+
+    #[test]
     fn parametric_typenames_survive_collection() {
         let _g = serial();
         rj_init();
