@@ -3,8 +3,10 @@
 //! Executes a faithful subset of Julia's lowered statement forms via an
 //! instruction-pointer loop, mirroring `eval_body` in `src/interpreter.c`:
 //! `SlotNumber` locals, `SSAValue` results, `GotoNode`, `GotoIfNot`,
-//! `ReturnNode`, and `:call` expressions. This is *lowered* CodeInfo, which uses
-//! mutable slots rather than SSA phi nodes.
+//! `ReturnNode`, `:call` expressions, `:new`/field access, exception handling
+//! (`EnterNode`/`:leave`/`throw`, with exceptions as values), and array
+//! operations. This is *lowered* CodeInfo, which uses mutable slots rather
+//! than SSA phi nodes.
 //!
 //! `:call` to a builtin resolves directly; `:call` to a generic function
 //! ([`Stmt::CallGeneric`]) goes through multiple dispatch. IR is constructed

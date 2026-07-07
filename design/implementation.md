@@ -153,10 +153,16 @@ flowchart TD
     INTERP --> DISP["dispatch.rs — multiple dispatch"]
     INTERP --> VAL["value.rs — boxing"]
     INTERP --> INTR["intrinsics crate — arithmetic / comparison"]
-    DISP --> SUB["subtype.rs — subtyping (UnionAll / TypeVar)"]
+    INTERP --> ARR["array.rs — 1-D Array + growth"]
+    INTERP --> ERR["errors.rs — exception values (rtutils)"]
+    ARR --> MEMM["memory.rs — GenericMemory buffers"]
+    FE --> MOD["module.rs — Main, global bindings"]
+    MOD --> ARR
+    DISP --> SUB["subtype.rs — subtyping (UnionAll / TypeVar / Type{T})"]
     SUB <--> TYPES["types.rs — DataTypes & hierarchy"]
     VAL --> OBJ["object.rs — tagged values"]
     TYPES --> OBJ
+    MEMM --> OBJ
     TYPES --> SYM["symbol.rs — interned symbols"]
     OBJ --> GC["gc.rs — generational mark-sweep"]
     OBJ --> REGION["region.rs — bounded memory region"]
@@ -176,6 +182,10 @@ flowchart TD
 | `symbol.rs` | interned (immortal) symbols |
 | `gc.rs` | generational, pooled mark-sweep GC with shadow-stack rooting |
 | `region.rs` | the single bounded region of WASM linear memory (offset-based references) |
+| `memory.rs` | `GenericMemory{T}` — the flat linear-memory buffer under arrays |
+| `array.rs` | one-dimensional `Array{T}` over a memory buffer, with growth |
+| `module.rs` | modules and global bindings (`Main`) |
+| `errors.rs` | exception values (the `rtutils.c` analog) |
 | `intrinsics` (crate) | pure arithmetic and comparison intrinsics |
 
 ---

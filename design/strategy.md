@@ -97,17 +97,17 @@ flowchart TD
     STRUCTS["struct support [done: phase-0 subset]"]
     INTRIN["intrinsics & boxing breadth [done: phase-0 subset]"]
     GCX["GC exactness & tuning [done: phase-0 subset]"]
-    SUBXE("subtype expressibility: varargs,<br/>Type{T}, UnionAll instantiation (frontier)")
-    EXC("exceptions: enter/leave (frontier)")
+    SUBXE["subtype expressibility [done: subset —<br/>typevar-N Vararg rides with the engine]"]
+    EXC["exceptions [done: subset — reified values,<br/>finally; exception stack later]"]
 
-    ORACLE("oracle capacity: test/subtype.jl<br/>tranches unlocked by expressibility")
-    SUBXM{"subtype engine: union decision machine,<br/>Intersect/Loffset, concrete propagation"}
+    ORACLE["oracle capacity [done: 106 cases, growing]"]
+    SUBXM("subtype engine: union decision machine,<br/>Intersect/Loffset, concrete propagation (frontier)")
     ISECT{"type intersection"}
     MORESPEC{"type_morespecific"}
     DISPX{"dispatch hardening: cache, ambiguity, MethodError"}
-    ARRAYS("arrays & GenericMemory (frontier)")
-    MODULES("modules & bindings, toplevel (frontier)")
-    LOWER{"real lowering: JuliaSyntax/JuliaLowering"}
+    ARRAYS["arrays & GenericMemory [done: 1-D subset]"]
+    MODULES["modules & bindings [done: subset —<br/>toplevel scoping rides with real lowering]"]
+    LOWER("real lowering: JuliaSyntax/JuliaLowering (frontier)")
     AOT{"phase-1 AOT backend"}
     BASE{"base/ & stdlib/ AOT-compiled"}
     BLAS{"BLAS/LAPACK phase B: Rust kernels"}
@@ -144,9 +144,15 @@ flowchart TD
 ## The frontier
 
 Unblocked now, in no required order — pick by the selection principles below.
+**M1 (breadth online) was reached 2026-07**: every breadth item below is
+landed as scoped, which unblocked the two research-grade gates — they *are*
+the frontier now, alongside depth work in the landed subsets.
 
 | Increment | What it is | What it unblocks |
 | - | - | - |
+| **subtype engine** | the global union-decision machine (`Lunions`/`Runions`), `Intersect`/`Loffset` from the pin, `concrete` propagation, typevar-count `Vararg{T,N}` — **research-grade**; measured by the 106-case oracle, which pre-maps 2 divergences it must heal | type intersection → `type_morespecific` → dispatch hardening (the M3 spine) |
+| **real lowering** | JuliaSyntax/JuliaLowering → real `CodeInfo`, retiring `frontend.rs`; brings real toplevel scoping — **research-grade** | M2; `base/` code; method definitions from source |
+| **depth in landed subsets** | N-D arrays, `popfirst!`/views, isbits-struct elements; the exception stack (`pop_exception`); nested modules/imports; `BFloat16`, permbox caches (findings 1, 9) | pulled in by demand from the two gates above |
 | **arrays & GenericMemory** | landed 2026-07: ~~`GenericMemory` core~~ (the linear-memory buffer, get/set/length, GC element tracing + barrier), ~~1-D `Array` + growth~~ (`jl_array_grow_end`), ~~front-end syntax~~ (`[literals]`, `a[i]`, `push!`, `length`); remaining depth: N-D arrays, `popfirst!`/`deleteat!` (offset motion), shared views, isbits-struct/union elements | most real Julia programs; `base/` code |
 | **modules & bindings** | landed 2026-07: ~~`Main` + bindings~~ (`jl_module_t` core, get/set_global with barriers), ~~top-level globals persisting across evals~~ (REPL-style seed/flush); remaining depth: nested modules, imports/exports, `jl_binding_t` partitions/constness, real toplevel scoping (with real lowering) | `base/` code; method definitions from source |
 | **subtype expressibility** | landed 2026-07 (oracle 53→106): ~~unbounded varargs in tuples~~, ~~two-parameter `Pair` (multi-param invariant/diagonal)~~, ~~curated bounded/diagonal `test_3` expansion~~; ~~fixed-count `Vararg{T,N}` (expansion at construction)~~, ~~`Type{T}` kinds~~; remaining: typevar-count `Vararg{T,N}` (the `BOUND` kind — engine-adjacent: its length algebra lives in `jl_varbinding_t`) — bounded slices, each unlocking a tranche of `test/subtype.jl` for the oracle | grows the oracle toward the coverage the **engine slice** needs to be measurable; varargs also feeds dispatch |

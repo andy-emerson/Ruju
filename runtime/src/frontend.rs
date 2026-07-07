@@ -6,8 +6,11 @@
 //! Until the runtime can host them (AOT-compiled, much later), this hand-written
 //! Rust front-end lets real Julia source execute. It covers integer and float
 //! literals, variables, assignment, arithmetic (`+ - * / ÷ %`), bitwise ops
-//! (`& | << >> >>>`), comparisons (incl. `===`), `if`/`elseif`/`else`, and
-//! `while`. `/` always yields `Float64`, as in Julia.
+//! (`& | << >> >>>`), comparisons (incl. `===`), `if`/`elseif`/`else`,
+//! `while`, `struct`/`mutable struct` with field access, array literals with
+//! 1-based indexing plus `push!`/`length`, `try`/`catch [e]`/`finally` and
+//! `throw`, and top-level globals (`Main` bindings persisting across evals).
+//! `/` always yields `Float64`, as in Julia.
 
 use std::collections::HashMap;
 

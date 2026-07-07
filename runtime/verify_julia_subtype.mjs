@@ -7,8 +7,9 @@
 //   Ref{T}   -> Box{T}     (both are single-parameter invariant types)
 //   Int      -> Int64
 //   Vector{T} used only for invariance also maps to Box{T}
-// Cases needing Vararg, Type{}, Pair (2-param), String, or a parameter-sharing
-// supertype (AbstractVector) are out of scope for the current ABI and omitted.
+// Vararg (unbounded and fixed-count), Type{}, and Pair are all expressible.
+// Cases needing String, typevar-count Vararg{T,N}, or a parameter-sharing
+// supertype (AbstractVector) remain out of scope for the current ABI.
 //
 //   node runtime/verify_julia_subtype.mjs
 // (build first: cargo build -p ruju-runtime --target wasm32-unknown-unknown --release)

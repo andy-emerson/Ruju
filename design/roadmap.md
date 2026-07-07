@@ -35,11 +35,11 @@ genuinely unknowable up front.
 | Increment | Stream | Size | Waves | Depends on | Notes |
 | - | - | - | - | - | - |
 | GC exactness tail | breadth | S | W1–W2 | GC core | ~~done 2026-07~~: `newpages` landed; "deferred sweep" was a mischaracterized pin (finding 21) |
-| Arrays & GenericMemory | breadth | L | W1–W3 | structs | `genericmemory.c`, `array.c` |
-| Modules & bindings | breadth | M | W2–W4 | structs | `module.c`, `toplevel.c` |
-| Exceptions (`enter`/`leave`) | breadth | M | W2–W3 | interpreter core | `interpreter.c`, `rtutils.c` |
-| Subtype expressibility | type-depth | M | W1–W2 | subtyping core | varargs, `Type{T}`, `UnionAll` instantiation |
-| Oracle expansion | type-depth | S | W1–W3 | expressibility | 53 → full `test/subtype.jl` |
+| Arrays & GenericMemory | breadth | L | W1–W3 | structs | ~~done 2026-07~~ (1-D subset, linear-memory buffer, growth, syntax) |
+| Modules & bindings | breadth | M | W2–W4 | structs | ~~core done 2026-07~~; toplevel scoping rides with real lowering |
+| Exceptions (`enter`/`leave`) | breadth | M | W2–W3 | interpreter core | ~~done 2026-07~~ (reified values, `finally`; exception stack later) |
+| Subtype expressibility | type-depth | M | W1–W2 | subtyping core | ~~done 2026-07~~ (varargs, `Type{T}`, `UnionAll` inst.; typevar-`N` → engine) |
+| Oracle expansion | type-depth | S | W1–W3 | expressibility | 53 → **106** (2026-07), 2 engine divergences pre-mapped; keeps growing |
 | **Subtype engine** | type-depth | XL | W3–W6 | oracle | union-decision machine, `Intersect`/`Loffset`, `concrete` propagation — **research-grade** |
 | Type intersection | type-depth | L | W6–W7 | subtype engine | `jl_type_intersection` |
 | `type_morespecific` | type-depth | M | W7–W8 | intersection | dispatch specificity |
@@ -56,7 +56,7 @@ genuinely unknowable up front.
 
 | # | Wave | Milestone | What it means |
 | - | - | - | - |
-| M1 | end W3 | Breadth online | Arrays, modules, exceptions land; the oracle grows with expressibility. Programs stay interpreted, but the vocabulary is finally Julia-shaped. |
+| M1 | end W3 | Breadth online — **REACHED 2026-07** | Arrays, modules, exceptions landed; oracle 53→106 with 2 engine divergences pre-mapped; exceptions are reified values with `finally`; GC tail closed (finding 21). Programs stay interpreted, but the vocabulary is Julia-shaped. |
 | M2 | end W7 | Faithful front-end | `frontend.rs` retired; JuliaSyntax + JuliaLowering produce real `CodeInfo`. Source compatibility stops being a bootstrap subset. |
 | M3 | end W9 | Type & dispatch faithful | Subtype engine healed against the grown oracle; intersection and `type_morespecific` in place; dispatch hardened (cache, world age, ambiguity, `MethodError`). |
 | M4 | end W12 | AOT MVP | The build-time IR → WASM backend compiles the hot path; the interpreter remains the open-world fallback. |
