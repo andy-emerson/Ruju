@@ -629,6 +629,32 @@ mod tests {
     }
 
     #[test]
+    fn interpreter_try_catch_transfers_control() {
+        use crate::interp::{eval, Body, Builtin, Op, Stmt};
+        let _g = serial();
+        rj_init();
+        // try; slot0 = a ÷ b; catch; return 999; end; return slot0
+        let mk = |a: i64, b: i64| Body {
+            nslots: 1,
+            code: vec![
+                Stmt::Enter(5),                                        // 0: catch at ip 5
+                Stmt::Call(Builtin::IDiv, vec![Op::Int(a), Op::Int(b)]), // 1: throws if b==0
+                Stmt::Assign(0, Op::Ssa(1)),                          // 2: slot0 = quotient
+                Stmt::Leave(1),                                       // 3: normal: pop handler
+                Stmt::Return(Op::Slot(0)),                            // 4: normal return
+                Stmt::Return(Op::Int(999)),                           // 5: catch: recover
+            ],
+        };
+        // b == 0 raises DivideError inside the try; control lands in the catch.
+        let caught = eval(&mk(1, 0)).expect("catch recovers");
+        assert_eq!(crate::value::unbox_int(caught), 999);
+        // No throw: Leave pops the handler and the normal path returns the quotient.
+        let normal = eval(&mk(6, 2)).expect("normal path");
+        assert_eq!(crate::value::unbox_int(normal), 3);
+        assert_eq!(gc::root_count(), 0, "roots released after eval");
+    }
+
+    #[test]
     fn primitive_sizes_match_julia() {
         let _g = serial();
         rj_init();

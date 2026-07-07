@@ -85,6 +85,18 @@ pub enum Stmt {
     GetField(Op, crate::region::Offset),
     /// `setfield!(obj, name, rhs)`; the statement's value is `rhs`.
     SetField(Op, crate::region::Offset, Op),
+    /// Begin an exception handler (`EnterNode`, `interpreter.c:521`): if an
+    /// exception is thrown before the matching `Leave`, control transfers to
+    /// statement `catch_ip`. Adapted for the single-loop interpreter as an
+    /// explicit handler stack plus a catch-destination jump, because WASM has no
+    /// `setjmp`/`longjmp` machine-stack unwinding — a recorded divergence, of a
+    /// kind with the mandatory shadow stack, and the shape compiled code reuses.
+    #[allow(dead_code)] // the front-end wiring for `try`/`catch` is the next slice
+    Enter(usize),
+    /// Pop `n` active handlers on normal control flow out of their `try` regions
+    /// (`:leave`, `interpreter.c:608`).
+    #[allow(dead_code)] // the front-end wiring for `try`/`catch` is the next slice
+    Leave(usize),
 }
 
 /// A lowered method body: its statements and its number of local slots. For a
@@ -184,6 +196,27 @@ pub fn eval_with_args(body: &Body, args: &[Value]) -> Result<Value, String> {
     }
 
     let mut ip = 0usize;
+    // Active exception handlers (catch destinations), innermost last. An explicit
+    // stack + catch-dest jump stands in for `setjmp`/`longjmp` (absent in WASM);
+    // it is also the shape compiled code will reuse.
+    let mut handlers: Vec<usize> = Vec::new();
+    // Divert a thrown error to the innermost active handler's catch block, or
+    // propagate it out of the frame if none is active.
+    macro_rules! guard {
+        ($result:expr) => {
+            match $result {
+                Ok(v) => v,
+                Err(e) => {
+                    if let Some(catch_ip) = handlers.pop() {
+                        let _ = e; // the exception value binding (`catch e`) is a later slice
+                        ip = catch_ip;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        };
+    }
     loop {
         match &body.code[ip] {
             Stmt::Goto(target) => {
@@ -212,7 +245,7 @@ pub fn eval_with_args(body: &Body, args: &[Value]) -> Result<Value, String> {
                 }
                 let result = apply(*builtin, &argf);
                 drop(argf);
-                frame.set(ssa_base + ip, result?);
+                frame.set(ssa_base + ip, guard!(result));
             }
             Stmt::CallGeneric(func, args) => {
                 let argf = Frame::new(args.len());
@@ -222,7 +255,7 @@ pub fn eval_with_args(body: &Body, args: &[Value]) -> Result<Value, String> {
                 let vals: Vec<Value> = (0..args.len()).map(|j| argf.get(j)).collect();
                 let result = dispatch::invoke(*func, &vals); // args stay rooted via argf
                 drop(argf);
-                frame.set(ssa_base + ip, result?);
+                frame.set(ssa_base + ip, guard!(result));
             }
             Stmt::New(ty, args) => {
                 let argf = Frame::new(args.len());
@@ -232,34 +265,42 @@ pub fn eval_with_args(body: &Body, args: &[Value]) -> Result<Value, String> {
                 let vals: Vec<Value> = (0..args.len()).map(|j| argf.get(j)).collect();
                 let result = types::new_struct(*ty, &vals); // args stay rooted via argf
                 drop(argf);
-                frame.set(ssa_base + ip, result?);
+                frame.set(ssa_base + ip, guard!(result));
             }
             Stmt::GetField(op, name_sym) => {
                 let v = read_op(*op, &frame, ssa_base);
                 let t = object::type_of(v);
-                let i = types::field_index(t, *name_sym).ok_or_else(|| {
+                let i = guard!(types::field_index(t, *name_sym).ok_or_else(|| {
                     format!(
                         "type {} has no field {}",
                         crate::symbol::as_str(types::type_sym(t)),
                         crate::symbol::as_str(*name_sym)
                     )
-                })?;
-                let r = types::get_nth_field(v, i)?;
+                }));
+                let r = guard!(types::get_nth_field(v, i));
                 frame.set(ssa_base + ip, r);
             }
             Stmt::SetField(obj, name_sym, rhs) => {
                 let v = read_op(*obj, &frame, ssa_base);
                 let r = read_op(*rhs, &frame, ssa_base);
                 let t = object::type_of(v);
-                let i = types::field_index(t, *name_sym).ok_or_else(|| {
+                let i = guard!(types::field_index(t, *name_sym).ok_or_else(|| {
                     format!(
                         "type {} has no field {}",
                         crate::symbol::as_str(types::type_sym(t)),
                         crate::symbol::as_str(*name_sym)
                     )
-                })?;
-                types::set_nth_field(v, i, r)?;
+                }));
+                guard!(types::set_nth_field(v, i, r));
                 frame.set(ssa_base + ip, r);
+            }
+            Stmt::Enter(catch_ip) => {
+                handlers.push(*catch_ip);
+            }
+            Stmt::Leave(n) => {
+                for _ in 0..*n {
+                    handlers.pop();
+                }
             }
         }
         ip += 1;

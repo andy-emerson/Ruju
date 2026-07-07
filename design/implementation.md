@@ -414,10 +414,10 @@ loop and the slots-then-SSA-values single-frame layout match the C exactly
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
 | `eval_body` loop | Done | Faithful | instruction-pointer loop |
-| Statements (`Goto`/`GotoIfNot`/`Return`/`:call`/`:(=)`) | Partial | Faithful | `GotoIfNot` skips the `Bool` `TypeError` (`interpreter.c:505–507`); builtin errors (`DivideError`) propagate as `Result` eval errors until `enter`/`leave` exist |
+| Statements (`Goto`/`GotoIfNot`/`Return`/`:call`/`:(=)`) | Partial | Faithful | `GotoIfNot` skips the `Bool` `TypeError` (`interpreter.c:505–507`); a builtin error (`DivideError`) now diverts to the innermost active handler's catch block, else propagates as a `Result` eval error (exceptions slice 1, 2026-07) |
 | Operands (SSA / slot / const) | Done | Faithful | — |
 | Phi / phic / upsilon | Planned | Faithful | SSA-form nodes |
-| Exception handling (`enter`/`leave`) | Planned | Faithful | — |
+| Exception handling (`enter`/`leave`) | Partial | **Divergence** | control flow ported (exceptions slice 1, 2026-07): `Enter`/`Leave` statements + an explicit handler stack; a thrown error diverts to the innermost handler's catch destination (`EnterNode`/`:leave`, `interpreter.c:521,608`). **Divergence** because WASM has no `setjmp`/`longjmp` — the C's per-handler `jl_setjmp` + recursive `eval_body` becomes a handler stack + catch-dest jump in the single ip-loop (the shape compiled code will reuse, per the AOT carry-forward ledger). Omitted for later slices: the front-end wiring for `try`/`catch` syntax, the `catch e` exception-value binding + exception stack (`jl_current_exception`/`pop_exception`), `finally`, and scoped `EnterNode`s |
 | `:new` / `getfield` / `setfield!` / globals / closures | Partial | Faithful | `New`/`GetField`/`SetField` statements over the slice-1 runtime core (structs 2026-06); field resolution by interned symbol at run time; globals and closures still Planned |
 | IR source | Partial | **Divergence** | hand-built Rust IR via a Rust front-end; faithful path is heap `CodeInfo` from `JuliaLowering` |
 
