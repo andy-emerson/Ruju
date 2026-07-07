@@ -540,6 +540,124 @@ pub fn pair_type(a: Offset, b: Offset) -> Offset {
     apply_type(bi.pair_typename, bi.types[id::ANY as usize], &[a, b])
 }
 
+/// A link in a single-variable-at-a-time substitution environment
+/// (`jl_typeenv_t`): bind `var` to `val`, chained to `prev`.
+struct SubstEnv<'a> {
+    var: Offset,
+    val: Offset,
+    prev: Option<&'a SubstEnv<'a>>,
+}
+
+/// `inst_type_w_` (`jltypes.c:2752`), the core of type instantiation, for the
+/// type forms Ruju represents. Substitutes the environment's bound variables
+/// throughout `t`, rebuilding (and re-uniquing) any parametric type whose
+/// parameters change. Every `t` handled here is a subterm of the originally
+/// rooted body, so only the *fresh* intermediate results are rooted across the
+/// allocations that follow them (mirroring the C's `JL_GC_PUSH`).
+///
+/// Simplified vs the reference (recorded in `design/implementation.md`): no
+/// recursive-type `stack`, no `check`/`nothrow` bound validation, and the
+/// nominal supertype is carried through unchanged rather than re-instantiated
+/// (Ruju's demo parametrics have `Any` supers; parameter-sharing supertypes
+/// arrive with a later slice).
+fn inst_type(t: Offset, env: Option<&SubstEnv>) -> Offset {
+    if is_typevar(t) {
+        let mut e = env;
+        while let Some(link) = e {
+            if link.var == t {
+                return link.val;
+            }
+            e = link.prev;
+        }
+        return t;
+    }
+    if is_unionall(t) {
+        let uvar = unionall_var(t);
+        let (old_lb, old_ub) = (tvar_lb(uvar), tvar_ub(uvar));
+        let lb = inst_type(old_lb, env);
+        let _rlb = Rooted::new(object::Value(lb));
+        let ub = inst_type(old_ub, env);
+        let _rub = Rooted::new(object::Value(ub));
+        // A bound variable whose bounds moved becomes a fresh variable; the body
+        // is then instantiated with the old→new remapping in scope.
+        let newvar = if lb != old_lb || ub != old_ub {
+            typevar(tvar_name(uvar), lb, ub)
+        } else {
+            uvar
+        };
+        let _rvar = Rooted::new(object::Value(newvar));
+        let newenv = SubstEnv { var: uvar, val: newvar, prev: env };
+        let body = unionall_body(t);
+        let newbody = inst_type(body, Some(&newenv));
+        if newbody == body && newvar == uvar {
+            return t;
+        }
+        return unionall_type(newvar, newbody);
+    }
+    if is_union(t) {
+        let (oa, ob) = (union_a(t), union_b(t));
+        let a = inst_type(oa, env);
+        let _ra = Rooted::new(object::Value(a));
+        let b = inst_type(ob, env);
+        let _rb = Rooted::new(object::Value(b));
+        if a == oa && b == ob {
+            return t;
+        }
+        return union_of(&[a, b]);
+    }
+    if is_vararg(t) {
+        let oe = vararg_elem(t);
+        let ne = inst_type(oe, env);
+        if ne == oe {
+            return t;
+        }
+        return vararg_type(ne);
+    }
+    if is_datatype(t) {
+        let p = parameters_of(t);
+        if p == NULL || svec_len(p) == 0 {
+            return t;
+        }
+        let n = svec_len(p);
+        let mut params: Vec<Offset> = Vec::with_capacity(n as usize);
+        // Root each rebuilt parameter across the remaining recursive allocations.
+        let mut roots: Vec<Rooted> = Vec::with_capacity(n as usize);
+        let mut changed = false;
+        for i in 0..n {
+            let pi = svec_ref(p, i);
+            let ni = inst_type(pi, env);
+            roots.push(Rooted::new(object::Value(ni)));
+            params.push(ni);
+            if ni != pi {
+                changed = true;
+            }
+        }
+        let result = if changed {
+            apply_type(name_of(t), supertype(t), &params)
+        } else {
+            t
+        };
+        // Release the parameter roots in LIFO order (the shadow stack requires
+        // it); `Vec<Rooted>` would otherwise drop them oldest-first.
+        while roots.pop().is_some() {}
+        return result;
+    }
+    t
+}
+
+/// `jl_instantiate_unionall` (`jltypes.c:1606`): instantiate the `UnionAll` `u`'s
+/// bound variable with `p`, substituting throughout its body.
+pub fn instantiate_unionall(u: Offset, p: Offset) -> Offset {
+    let _ru = Rooted::new(object::Value(u));
+    let _rp = Rooted::new(object::Value(p));
+    let env = SubstEnv {
+        var: unionall_var(u),
+        val: p,
+        prev: None,
+    };
+    inst_type(unionall_body(u), Some(&env))
+}
+
 pub(crate) fn parameters_of(t: Offset) -> Offset {
     unsafe { (*dt(t)).parameters }
 }

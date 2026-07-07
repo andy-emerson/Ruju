@@ -326,6 +326,13 @@ pub extern "C" fn rj_pair_type(a: u32, b: u32) -> u32 {
     types::pair_type(a as Offset, b as Offset)
 }
 
+/// Instantiate the `UnionAll` at `u` with the type `p` (`jl_instantiate_unionall`).
+#[no_mangle]
+pub extern "C" fn rj_instantiate(u: u32, p: u32) -> u32 {
+    ensure_init();
+    types::instantiate_unionall(u as Offset, p as Offset)
+}
+
 /// Construct a `TypeVar` `lb <: T <: ub` named "T". Pass `0` for `lb`/`ub` to
 /// default them to `Union{}` and `Any` respectively.
 #[no_mangle]
@@ -512,6 +519,51 @@ mod tests {
         assert!(!types::issubtype(t(id::INT64), t(id::FLOAT64)));
         assert!(!types::issubtype(t(id::INT64), t(id::UNSIGNED)));
         assert!(!types::issubtype(t(id::NUMBER), t(id::INT64)));
+    }
+
+    #[test]
+    fn unionall_instantiation_matches_direct_construction() {
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+        let uall = types::unionall_type;
+        let inst = types::instantiate_unionall;
+        let tv = || types::make_typevar("T", types::builtin(id::BOTTOM), t(id::ANY));
+        let (int, int8, bool_) = (t(id::INT64), t(id::INT8), t(id::BOOL));
+
+        // Uniquing makes instantiation === direct construction: identical offsets.
+        // Box{T} where T  @Int  ==  Box{Int}
+        let bt = tv();
+        assert_eq!(inst(uall(bt, types::box_type(bt)), int), types::box_type(int));
+        // Tuple{T,T} where T  @Int  ==  Tuple{Int,Int}
+        let tt = tv();
+        assert_eq!(
+            inst(uall(tt, types::tuple_type(&[tt, tt])), int),
+            types::tuple_type(&[int, int])
+        );
+        // Nested parametric: Tuple{T, Box{T}} where T  @Int
+        let nt = tv();
+        assert_eq!(
+            inst(uall(nt, types::tuple_type(&[nt, types::box_type(nt)])), int),
+            types::tuple_type(&[int, types::box_type(int)])
+        );
+        // Union member: Union{T,Int8} where T  @Int  ==  Union{Int,Int8}. Unions
+        // are not interned, so compare structurally rather than by offset.
+        let ut = tv();
+        let inst_u = inst(uall(ut, types::union_type(ut, int8)), int);
+        let direct_u = types::union_type(int, int8);
+        assert!(types::issubtype(inst_u, direct_u) && types::issubtype(direct_u, inst_u));
+        // Second parameter of a Pair: Pair{Int,S} where S  @Bool
+        let st = tv();
+        assert_eq!(
+            inst(uall(st, types::pair_type(int, st)), bool_),
+            types::pair_type(int, bool_)
+        );
+        // A variable that does not occur leaves the body identical.
+        let zt = tv();
+        assert_eq!(inst(uall(zt, types::box_type(int)), bool_), types::box_type(int));
+
+        assert_eq!(gc::root_count(), 0, "roots released after instantiation");
     }
 
     #[test]
