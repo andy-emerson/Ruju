@@ -26,7 +26,9 @@ browser, through a runtime that compiles to WASM with the standard toolchain.
 
 ## Key design decisions
 
-Two decisions shape the whole runtime. Both were made up front and have held.
+Two founding decisions shape the whole runtime; both were made up front and
+have held. A second set was ratified 2026-07 after the post-M1 research pass
+(evidence: `design/research/`, record: `design/research/DECISIONS-2026-07.md`).
 
 **Cold path — interpreter fallback, AOT for the hot path.** Removing the
 in-browser JIT raises the question of what runs when code needs a type/method
@@ -46,6 +48,38 @@ it **mandatory** (no scan fallback), expressed through RAII
 (`Rooted`/`Frame`). *Rejected:* conservative scanning (impossible in WASM)
 and a handle table (more indirection than needed). Roots live in addressable
 slots, so the door stays open to a moving collector later.
+
+**Real `CodeInfo` by build-time pre-lowering (M2, decided 2026-07).** The
+pinned **native** Julia runs offline at build time to parse+lower source; the
+resulting `CodeInfo` is serialized in a Ruju-owned pin-versioned format and
+loaded by Ruju as data. Maximal fidelity by construction — it *is* upstream's
+lowering output (production lowering at the pin is still flisp,
+`ast.c:1248–1260`; JuliaLowering is experimental). *Rejected:* interpreting
+JuliaSyntax/JuliaLowering in-wasm (circular — they need most of `base/`,
+which needs a lowerer), AOT-first (roadmap inversion), and a flisp port
+(**held as the recorded hedge**). *Consequences:* in-browser `eval` of new
+source becomes a separate post-M5 milestone; `frontend.rs` is retained as a
+dev convenience; Emscripten is used at no stage in any role; the build-time
+Julia dependency is temporary — self-hosting removes it post-M5.
+
+**AOT architecture (M4, decided 2026-07).** Typed IR comes from the pinned
+`Compiler/` loaded as a package in the build-time Julia (`typeinf_ircode`) —
+type inference is never reimplemented. The backend is a Rust program emitting
+via `wasm-encoder` (+ "Beyond Relooper" for control flow; optional `wasm-opt`
+post-pass); *rejected:* Cranelift (verified: no wasm32 backend), LLVM (held
+as later escalation), emitting Rust source. Linking is **two modules** for
+the MVP — the runtime exports memory + funcref table + `rj_` entry points,
+the first real exercise of the composable-memory commitment — with Binaryen
+`wasm-merge` to a single artifact **explicitly kept on the table** for
+deployment. Compiled methods get two entry points after the pin's
+`CodeInstance` `invoke`/`specptr` split. *Named accepted risk:*
+cross-implementation miscompiles (64-bit-host layout folding vs 4-byte refs,
+method-table divergence during the base/-subset transition, intrinsic
+constant-folding vs recorded divergences) — mitigated by a whitelisted IR
+vocabulary, then an `AbstractInterpreter` overlay, then self-hosted `base/`;
+probed **early** by the thin-slice go/no-go experiment
+(`design/research/research-aot-backend.md`), which no longer waits for
+dispatch hardening.
 
 ## Why a dependency map, and how to use it
 
@@ -107,7 +141,10 @@ flowchart TD
     DISPX{"dispatch hardening: cache, ambiguity, MethodError"}
     ARRAYS["arrays & GenericMemory [done: 1-D subset]"]
     MODULES["modules & bindings [done: subset —<br/>toplevel scoping rides with real lowering]"]
-    LOWER("real lowering: JuliaSyntax/JuliaLowering (frontier)")
+    BOOTPIPE("build-time pipeline: pinned Julia offline →<br/>serialized compiler artifacts (frontier)")
+    THINSLICE("AOT thin slice: go/no-go experiment (frontier)")
+    LOWER("real CodeInfo: build-time pre-lowering +<br/>full interpreter statement set (frontier)")
+    EVAL{"in-browser eval: pre-lowered<br/>JuliaSyntax/JuliaLowering interpreted"}
     AOT{"phase-1 AOT backend"}
     BASE{"base/ & stdlib/ AOT-compiled"}
     BLAS{"BLAS/LAPACK phase B: Rust kernels"}
@@ -131,6 +168,11 @@ flowchart TD
     STRUCTS --> LOWER
     INTRIN --> LOWER
     EXC --> LOWER
+    BOOTPIPE --> LOWER
+    BOOTPIPE --> AOT
+    THINSLICE --> AOT
+    LOWER --> EVAL
+    BASE --> EVAL
     MODULES --> BASE
     ARRAYS --> BASE
     LOWER --> BASE
@@ -151,7 +193,9 @@ the frontier now, alongside depth work in the landed subsets.
 | Increment | What it is | What it unblocks |
 | - | - | - |
 | **subtype engine** | the global union-decision machine (`Lunions`/`Runions`), `Intersect`/`Loffset` from the pin, `concrete` propagation, typevar-count `Vararg{T,N}` — **research-grade**; measured by the 106-case oracle, which pre-maps 2 divergences it must heal | type intersection → `type_morespecific` → dispatch hardening (the M3 spine) |
-| **real lowering** | JuliaSyntax/JuliaLowering → real `CodeInfo`, retiring `frontend.rs`; brings real toplevel scoping — **research-grade** | M2; `base/` code; method definitions from source |
+| **real `CodeInfo` (M2)** | build-time pre-lowering (decided 2026-07): the pinned native Julia lowers offline; Ruju loads serialized `CodeInfo` as data; grow `interp.rs` to the full lowered statement set (phi/phic/upsilon, `GlobalRef`, `QuoteNode`, `:method`, …); real toplevel scoping comes with it — plan in `design/research/research-real-lowering.md` | M2; `base/` code; method definitions from source |
+| **build-time pipeline** | the offline harness both M2 and M4 share: run the pinned Julia, serialize compiler artifacts (`CodeInfo` now, typed `IRCode` later) | real `CodeInfo`; the AOT backend |
+| **AOT thin slice** | the go/no-go experiment (spec: `design/research/research-aot-backend.md`): hand-transcribed typed IR → ~500-line `wasm-encoder` backend → registered in dispatch → benchmarked (≥100× interpreter; ≤3× native-Rust-in-wasm). Stage 2 forces the linear-memory shadow stack + region-base export | probes the AOT semantic-gap risk before M3/M4 invest; validates two-module linking |
 | **depth in landed subsets** | N-D arrays, `popfirst!`/views, isbits-struct elements; the exception stack (`pop_exception`); nested modules/imports; `BFloat16`, permbox caches (findings 1, 9) | pulled in by demand from the two gates above |
 | **arrays & GenericMemory** | landed 2026-07: ~~`GenericMemory` core~~ (the linear-memory buffer, get/set/length, GC element tracing + barrier), ~~1-D `Array` + growth~~ (`jl_array_grow_end`), ~~front-end syntax~~ (`[literals]`, `a[i]`, `push!`, `length`); remaining depth: N-D arrays, `popfirst!`/`deleteat!` (offset motion), shared views, isbits-struct/union elements | most real Julia programs; `base/` code |
 | **modules & bindings** | landed 2026-07: ~~`Main` + bindings~~ (`jl_module_t` core, get/set_global with barriers), ~~top-level globals persisting across evals~~ (REPL-style seed/flush); remaining depth: nested modules, imports/exports, `jl_binding_t` partitions/constness, real toplevel scoping (with real lowering) | `base/` code; method definitions from source |
@@ -187,18 +231,26 @@ instantiation → engine), so the type vocabulary and the engine grow together
 and no retrofit cliff accumulates. Then: type intersection →
 `type_morespecific` → dispatch hardening (typemap cache,
 world age, ambiguity, `MethodError`). Arrays and modules behind structs. Real
-lowering (replacing `frontend.rs`) once structs, intrinsics breadth, and
-exceptions hold. The phase-1 AOT backend once dispatch and GC are hardened.
+`CodeInfo` via build-time pre-lowering (see Key design decisions) now that
+structs, intrinsics breadth, and exceptions hold; a separate **in-browser
+eval** milestone (pre-lowering JuliaSyntax/JuliaLowering themselves and
+interpreting them) follows `base/`. The phase-1 AOT backend once dispatch and GC are hardened.
 Then `base`/`stdlib` AOT — at which point **BLAS/LAPACK Phase A** (Julia's
 generic fallbacks) arrives free, making linear algebra a performance problem,
 not a correctness one:
 
-- **Phase B — Rust kernels behind the LBT surface.** The subset of the
-  BLAS/LAPACK ABI `LinearAlgebra` actually calls (`gemm`, `gemv`, `getrf`,
-  `potrf`, `geqrf`, `syevr`/`gesdd`), in Rust, inside the same `.wasm`
-  module, registered where `libblastrampoline` would forward. *Open
-  decision:* hand-rolled kernels (small, owned) vs vendoring `faer-rs`
-  (mature, large dependency).
+- **Phase B — faer behind the LBT surface (decided 2026-07;** *rejected:*
+  hand-rolled kernels — SVD/eigensolvers embody decades of numerics**).**
+  The BLAS/LAPACK symbol surface `LinearAlgebra` actually calls (enumerated
+  from the pinned stdlib in `design/research/research-faer-wasm.md`),
+  presented by a Ruju-side shim over **faer** (pure Rust, MIT) — building on
+  upstream's `faer-ffi`, registered through the runtime's internal ccall
+  symbol table where `libblastrampoline` would forward. Verified empirically:
+  after a 4-line 32-bit fix faer builds and runs on `wasm32-unknown-unknown`
+  (51–396 KiB by decomposition, bit-identical to native); pulp's simd128 +
+  relaxed-FMA backend already exists; `Par::Seq` is first-class. The faer
+  side proceeds as an independent thin-fork track with its own roadmap;
+  coverage gaps (Schur, Sylvester) fall back to Phase A generics.
 - **Phase C — WebGPU offload** for large matrices behind the same interface.
 
 Tasks and threading remain WASM-frontier-dependent (stack switching,
