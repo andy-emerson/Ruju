@@ -37,13 +37,13 @@ static MAIN: MainSlot = MainSlot(Cell::new(NULL));
 
 /// Create a module named by the interned symbol `name_sym`. A `NULL` parent
 /// self-parents the module, as Julia does for `Main`.
-pub fn new_module(name_sym: Offset, parent: Offset) -> Result<Value, String> {
+pub fn new_module(name_sym: Offset, parent: Offset) -> Result<Value, Value> {
     let _n = gc::Rooted::new(Value(name_sym));
     let bindings = array::alloc_1d(types::builtin(id::ANY), 0)?;
     let _b = gc::Rooted::new(bindings);
     let m = object::alloc(types::builtin(id::MODULE), BODY);
     if m.is_null() {
-        return Err("out of memory".to_string());
+        return Err(crate::errors::out_of_memory());
     }
     unsafe {
         *crate::region::ptr_mut::<u32>(m.raw() + NAME) = name_sym;
@@ -88,7 +88,7 @@ pub fn get_global(m: Value, sym: Offset) -> Option<Value> {
 /// Bind or assign the global `sym` in `m` (`jl_set_global`): replace an
 /// existing binding's value (the store goes through the write barrier in
 /// `memory::set`) or append a new `[sym, value]` pair.
-pub fn set_global(m: Value, sym: Offset, v: Value) -> Result<(), String> {
+pub fn set_global(m: Value, sym: Offset, v: Value) -> Result<(), Value> {
     let _m = gc::Rooted::new(m);
     let _v = gc::Rooted::new(v);
     let b = bindings_of(m);

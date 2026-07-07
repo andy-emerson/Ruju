@@ -57,6 +57,7 @@ enum Tok {
     While,
     Try,
     Catch,
+    Finally,
     Eof,
 }
 
@@ -215,6 +216,7 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                     "while" => Tok::While,
                     "try" => Tok::Try,
                     "catch" => Tok::Catch,
+                    "finally" => Tok::Finally,
                     "struct" => Tok::Struct,
                     "mutable" => Tok::Mutable,
                     w => Tok::Ident(w.to_string()),
@@ -274,8 +276,12 @@ enum SrcStmt {
     If(Expr, Vec<SrcStmt>, Vec<SrcStmt>),
     While(Expr, Vec<SrcStmt>),
     /// `try <body> catch [e] <handler> end`; the optional name binds the caught
-    /// exception. `finally` is a later slice.
+    /// exception.
     Try(Vec<SrcStmt>, Option<String>, Vec<SrcStmt>),
+    /// `try <body> finally <cleanup> end`: the cleanup runs on both the normal
+    /// and the exception path (which then rethrows). A combined
+    /// `try/catch/finally` desugars to `TryFinally([Try(..)], cleanup)`.
+    TryFinally(Vec<SrcStmt>, Vec<SrcStmt>),
     /// `var[index] = expr` (1-based `setindex!`).
     IndexAssign(String, Expr, Expr),
     /// `[mutable] struct Name; field[::Type]...; end`.
@@ -329,7 +335,7 @@ impl Parser {
         loop {
             self.skip_seps();
             match self.peek() {
-                Tok::End | Tok::Else | Tok::Elseif | Tok::Catch | Tok::Eof => break,
+                Tok::End | Tok::Else | Tok::Elseif | Tok::Catch | Tok::Finally | Tok::Eof => break,
                 _ => out.push(self.parse_stmt()?),
             }
         }
@@ -376,6 +382,12 @@ impl Parser {
             Tok::Try => {
                 self.next();
                 let body = self.parse_block()?;
+                if *self.peek() == Tok::Finally {
+                    self.next();
+                    let cleanup = self.parse_block()?;
+                    self.expect(&Tok::End)?;
+                    return Ok(SrcStmt::TryFinally(body, cleanup));
+                }
                 self.expect(&Tok::Catch)?;
                 // `catch e` — an identifier before the newline names the exception.
                 let var = match self.peek().clone() {
@@ -386,6 +398,12 @@ impl Parser {
                     _ => None,
                 };
                 let handler = self.parse_block()?;
+                if *self.peek() == Tok::Finally {
+                    self.next();
+                    let cleanup = self.parse_block()?;
+                    self.expect(&Tok::End)?;
+                    return Ok(SrcStmt::TryFinally(vec![SrcStmt::Try(body, var, handler)], cleanup));
+                }
                 self.expect(&Tok::End)?;
                 Ok(SrcStmt::Try(body, var, handler))
             }
@@ -741,6 +759,22 @@ impl Lower {
                 self.emit(Stmt::SetField(obj, sym, rhs));
                 Some(rhs)
             }
+            SrcStmt::TryFinally(body, cleanup) => {
+                // Julia lowers `finally` by duplicating the cleanup on both
+                // paths; the exception path rethrows after it runs.
+                let enter = self.emit(Stmt::Enter(0));
+                self.lower_block(body)?;
+                self.emit(Stmt::Leave(1));
+                self.lower_block(cleanup)?; // normal path
+                let gend = self.emit(Stmt::Goto(0));
+                let catch_start = self.code.len();
+                self.patch(enter, catch_start);
+                self.lower_block(cleanup)?; // exception path
+                self.emit(Stmt::Rethrow);
+                let end = self.code.len();
+                self.patch(gend, end);
+                None
+            }
             SrcStmt::IndexAssign(var, idx, e) => {
                 let i = self.lower_expr(idx)?;
                 let rhs = self.lower_expr(e)?;
@@ -902,4 +936,7 @@ pub fn eval_source(src: &str) -> Result<Value, String> {
         }
         Ok(())
     })
+    // Exceptions travel as values inside the runtime; the host boundary
+    // renders an uncaught one (the embedding surface formats, as in Julia).
+    .map_err(crate::errors::format)
 }

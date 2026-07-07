@@ -93,7 +93,13 @@ pub mod id {
     pub const VARARG: u32 = 32; // jl_vararg_t: the `Vararg{T}` tail of a tuple type
     pub const MODULE: u32 = 33; // jl_module_t: name, parent, bindings
     pub const TYPE: u32 = 34; // the abstract `Type`; `Type{T}` shares its TypeName
-    pub const COUNT: usize = 35;
+    pub const EXCEPTION: u32 = 35; // abstract Exception (boot.jl)
+    pub const DIVIDEERROR: u32 = 36; // struct DivideError <: Exception (singleton)
+    pub const UNDEFREFERROR: u32 = 37; // struct UndefRefError <: Exception (singleton)
+    pub const OUTOFMEMORYERROR: u32 = 38; // struct OutOfMemoryError <: Exception (singleton)
+    pub const BOUNDSERROR: u32 = 39; // struct BoundsError <: Exception (a, i)
+    pub const ERROREXCEPTION: u32 = 40; // struct ErrorException <: Exception (msg)
+    pub const COUNT: usize = 41;
 }
 
 /// Offsets of the bootstrapped core types and the immortal value permboxes.
@@ -331,6 +337,25 @@ pub fn bootstrap() {
     let pair_typename = tn("Pair");
     let memory_typename = tn("GenericMemory");
     let array_typename = tn("Array");
+
+    // 6b. Exception types (boot.jl:373-400, rtutils.c throws them as values):
+    //    the abstract Exception, three fieldless singletons, BoundsError{a,i}
+    //    (two reference fields), and ErrorException{msg} — msg is an interned
+    //    Symbol until a String type exists (recorded adaptation).
+    types[id::EXCEPTION as usize] = new_type(datatype, tn("Exception"), any, 0, FLAG_ABSTRACT, &[]);
+    let exc = types[id::EXCEPTION as usize];
+    types[id::DIVIDEERROR as usize] = new_type(datatype, tn("DivideError"), exc, 0, 0, &[]);
+    types[id::UNDEFREFERROR as usize] = new_type(datatype, tn("UndefRefError"), exc, 0, 0, &[]);
+    types[id::OUTOFMEMORYERROR as usize] = new_type(datatype, tn("OutOfMemoryError"), exc, 0, 0, &[]);
+    types[id::BOUNDSERROR as usize] = new_type(datatype, tn("BoundsError"), exc, 8, 0, &[0, 4]);
+    types[id::ERROREXCEPTION as usize] = new_type(datatype, tn("ErrorException"), exc, 4, 0, &[0]);
+    for k in [id::DIVIDEERROR, id::UNDEFREFERROR, id::OUTOFMEMORYERROR] {
+        let inst = object::alloc(types[k as usize], 0).raw();
+        // Fresh bootstrap objects: direct instance write, as for `nothing` below.
+        unsafe {
+            (*dt(types[k as usize])).instance = inst;
+        }
+    }
 
     // 7. The `nothing` singleton: the sole (zero-size) instance of Nothing,
     //    recorded in the type's `instance` field (jl_datatype_t.instance).

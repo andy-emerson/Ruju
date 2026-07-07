@@ -25,6 +25,7 @@
 //! locks; and the zero-length singleton-instance optimization is absent (an
 //! empty memory is an ordinary allocation).
 
+use crate::errors;
 use crate::gc;
 use crate::object::{self, Value};
 use crate::region::{self, Offset, NULL};
@@ -77,17 +78,19 @@ pub fn elem_type_of(m: Value) -> Offset {
 /// Allocate `GenericMemory{elem}` of `len` elements, zero-initialized
 /// (`_new_genericmemory_`, `genericmemory.c:56`): overflow-checked size, one
 /// region object holding header and data, `ptr` set to the inline data.
-pub fn alloc(elem: Offset, len: u32) -> Result<Value, String> {
+pub fn alloc(elem: Offset, len: u32) -> Result<Value, Value> {
     let _e = gc::Rooted::new(Value(elem)); // rooted across the type + object allocs
     let elsz = elem_size(elem);
     let nbytes = (len as usize)
         .checked_mul(elsz as usize)
         .filter(|&n| n < u32::MAX as usize - DATA as usize)
-        .ok_or("invalid GenericMemory size: the number of elements is either negative or too large")?;
+        .ok_or_else(|| {
+            errors::error_exception("invalid GenericMemory size: the number of elements is either negative or too large")
+        })?;
     let mtype = types::memory_type(elem); // uniqued; immortal via the pinned typename
     let m = object::alloc(mtype, DATA as usize + nbytes);
     if m.is_null() {
-        return Err("out of memory".to_string());
+        return Err(errors::out_of_memory());
     }
     unsafe {
         *region::ptr_mut::<u32>(m.raw() + LENGTH) = len;
@@ -113,16 +116,16 @@ fn data(m: Value) -> Offset {
 /// Read element `i` (`jl_memoryrefget`, `genericmemory.c:343`): boxed elements
 /// load the reference (an unset slot is an `UndefRefError`); singleton elements
 /// return the type's `instance`; bits elements re-box (`jl_new_bits`).
-pub fn get(m: Value, i: u32) -> Result<Value, String> {
+pub fn get(m: Value, i: u32) -> Result<Value, Value> {
     if i >= len(m) {
-        return Err(format!("BoundsError: memory index {}", i + 1));
+        return Err(errors::bounds_error(m, i as i64 + 1));
     }
     let elem = elem_type_of(m);
     match elem_kind(elem) {
         Elem::Boxed => {
             let r = unsafe { *region::ptr_mut::<u32>(data(m) + 4 * i) };
             if r == NULL {
-                return Err("UndefRefError: access to undefined reference".to_string());
+                return Err(errors::undef_ref_error());
             }
             Ok(Value(r))
         }
@@ -132,7 +135,7 @@ pub fn get(m: Value, i: u32) -> Result<Value, String> {
             let m_root = gc::Rooted::new(m);
             let b = object::alloc(elem, fsz as usize);
             if b.is_null() {
-                return Err("out of memory".to_string());
+                return Err(errors::out_of_memory());
             }
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -150,18 +153,18 @@ pub fn get(m: Value, i: u32) -> Result<Value, String> {
 /// be an instance of the element type; boxed stores go through the write
 /// barrier on the memory object (`jl_gc_wb(owner, rhs)`, `:463`); bits stores
 /// copy the payload.
-pub fn set(m: Value, i: u32, v: Value) -> Result<(), String> {
+pub fn set(m: Value, i: u32, v: Value) -> Result<(), Value> {
     if i >= len(m) {
-        return Err(format!("BoundsError: memory index {}", i + 1));
+        return Err(errors::bounds_error(m, i as i64 + 1));
     }
     let elem = elem_type_of(m);
     let vt = object::type_of(v);
     if elem != types::builtin(types::id::ANY) && vt != elem && !types::issubtype(vt, elem) {
-        return Err(format!(
+        return Err(errors::wrap_msg(format!(
             "TypeError: memoryrefset!: expected {}, got {}",
             crate::symbol::as_str(types::type_sym(elem)),
             crate::symbol::as_str(types::type_sym(vt)),
-        ));
+        )));
     }
     match elem_kind(elem) {
         Elem::Boxed => {

@@ -16,6 +16,7 @@ mod interp;
 mod object;
 mod region;
 mod array;
+mod errors;
 mod memory;
 mod module;
 mod subtype;
@@ -1085,14 +1086,62 @@ mod tests {
         assert_eq!(run("x = 0\ntry\nthrow(6 * 7)\ncatch e\nx = e + 1\nend\nx"), 43);
         // An uncaught throw propagates out as an eval error.
         assert!(crate::frontend::eval_source("throw(1)").is_err());
-        // A builtin error binds `nothing` to `catch e` (not a stale value):
-        // errors are not yet reified as exception objects (recorded).
+        // A builtin error binds its reified exception object to `catch e` —
+        // and never a stale earlier exception.
         let v = crate::frontend::eval_source(
             "x = 0\ntry\nthrow(5)\ncatch e\nx = e\nend\ntry\nx = 1 ÷ 0\ncatch e\nx = e\nend\nx",
         )
         .unwrap();
-        assert_eq!(v.raw(), types::nothing_instance(), "builtin error binds nothing");
+        assert_eq!(
+            v.raw(),
+            types::instance_of(types::builtin(id::DIVIDEERROR)),
+            "a DivideError binds its singleton to catch e"
+        );
         assert_eq!(gc::root_count(), 0, "roots released after eval");
+    }
+
+    #[test]
+    fn exceptions_are_reified_objects() {
+        let _g = serial();
+        rj_init();
+        let run = |s: &str| crate::frontend::eval_source(s).unwrap();
+        // An out-of-bounds index binds a BoundsError carrying the array and
+        // the offending 1-based index as its `a`/`i` fields (boot.jl:378).
+        let e = run("a = [1, 2]\nc = 0\ntry\nc = a[5]\ncatch e\ne\nend\ntry\nc = a[5]\ncatch err\nc = err\nend\nc");
+        assert_eq!(type_of(e), types::builtin(id::BOUNDSERROR));
+        let carried_a = crate::object::get_ref(e, 0);
+        let carried_i = crate::object::get_ref(e, 4);
+        assert!(types::is_array(type_of(carried_a)), "BoundsError.a is the array");
+        assert_eq!(crate::value::unbox_int(carried_i), 5, "BoundsError.i is 1-based");
+        // An uncaught exception formats at the host boundary.
+        let msg = crate::frontend::eval_source("[1][3]").unwrap_err();
+        assert!(msg.starts_with("BoundsError"), "host rendering: {}", msg);
+        let msg = crate::frontend::eval_source("1 ÷ 0").unwrap_err();
+        assert_eq!(msg, "DivideError");
+        assert_eq!(gc::root_count(), 0);
+    }
+
+    #[test]
+    fn source_finally_runs_on_both_paths() {
+        let _g = serial();
+        rj_init();
+        let run = |s: &str| crate::value::unbox_int(crate::frontend::eval_source(s).unwrap());
+        // Normal path: cleanup runs after the body.
+        assert_eq!(run("x = 0\ntry\nx = x + 1\nfinally\nx = x + 10\nend\nx"), 11);
+        // Exception path: cleanup runs, then the exception resumes unwinding
+        // and the outer catch binds it.
+        assert_eq!(
+            run("x = 0\ntry\ntry\nthrow(5)\nfinally\nx = x + 10\nend\ncatch e\nx = x + e\nend\nx"),
+            15
+        );
+        // Combined try/catch/finally desugars: handler and cleanup both run.
+        assert_eq!(
+            run("x = 0\ntry\nthrow(7)\ncatch e\nx = e\nfinally\nx = x + 100\nend\nx"),
+            107
+        );
+        // An uncaught rethrow after finally propagates out.
+        assert!(crate::frontend::eval_source("try\nthrow(1)\nfinally\nend").is_err());
+        assert_eq!(gc::root_count(), 0);
     }
 
     #[test]

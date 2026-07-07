@@ -113,6 +113,9 @@ pub enum Stmt {
     /// Bind the current caught exception as this statement's SSA value
     /// (`Expr(:the_exception)` / `jl_current_exception`), for `catch e`.
     Caught,
+    /// Re-throw the current exception (`jl_rethrow`) — the exception path of a
+    /// `finally` block resumes unwinding after the cleanup runs.
+    Rethrow,
 }
 
 /// A lowered method body: its statements and its number of local slots. For a
@@ -138,7 +141,7 @@ fn read_op(op: Op, frame: &Frame, ssa_base: usize) -> Value {
 /// homogeneous (no implicit promotion yet), except `/`, which converts integer
 /// operands through `sitofp` as Julia's `base/` promotion does. `Err` carries
 /// the would-be exception (e.g. `DivideError`) until real exceptions exist.
-fn apply(b: Builtin, args: &Frame) -> Result<Value, String> {
+fn apply(b: Builtin, args: &Frame) -> Result<Value, Value> {
     let x = args.get(0);
     let y = args.get(1);
     if let Builtin::Egal = b {
@@ -170,7 +173,9 @@ fn apply(b: Builtin, args: &Frame) -> Result<Value, String> {
             | Builtin::Xor
             | Builtin::Shl
             | Builtin::Shr
-            | Builtin::Lshr => return Err("integer operator applied to Float64".to_string()),
+            | Builtin::Lshr => {
+                return Err(crate::errors::error_exception("integer operator applied to Float64"))
+            }
             Builtin::Div | Builtin::Egal => unreachable!("handled above"),
         })
     } else {
@@ -179,8 +184,12 @@ fn apply(b: Builtin, args: &Frame) -> Result<Value, String> {
             Builtin::Add => box_int(add_int(a, c)),
             Builtin::Sub => box_int(sub_int(a, c)),
             Builtin::Mul => box_int(mul_int(a, c)),
-            Builtin::IDiv => box_int(checked_sdiv_int(a, c).ok_or("DivideError")?),
-            Builtin::Rem => box_int(checked_srem_int(a, c).ok_or("DivideError")?),
+            Builtin::IDiv => {
+                box_int(checked_sdiv_int(a, c).ok_or_else(crate::errors::divide_error)?)
+            }
+            Builtin::Rem => {
+                box_int(checked_srem_int(a, c).ok_or_else(crate::errors::divide_error)?)
+            }
             Builtin::And => box_int(and_int(a, c)),
             Builtin::Or => box_int(or_int(a, c)),
             Builtin::Xor => box_int(xor_int(a, c)),
@@ -196,12 +205,12 @@ fn apply(b: Builtin, args: &Frame) -> Result<Value, String> {
 }
 
 /// Evaluate `body` with no arguments.
-pub fn eval(body: &Body) -> Result<Value, String> {
+pub fn eval(body: &Body) -> Result<Value, Value> {
     eval_core(body, &[], |_| Ok(()))
 }
 
 /// Evaluate `body`, binding `args` to its leading slots (a method invocation).
-pub fn eval_with_args(body: &Body, args: &[Value]) -> Result<Value, String> {
+pub fn eval_with_args(body: &Body, args: &[Value]) -> Result<Value, Value> {
     let seeds: Vec<(usize, Value)> = args.iter().copied().enumerate().collect();
     eval_core(body, &seeds, |_| Ok(()))
 }
@@ -212,8 +221,8 @@ pub fn eval_with_args(body: &Body, args: &[Value]) -> Result<Value, String> {
 pub fn eval_toplevel(
     body: &Body,
     seed: &[(usize, Value)],
-    flush: impl FnOnce(&Frame) -> Result<(), String>,
-) -> Result<Value, String> {
+    flush: impl FnOnce(&Frame) -> Result<(), Value>,
+) -> Result<Value, Value> {
     eval_core(body, seed, flush)
 }
 
@@ -224,8 +233,8 @@ pub fn eval_toplevel(
 fn eval_core(
     body: &Body,
     seed: &[(usize, Value)],
-    flush: impl FnOnce(&Frame) -> Result<(), String>,
-) -> Result<Value, String> {
+    flush: impl FnOnce(&Frame) -> Result<(), Value>,
+) -> Result<Value, Value> {
     let ssa_base = body.nslots;
     // One extra slot past the SSA values holds the current caught exception, so
     // it stays rooted (in the frame) across allocations inside a catch block.
@@ -248,11 +257,7 @@ fn eval_core(
                 Ok(v) => v,
                 Err(e) => {
                     if let Some(catch_ip) = handlers.pop() {
-                        // Builtin errors are not yet reified as exception
-                        // objects (rtutils.c is Planned): `catch e` binds
-                        // `nothing`, set freshly so no stale exception leaks in.
-                        let _ = e;
-                        frame.set(exc_slot, Value(types::nothing_instance()));
+                        frame.set(exc_slot, e); // the caught exception, for `catch e`
                         ip = catch_ip;
                         continue;
                     }
@@ -302,7 +307,7 @@ fn eval_core(
                     argf.set(j, read_op(*op, &frame, ssa_base));
                 }
                 let vals: Vec<Value> = (0..args.len()).map(|j| argf.get(j)).collect();
-                let result = dispatch::invoke(*func, &vals); // args stay rooted via argf
+                let result = dispatch::invoke(*func, &vals);
                 drop(argf);
                 frame.set(ssa_base + ip, guard!(result));
             }
@@ -312,7 +317,7 @@ fn eval_core(
                     argf.set(j, read_op(*op, &frame, ssa_base));
                 }
                 let vals: Vec<Value> = (0..args.len()).map(|j| argf.get(j)).collect();
-                let result = types::new_struct(*ty, &vals); // args stay rooted via argf
+                let result = types::new_struct(*ty, &vals).map_err(crate::errors::wrap_msg);
                 drop(argf);
                 frame.set(ssa_base + ip, guard!(result));
             }
@@ -320,13 +325,13 @@ fn eval_core(
                 let v = read_op(*op, &frame, ssa_base);
                 let t = object::type_of(v);
                 let i = guard!(types::field_index(t, *name_sym).ok_or_else(|| {
-                    format!(
+                    crate::errors::wrap_msg(format!(
                         "type {} has no field {}",
                         crate::symbol::as_str(types::type_sym(t)),
                         crate::symbol::as_str(*name_sym)
-                    )
+                    ))
                 }));
-                let r = guard!(types::get_nth_field(v, i));
+                let r = guard!(types::get_nth_field(v, i).map_err(crate::errors::wrap_msg));
                 frame.set(ssa_base + ip, r);
             }
             Stmt::SetField(obj, name_sym, rhs) => {
@@ -334,13 +339,13 @@ fn eval_core(
                 let r = read_op(*rhs, &frame, ssa_base);
                 let t = object::type_of(v);
                 let i = guard!(types::field_index(t, *name_sym).ok_or_else(|| {
-                    format!(
+                    crate::errors::wrap_msg(format!(
                         "type {} has no field {}",
                         crate::symbol::as_str(types::type_sym(t)),
                         crate::symbol::as_str(*name_sym)
-                    )
+                    ))
                 }));
-                guard!(types::set_nth_field(v, i, r));
+                guard!(types::set_nth_field(v, i, r).map_err(crate::errors::wrap_msg));
                 frame.set(ssa_base + ip, r);
             }
             Stmt::Enter(catch_ip) => {
@@ -358,10 +363,19 @@ fn eval_core(
                     ip = catch_ip;
                     continue;
                 }
-                return Err("uncaught exception".to_string());
+                return Err(exc);
             }
             Stmt::Caught => {
                 frame.set(ssa_base + ip, frame.get(exc_slot));
+            }
+            Stmt::Rethrow => {
+                let exc = frame.get(exc_slot);
+                if let Some(catch_ip) = handlers.pop() {
+                    frame.set(exc_slot, exc);
+                    ip = catch_ip;
+                    continue;
+                }
+                return Err(exc);
             }
             Stmt::ArrayLit(args) => {
                 let argf = Frame::new(args.len());
@@ -417,24 +431,21 @@ fn eval_core(
 }
 
 /// `v` must be an array (a `MethodError` otherwise, in spirit).
-fn expect_array(v: Value) -> Result<(), String> {
+fn expect_array(v: Value) -> Result<(), Value> {
     if types::is_array(object::type_of(v)) {
         Ok(())
     } else {
-        Err("MethodError: expected an Array".to_string())
+        Err(crate::errors::error_exception("MethodError: expected an Array"))
     }
 }
 
-/// Convert a 1-based boxed index into a checked 0-based one.
-fn index_checked(a: Value, i: Value) -> Result<u32, String> {
+/// Convert a 1-based boxed index into a checked 0-based one; out of range is a
+/// `BoundsError(a, i)` carrying the array and the offending index.
+fn index_checked(a: Value, i: Value) -> Result<u32, Value> {
     expect_array(a)?;
     let i = unbox_int(i);
     if i < 1 || i > crate::array::len(a) as i64 {
-        return Err(format!(
-            "BoundsError: attempt to access {}-element Array at index [{}]",
-            crate::array::len(a),
-            i
-        ));
+        return Err(crate::errors::bounds_error(a, i));
     }
     Ok((i - 1) as u32)
 }
