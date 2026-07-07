@@ -559,6 +559,7 @@ fn push_roots(work: &mut Vec<Value>) {
     work.push(Value(b.box_typename)); // demo parametric constructor
     work.push(Value(b.pair_typename)); // demo two-parameter constructor
     work.push(Value(b.memory_typename)); // shared across all GenericMemory types
+    work.push(Value(b.array_typename)); // shared across all Array types
     crate::symbol::each_interned(|s| work.push(Value(s))); // symbols are immortal
     crate::dispatch::each_sig(|s| work.push(Value(s))); // method signatures
     crate::types::each_registered_struct(|t| work.push(Value(t))); // source-defined types
@@ -579,6 +580,11 @@ fn each_ref(v: Value, mut f: impl FnMut(Value)) {
         // Variable-length object: trace the boxed elements, as the C's
         // typename special-case does (`gc-stock.c:2412,2448–2456`).
         crate::memory::each_element_ref(v, f);
+    } else if types::is_array(t) {
+        // An array's one reference is its buffer (`a->ref.mem`). In the C this
+        // is ordinary layout-driven marking; our parametric instantiations
+        // carry no layouts yet, so the typename routes it (recorded).
+        f(crate::array::mem_of(v));
     } else {
         for i in 0..types::layout_npointers(t) {
             f(object::get_ref(v, types::layout_ptr_offset(t, i)));

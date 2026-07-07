@@ -112,6 +112,8 @@ pub struct Builtins {
     /// (`jl_genericmemory_typename`), which is how the GC recognizes memory
     /// objects at mark time (`gc-stock.c:2412`).
     pub memory_typename: Offset,
+    /// The `TypeName` shared by every `Array{T}` type (`jl_array_typename`).
+    pub array_typename: Offset,
 }
 
 struct BuiltinsSlot(Cell<Option<Builtins>>);
@@ -310,6 +312,7 @@ pub fn bootstrap() {
     let box_typename = tn("Box");
     let pair_typename = tn("Pair");
     let memory_typename = tn("GenericMemory");
+    let array_typename = tn("Array");
 
     // 7. The `nothing` singleton: the sole (zero-size) instance of Nothing,
     //    recorded in the type's `instance` field (jl_datatype_t.instance).
@@ -338,6 +341,7 @@ pub fn bootstrap() {
         box_typename,
         pair_typename,
         memory_typename,
+        array_typename,
     }));
 }
 
@@ -558,6 +562,18 @@ pub fn memory_type(elem: Offset) -> Offset {
 /// typename, exactly as the C checks `vt->name == jl_genericmemory_typename`.
 pub fn is_genericmemory(t: Offset) -> bool {
     is_datatype(t) && name_of(t) == builtins().memory_typename
+}
+
+/// Construct `Array{elem}` (invariant), uniqued. Julia's is `Array{T,N}`;
+/// ours is one-dimensional, so `N` is fixed at 1 (a recorded simplification).
+pub fn array_type(elem: Offset) -> Offset {
+    let bi = builtins();
+    apply_type(bi.array_typename, bi.types[id::ANY as usize], &[elem])
+}
+
+/// Whether `t` is an `Array{T}` type (`a->name == jl_array_typename`).
+pub fn is_array(t: Offset) -> bool {
+    is_datatype(t) && name_of(t) == builtins().array_typename
 }
 
 /// A link in a single-variable-at-a-time substitution environment

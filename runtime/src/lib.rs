@@ -15,6 +15,7 @@ mod gc;
 mod interp;
 mod object;
 mod region;
+mod array;
 mod memory;
 mod subtype;
 mod symbol;
@@ -334,6 +335,57 @@ pub extern "C" fn rj_instantiate(u: u32, p: u32) -> u32 {
     types::instantiate_unionall(u as Offset, p as Offset)
 }
 
+/// Construct the type `Array{elem}` (invariant, uniqued).
+#[no_mangle]
+pub extern "C" fn rj_array_type(elem: u32) -> u32 {
+    ensure_init();
+    types::array_type(elem as Offset)
+}
+
+/// Allocate an `Array{elem}` of `len` elements over a fresh zeroed buffer.
+/// Returns the array value's offset, or 0 on error.
+#[no_mangle]
+pub extern "C" fn rj_array_new(elem: u32, len: u32) -> u32 {
+    ensure_init();
+    array::alloc_1d(elem as Offset, len).map_or(0, |a| a.raw())
+}
+
+/// The element count of the array at `a`.
+#[no_mangle]
+pub extern "C" fn rj_array_len(a: u32) -> u32 {
+    array::len(Value(a))
+}
+
+/// Read element `i` (0-based) as an `Int64` payload, or 0 on error.
+#[no_mangle]
+pub extern "C" fn rj_array_get_i64(a: u32, i: u32) -> i64 {
+    array::aref(Value(a), i).map_or(0, crate::value::unbox_int)
+}
+
+/// Store `v` into element `i` (0-based), boxing the payload. 1 on success.
+#[no_mangle]
+pub extern "C" fn rj_array_set_i64(a: u32, i: u32, v: i64) -> u32 {
+    let arr = Value(a);
+    let _r = gc::Rooted::new(arr);
+    let b = crate::value::box_int(v);
+    array::aset(arr, i, b).is_ok() as u32
+}
+
+/// Delete the last `dec` elements, zeroing the vacated tail. 1 on success.
+#[no_mangle]
+pub extern "C" fn rj_array_del_end(a: u32, dec: u32) -> u32 {
+    array::del_end(Value(a), dec).is_ok() as u32
+}
+
+/// Append `v` (boxed) to the array, growing its buffer as needed. 1 on success.
+#[no_mangle]
+pub extern "C" fn rj_array_push_i64(a: u32, v: i64) -> u32 {
+    let arr = Value(a);
+    let _r = gc::Rooted::new(arr);
+    let b = crate::value::box_int(v);
+    array::push(arr, b).is_ok() as u32
+}
+
 /// Construct the type `GenericMemory{elem}` (invariant, uniqued).
 #[no_mangle]
 pub extern "C" fn rj_memory_type(elem: u32) -> u32 {
@@ -603,6 +655,80 @@ mod tests {
         assert_eq!(inst(uall(zt, types::box_type(int)), bool_), types::box_type(int));
 
         assert_eq!(gc::root_count(), 0, "roots released after instantiation");
+    }
+
+    #[test]
+    fn array_growth_follows_the_c_sequence() {
+        let _g = serial();
+        rj_init();
+        let int = types::builtin(id::INT64);
+        let a = array::alloc_1d(int, 0).unwrap();
+        let root = gc::Rooted::new(a);
+        assert_eq!(array::len(a), 0);
+        // Push 0..100: contents stay intact across every buffer reallocation.
+        for i in 0..100i64 {
+            array::push(root.get(), box_int(i)).unwrap();
+        }
+        assert_eq!(array::len(root.get()), 100);
+        for i in 0..100u32 {
+            assert_eq!(
+                crate::value::unbox_int(array::aref(root.get(), i).unwrap()),
+                i as i64
+            );
+        }
+        // Capacity followed 0 -> 4 -> 6 -> 9 -> 13 -> ... (grow-by-half below
+        // 48, by a fifth above): strictly more than 100, well under 2x.
+        let cap = memory::len(array::mem_of(root.get()));
+        assert!(cap >= 100 && cap < 200, "capacity {} out of the C's envelope", cap);
+        // aset/aref respect the array's length, not the buffer's.
+        assert!(array::aref(root.get(), 100).is_err());
+        assert!(array::aset(root.get(), cap - 1, box_int(0)).is_err());
+        // del_end shrinks and zeroes the tail.
+        array::del_end(root.get(), 90).unwrap();
+        assert_eq!(array::len(root.get()), 10);
+        assert!(array::aref(root.get(), 10).is_err());
+        drop(root);
+        assert_eq!(gc::root_count(), 0);
+    }
+
+    #[test]
+    fn array_boxed_elements_survive_growth_and_collection() {
+        let _g = serial();
+        rj_init();
+        let any = types::builtin(id::ANY);
+        let a = array::alloc_1d(any, 0).unwrap();
+        let root = gc::Rooted::new(a);
+        // Interleave pushes with collections: the array roots its buffer, the
+        // buffer roots the elements, growth swaps buffers mid-stream.
+        for i in 0..40i64 {
+            array::push(root.get(), box_int(1000 + i)).unwrap();
+            if i % 10 == 9 {
+                gc::collect_full();
+            }
+        }
+        for i in 0..40u32 {
+            assert_eq!(
+                crate::value::unbox_int(array::aref(root.get(), i).unwrap()),
+                1000 + i as i64
+            );
+        }
+        // Promote the array old, then push young: grow_end swaps the mem field
+        // through the write barrier, and a minor collect must keep everything.
+        gc::collect();
+        gc::collect();
+        array::push(root.get(), box_int(4242)).unwrap();
+        gc::collect();
+        rj_alloc_garbage(64);
+        assert_eq!(
+            crate::value::unbox_int(array::aref(root.get(), 40).unwrap()),
+            4242
+        );
+        // A deleted boxed tail reads as unset (zeroed, not dangling).
+        array::del_end(root.get(), 1).unwrap();
+        array::grow_end(root.get(), 1).unwrap();
+        assert!(array::aref(root.get(), 40).is_err(), "cleared slot must be unset");
+        drop(root);
+        assert_eq!(gc::root_count(), 0);
     }
 
     #[test]

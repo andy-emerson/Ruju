@@ -253,6 +253,20 @@ check(
 x.rj_gc_collect();
 check("fresh memory after collect", x.rj_memory_len(x.rj_memory_new(ty(T.Int64), 8)), 8);
 
+// --- Array{T}: the growable wrapper over GenericMemory ---
+const arr = x.rj_array_new(ty(T.Int64), 0);
+check("Array{Int64}() allocates empty", x.rj_array_len(arr), 0);
+for (let i = 0; i < 50; i++) x.rj_array_push_i64(arr, BigInt(i * 3));
+check("push! grows length to 50", x.rj_array_len(arr), 50);
+check("arrayref [0]", x.rj_array_get_i64(arr, 0), 0n);
+check("arrayref [49] across regrowth", x.rj_array_get_i64(arr, 49), 147n);
+x.rj_array_set_i64(arr, 10, 999n);
+check("arrayset [10]", x.rj_array_get_i64(arr, 10), 999n);
+check("array bounds: set at len rejected", x.rj_array_set_i64(arr, 50, 1n), 0);
+x.rj_array_del_end(arr, 45);
+check("del_end shrinks to 5", x.rj_array_len(arr), 5);
+check("Array{Int64} is uniqued (===)", x.rj_array_type(ty(T.Int64)) === x.rj_array_type(ty(T.Int64)), true);
+
 // --- invariants ---
 check("rj_root_count() balanced", x.rj_root_count(), 0);
 console.log(`info heap high-water: ${x.rj_heap_used()} bytes, live objects: ${x.rj_live_objects()}`);

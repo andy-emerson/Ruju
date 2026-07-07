@@ -193,3 +193,40 @@ pub fn each_element_ref(m: Value, mut f: impl FnMut(Value)) {
         }
     }
 }
+
+/// Copy the first `n` elements of `src` into `dst` (same element type) — the
+/// `memcpy` in `jl_array_grow_end` (`array.c:224`). Raw byte copy: boxed
+/// elements are plain offsets, and `dst` is freshly allocated (young), so no
+/// write barrier is owed.
+pub(crate) fn copy_prefix(dst: Value, src: Value, n: u32) {
+    debug_assert_eq!(elem_type_of(dst), elem_type_of(src));
+    debug_assert!(n <= len(src) && n <= len(dst));
+    let fsz = elem_size(elem_type_of(src));
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            region::ptr_mut::<u8>(data(src)),
+            region::ptr_mut::<u8>(data(dst)),
+            (n * fsz) as usize,
+        );
+    }
+}
+
+/// The element byte size for `elem` — exposed for the array layer's clearing
+/// of deleted tails (`jl_array_del_end`'s `memset`).
+pub(crate) fn elem_byte_size(elem: Offset) -> u32 {
+    elem_size(elem)
+}
+
+/// Zero elements `[from, to)` of `m` (`jl_array_del_end`, `array.c:251–254`):
+/// deleted boxed slots must read as unset and stop being traced.
+pub(crate) fn zero_range(m: Value, from: u32, to: u32) {
+    let fsz = elem_byte_size(elem_type_of(m));
+    debug_assert!(from <= to && to <= len(m));
+    unsafe {
+        core::ptr::write_bytes(
+            region::ptr_mut::<u8>(data(m) + from * fsz),
+            0,
+            ((to - from) * fsz) as usize,
+        );
+    }
+}
