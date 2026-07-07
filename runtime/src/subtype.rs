@@ -19,7 +19,17 @@
 //! newer `Intersect`/`Loffset` machinery. Union backtracking uses a simple
 //! save/restore of the environment rather than Julia's union-state bit-stack
 //! iterator — equivalent on the cases handled here, but not the full machine.
+//!
+//! GC rooting (the C's discipline, engine slice 1 first commit): the entry
+//! roots the query types (the C leaves this to callers; our host boundary
+//! passes raw offsets); each binding's mutable `lb`/`ub` stays rooted through
+//! a per-frame mirror (`subtype_unionall`'s `JL_GC_PUSH` on `vb.lb`/`vb.ub`);
+//! env snapshots root their saved bounds (`jl_savedenv_t.roots`,
+//! `subtype.c:331–337`); and the kind rule roots its fresh intermediates.
+//! Everything else reached mid-query is a subterm of one of those.
 
+use crate::gc::{self, Frame, Rooted};
+use crate::object::Value;
 use crate::region::{Offset, NULL};
 use crate::types::{self, id};
 
@@ -53,6 +63,10 @@ struct VarBinding {
     /// (`depth0`). Distinguishes `∀A ∃B` from `∃B ∀A` when an existential and a
     /// universal variable interact.
     depth0: i32,
+    /// Absolute shadow-stack index of this binding's rooted `{lb, ub}` mirror
+    /// (a 2-slot [`Frame`] owned by `subtype_unionall`). Narrowing writes
+    /// through it, so the current bounds are always GC roots.
+    root_base: usize,
 }
 
 /// The subtype environment (`jl_stenv_t`): the stack of variable bindings and
@@ -67,10 +81,58 @@ impl Env {
     fn lookup(&self, var: Offset) -> Option<usize> {
         self.vars.iter().rposition(|b| b.var == var)
     }
+
+    /// Narrow a binding's lower bound, keeping its rooted mirror current.
+    fn set_lb(&mut self, idx: usize, v: Offset) {
+        self.vars[idx].lb = v;
+        gc::set_slot(self.vars[idx].root_base, Value(v));
+    }
+
+    /// Narrow a binding's upper bound, keeping its rooted mirror current.
+    fn set_ub(&mut self, idx: usize, v: Offset) {
+        self.vars[idx].ub = v;
+        gc::set_slot(self.vars[idx].root_base + 1, Value(v));
+    }
+}
+
+/// A rooted snapshot of the environment's bindings (`jl_savedenv_t`,
+/// `subtype.c:331–337`): the saved `lb`/`ub` values occupy their own
+/// shadow-stack frame (the C's GC-rooted `roots` array), so bounds the
+/// search narrows past before a restore cannot be reclaimed meanwhile.
+struct SavedVars {
+    vars: Vec<VarBinding>,
+    _roots: Frame,
+}
+
+/// Snapshot the environment's bindings and root their bounds (`save_env`).
+fn save_vars(e: &Env) -> SavedVars {
+    let roots = Frame::new(e.vars.len() * 2);
+    for (i, b) in e.vars.iter().enumerate() {
+        roots.set(i * 2, Value(b.lb));
+        roots.set(i * 2 + 1, Value(b.ub));
+    }
+    SavedVars { vars: e.vars.clone(), _roots: roots }
+}
+
+/// Restore the environment to a snapshot taken at the same binding depth
+/// (`restore_env`), re-syncing each binding's live bounds mirror.
+fn restore_vars(e: &mut Env, saved: &SavedVars) {
+    e.vars.clear();
+    e.vars.extend_from_slice(&saved.vars);
+    for b in &e.vars {
+        gc::set_slot(b.root_base, Value(b.lb));
+        gc::set_slot(b.root_base + 1, Value(b.ub));
+    }
 }
 
 /// Entry point: decide `a <: b`.
 pub fn subtype(a: Offset, b: Offset) -> bool {
+    // The C expects the caller to root the query types; our host boundary
+    // passes raw offsets, so the engine entry roots them for the query's
+    // duration (any type reached below is a subterm of these, of a rooted
+    // bound, or is itself freshly rooted at its allocation site).
+    let _ra = Rooted::new(Value(a));
+    let _rb = Rooted::new(Value(b));
     let mut e = Env {
         vars: Vec::new(),
         invdepth: 0,
@@ -91,11 +153,11 @@ fn sub(x: Offset, y: Offset, e: &mut Env, param: Param) -> bool {
     // Union on the right is an exists: try each member, restoring the
     // environment between attempts (a simplified `exists_subtype`).
     if types::is_union(y) {
-        let saved = e.vars.clone();
+        let saved = save_vars(e);
         if sub(x, types::union_a(y), e, param) {
             return true;
         }
-        e.vars = saved;
+        restore_vars(e, &saved);
         return sub(x, types::union_b(y), e, param);
     }
 
@@ -152,9 +214,16 @@ fn sub(x: Offset, y: Offset, e: &mut Env, param: Param) -> bool {
                 return false;
             }
             // Every instance of a kind is a type: recurse as the full
-            // `Type{T'} where T'` against y, binding y's variable.
+            // `Type{T'} where T'` against y, binding y's variable. The C
+            // recurses via the immortal `jl_type_type` (`subtype.c:2111`);
+            // we build it fresh, so each intermediate is rooted across the
+            // allocations (and the query) that follow it.
             let v = types::make_typevar("T", types::builtin(id::BOTTOM), types::builtin(id::ANY));
-            let ua = types::unionall_type(v, types::type_type(v));
+            let _rv = Rooted::new(Value(v));
+            let tt = types::type_type(v);
+            let _rt = Rooted::new(Value(tt));
+            let ua = types::unionall_type(v, tt);
+            let _ru = Rooted::new(Value(ua));
             return sub(ua, y, e, param);
         }
         // `Type{Concrete}` has no broader non-`Type{}` subtypes. (The C exempts
@@ -171,15 +240,24 @@ fn sub(x: Offset, y: Offset, e: &mut Env, param: Param) -> bool {
 fn subtype_unionall(t: Offset, u: Offset, e: &mut Env, r: bool, param: Param) -> bool {
     let var = types::unionall_var(u);
     let body = types::unionall_body(u);
+    let lb = types::tvar_lb(var);
+    let ub = types::tvar_ub(var);
+    // The binding's mutable bounds stay rooted for the frame's lifetime
+    // through this mirror; narrowing writes through it (`Env::set_lb`/
+    // `set_ub`) — the C roots `vb.lb`/`vb.ub` per frame for the same reason.
+    let mirror = Frame::new(2);
+    mirror.set(0, Value(lb));
+    mirror.set(1, Value(ub));
     let idx = e.vars.len();
     e.vars.push(VarBinding {
         var,
-        lb: types::tvar_lb(var),
-        ub: types::tvar_ub(var),
+        lb,
+        ub,
         existential: r,
         occurs_cov: 0,
         cov_diag: 0,
         depth0: e.invdepth,
+        root_base: mirror.slot_index(0),
     });
     let mut ans = if r {
         sub(t, body, e, param)
@@ -246,7 +324,8 @@ fn var_lt(a: Offset, e: &mut Env, idx: usize, param: Param) -> bool {
     if !ccheck(bb.lb, a, e) {
         return false; // lower bound must already satisfy the constraint
     }
-    e.vars[idx].ub = simple_meet(e.vars[idx].ub, a);
+    let m = simple_meet(e.vars[idx].ub, a);
+    e.set_ub(idx, m);
     true
 }
 
@@ -265,7 +344,8 @@ fn var_gt(a: Offset, e: &mut Env, idx: usize, param: Param) -> bool {
     if !ccheck(a, bb.ub, e) {
         return false; // upper bound must already admit the constraint
     }
-    e.vars[idx].lb = simple_join(e.vars[idx].lb, a);
+    let j = simple_join(e.vars[idx].lb, a);
+    e.set_lb(idx, j);
     true
 }
 
@@ -593,9 +673,9 @@ fn forall_exists_equal(x: Offset, y: Offset, e: &mut Env) -> bool {
             return sub(x, y, e, Param::Invariant);
         }
     }
-    let saved = e.vars.clone();
+    let saved = save_vars(e);
     if !sub(x, y, e, Param::Invariant) {
-        e.vars = saved;
+        restore_vars(e, &saved);
         return false;
     }
     sub(y, x, e, Param::None)

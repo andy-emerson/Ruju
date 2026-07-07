@@ -974,6 +974,66 @@ mod tests {
     }
 
     #[test]
+    fn subtype_queries_survive_stress_collection() {
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+        let tup = |elems: &[Offset]| types::tuple_type(elems);
+        let uall = types::unionall_type;
+        let tv = |n: &str| types::make_typevar(n, types::builtin(id::BOTTOM), t(id::ANY));
+        let (int, int8, dt) = (t(id::INT64), t(id::INT8), t(id::DATATYPE));
+
+        // Build the queries first (the constructors root their own working
+        // sets), then run them with a collection forced at *every*
+        // allocation. Mid-query allocation sites — the kind rule's fresh
+        // `Type{T'} where T'` and `simple_join`'s fresh unions — must not
+        // let the query types, the env's narrowed bounds, or the saved
+        // snapshots be reclaimed (subtype.c roots exactly these:
+        // `jl_savedenv_t.roots`, the `JL_GC_PUSH` on `vb.lb`/`vb.ub`).
+        let s1 = tv("S");
+        let type_s = uall(s1, types::type_type(s1));
+        let t2 = tv("T");
+        let s2 = tv("S");
+        let diag_kind_body = tup(&[t2, t2, types::type_type(s2)]);
+        let diag_kind = uall(t2, uall(s2, diag_kind_body));
+        let lhs_kind = tup(&[int, int8, dt]);
+        let d3 = tv("T");
+        let diag = uall(d3, tup(&[d3, d3]));
+        let u4 = tv("S");
+        let exists_union = uall(u4, types::union_type(int8, u4));
+        let lhs_union = types::union_type(int, int8);
+
+        {
+            // The queries' own roots: the test stands in for the host, which
+            // holds offsets across allocating calls only under this contract.
+            // (Named locals drop in reverse declaration order — LIFO, as the
+            // shadow stack requires.)
+            let _r0 = gc::Rooted::new(Value(type_s));
+            let _r1 = gc::Rooted::new(Value(diag_kind));
+            let _r2 = gc::Rooted::new(Value(lhs_kind));
+            let _r3 = gc::Rooted::new(Value(diag));
+            let _r4 = gc::Rooted::new(Value(exists_union));
+            let _r5 = gc::Rooted::new(Value(lhs_union));
+            gc::set_stress(true);
+            // The kind rule allocates its fresh `Type{T'} where T'` mid-query.
+            assert!(types::issubtype(dt, type_s), "DataType <: (Type{{S}} where S)");
+            // Diagonal rejection must read T's freshly-allocated union lower
+            // bound *after* the kind rule's allocations freed-or-kept it.
+            assert!(
+                !types::issubtype(lhs_kind, diag_kind),
+                "diagonal T with a fresh union lb survives later allocations"
+            );
+            // Plain diagonal accept/reject under stress.
+            assert!(types::issubtype(tup(&[int, int]), diag));
+            assert!(!types::issubtype(tup(&[int, int8]), diag));
+            // Union backtracking with env narrowing under stress.
+            assert!(types::issubtype(lhs_union, exists_union));
+            gc::set_stress(false);
+        }
+        assert_eq!(gc::root_count(), 0, "roots released after stressed queries");
+    }
+
+    #[test]
     fn interpreter_try_catch_transfers_control() {
         use crate::interp::{eval, Body, Builtin, Op, Stmt};
         let _g = serial();

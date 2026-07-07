@@ -361,18 +361,28 @@ mapping is real: per-var `lb`/`ub` narrowing through
     immediately caught a fourth bug — the diagonal rule rejected typevar
     lower bounds, breaking UnionAll alpha-equivalence (**fixed** per
     `subtype.c:1404–1419`; `concrete`-flag propagation still absent).
-24. **The query path allocates with nothing rooted (open, audit 2026-07;
-    = `design/research/research-subtype-engine.md` §7 risk 5).**
-    `subtype.rs` contains no `Rooted`/`Frame`. Allocation sites reachable
-    mid-query: `simple_join` → `types::union_type` (`subtype.rs:643`,
-    pre-existing) and the kind rule's fresh `make_typevar`/`type_type`/
-    `unionall_type` (`subtype.rs:156–158`, M1). A collection triggered
-    there can free the query types (the JS caller's offsets are not
-    rooted), any binding's narrowed `lb`/`ub` whose only reference is the
-    env, and the `e.vars.clone()` snapshots' bounds. The C roots exactly
-    these (`jl_savedenv_t.roots`, `subtype.c:331–337,385–414`; per-frame
-    `JL_GC_PUSH` in `subtype_unionall`). Fix is engine slice 1's first
-    commit.
+24. ~~The query path allocates with nothing rooted~~ (audit 2026-07;
+    = `design/research/research-subtype-engine.md` §7 risk 5) — **fixed
+    (engine slice 1, first commit, 2026-07)**. The exposure: `subtype.rs`
+    contained no `Rooted`/`Frame`, while `simple_join` → `types::union_type`
+    and the kind rule's fresh `make_typevar`/`type_type`/`unionall_type`
+    allocate mid-query — a collection there could free the query types (the
+    host's offsets are not rooted), a binding's narrowed `lb`/`ub`, or a
+    snapshot's saved bounds. Ported the C's discipline: the entry roots the
+    query types (adaptation — the C leaves this to callers, which our host
+    boundary cannot do); each binding's mutable `lb`/`ub` is mirrored in a
+    2-slot shadow-stack frame with write-through on narrowing
+    (`JL_GC_PUSH5(&u, &vb.lb, &vb.ub, …)`, `subtype.c:1378`); env snapshots
+    root their saved bounds (`jl_savedenv_t`'s `gcframe` + `roots`,
+    `subtype.c:331–337,385–414`); the kind rule roots its intermediates.
+    Enforced by a new allocation-stress GC mode (`gc::set_stress` — every
+    allocation collects) and a stress test that fails deterministically on
+    the unrooted engine (dangling env references corrupt the mark phase's
+    live accounting). The host boundary itself (JS holding un-interned
+    type offsets across allocating `rj_` calls, e.g. fresh unions and
+    `UnionAll`s in the oracle) remains exposed between queries — uncached
+    constructions survive today because the oracle stays under the heap
+    target; a host-side rooting contract is future work, noted here.
 
 Oracle: `runtime/verify_julia_subtype.mjs` runs assertions copied verbatim
 from JuliaLang/julia's own `test/subtype.jl` (mapping `Ref{T}`→`Box{T}`,
@@ -391,7 +401,7 @@ backtracking cannot; both self-report if a fix makes them pass.
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
 | `jl_subtype` structural core | Partial | Faithful | reflexive/`Any`/`Bottom`, Union forall–exists, covariant tuples (incl. an unbounded-`Vararg` tail — `subtype_tuple`/`subtype_tuple_tail`/`subtype_tuple_varargs` length classification + tail walk, `subtype.c:1740–1899`, varargs slice 2026-07), nominal, invariant parametrics, `UnionAll`/`TypeVar` via the env. Audit 2026-06 fixes landed: free-vs-free typevars now unconditionally false; `forall_exists_equal` reverse check at `PARAM_NONE` + same-name-datatype fast path. Remaining divergences: unions split before typevar/UnionAll handling (Julia prioritizes the latter, `subtype.c:1934–1948`); no two-union greedy path; local union backtracking vs the global decision machine (see oracle's known divergence) |
-| Existential env (`jl_stenv_t`) | Partial | Faithful | `var_lt`/`var_gt` narrow per-var `lb`/`ub`; ∀/∃ via the `existential` flag; `invdepth`/`depth0` order interacting existentials (`var_outside`, ∀∃-vs-∃∀). No `where`-var renaming or `innervars` leak handling |
+| Existential env (`jl_stenv_t`) | Partial | Faithful | `var_lt`/`var_gt` narrow per-var `lb`/`ub`; ∀/∃ via the `existential` flag; `invdepth`/`depth0` order interacting existentials (`var_outside`, ∀∃-vs-∃∀). GC-rooted (engine slice 1, 2026-07): binding bounds mirrored in per-frame shadow-stack slots with write-through, snapshots root their saved bounds, the entry roots the query (`subtype.c:1378`, `:331–337`; finding 24). No `where`-var renaming or `innervars` leak handling |
 | Diagonal rule | Partial | Faithful | `occurs_cov` + `cov_diag` consistency-scope folding (`subtype_ccheck`), static `var_occurs_invariant`, `is_leaf_bound`; `ccheck` enters at `PARAM_NONE` (fixed, audit 2026-06); typevar lower bounds accepted (fixed — Julia also propagates `concrete=1` to that var, `subtype.c:1411–1415`, which we still don't); pinned C has newer machinery the port predates (`Intersect` #61917, `push_forall_bound_scope`, `Loffset`) |
 | Union backtracking | Partial | Faithful | env save/restore on the exists branch; not Julia's `Lunions`/`Runions` bit-stack iterator (`forall_exists_subtype`, `subtype.c:2383`) |
 | `simple_meet` / `simple_join` | Partial | Faithful | join defers to the normalized `union_type` (keeps free vars, so `S>:T` survives); meet over-estimates to `b` for typevar operands (no `Intersect` node) |
@@ -564,7 +574,7 @@ strategy's "GC exactness & tuning" frontier item).**
 | Write barrier + remembered set | Done | Faithful | exact `jl_gc_wb` (`gc-wb-stock.h:14`) + `jl_gc_queue_root` (`gc-stock.c:1493`): fires on parent `== GC_OLD_MARKED` with child unMARKED; re-tag 3→1 is the at-most-once guard; remset cleared at mark start with entries restored to 3 and traced (`gc_queue_remset`, `:2828`), then **rebuilt** during marking — any scanned old object with a young-at-scan-time reference is re-pushed (`gc_mark_push_remset`, `:1613`, the `nptr == 0x3` rule). After a quick sweep, entries are put back in the *queued* state, `GC_MARKED` (`:3405–3414`), so the barrier cannot refire on them — slice 2's note claimed duplicates were "tolerated, as in the pin"; the pin in fact *prevents* barrier-after-scan duplicates via this re-queue (corrected, slice A). Full sweeps clear the remset outright (`:3415`). Slices 1–2 + tail A, 2026-06 |
 | Collection trigger | Partial | Faithful | proactive at the heap target, checked at allocation (`heap_size >= heap_target`, `gc-stock.c:356`); the target is live size + `overallocation` growth (`:3032–3050`, ported) floored at `default_collect_interval` scaled to the region (`:33–35`). Julia's MemBalancer rate machinery behind `target_allocs` omitted (GC tail slice A, 2026-06); exhaustion collect-and-retry remains the backstop |
 | Full-vs-quick policy | Done | Faithful | the pin's predicates (`gc-stock.c:3377–3400`): full next when promoted bytes since the last full sweep exceed 0.15 of the heap, or the heap outgrew the post-full baseline by `overallocation`; `user_max`/`under_pressure` omitted — no CLI options (GC tail slice A, 2026-06) |
-| Shadow-stack rooting (`gcframe`) | Done | Faithful | — |
+| Shadow-stack rooting (`gcframe`) | Done | Faithful | plus an allocation-stress test mode (`gc::set_stress` — a collection per allocation) as the rooting-discipline enforcement vehicle (engine slice 1, 2026-07) |
 | Machine-stack scanning | n/a | **Divergence** | impossible in WASM; the shadow stack is *mandatory* instead |
 | Safepoints | Partial | Faithful | trivial (single-threaded); multithreaded protocol later |
 | Finalizers | Planned | Faithful | includes `mark_reset_age` (`gc-stock.c:3165–3172`): objects reachable only from `to_finalize` are reset as-if-new — finalizer-only machinery, lands here |
@@ -750,6 +760,6 @@ unrecorded guard omission (23: unconditional vararg expansion), one latent
 rooting gap (26: `new_module`'s `parent`), a cluster of benign
 simplifications (27), and four citation errors (25, 26, 28 — corrected in
 place). Finding 24 records the subtype query path's pre-existing-but-widened
-GC exposure; its fix is engine slice 1's first commit.
+GC exposure; it was fixed the same day by engine slice 1's first commit.
 
 Audits have found over-claims every time they have run.
