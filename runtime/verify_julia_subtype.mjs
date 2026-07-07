@@ -115,6 +115,37 @@ const cases = [
     return [Pair(Ref(Int), Int), where(T, Pair(Ref(T), T))];
   }],
 
+  // --- more existential / bounded / diagonal cases (test_3) ---
+  ["L205 issub_strict(Vector{Int}, @UnionAll T Vector{T})", "strict", () => {
+    const T = tvar();
+    return [Ref(Int), where(T, Ref(T))];
+  }],
+  ["L214 !issub(@UnionAll T<:Integer @UnionAll S<:Number Tuple{T,S}, ...Tuple{S,T})", "notsub", () => {
+    const T = tvar(0, Integer), S = tvar(0, Number);
+    const T2 = tvar(0, Integer), S2 = tvar(0, Number);
+    return [where(T, where(S, Tuple(T, S))), where(T2, where(S2, Tuple(S2, T2)))];
+  }],
+  ["L238 issub(Tuple{Vector{Integer},Int}, @UnionAll T<:Integer @UnionAll S<:T Tuple{Vector{T},S})", "sub", () => {
+    const T = tvar(0, Integer), S = tvar(0, T); // S <: T
+    return [Tuple(Ref(Integer), Int), where(T, where(S, Tuple(Ref(T), S)))];
+  }],
+  ["L241 !issub(Tuple{Vector{Integer},Real}, @UnionAll T<:Integer Tuple{Vector{T},T})", "notsub", () => {
+    const T = tvar(0, Integer);
+    return [Tuple(Ref(Integer), Real), where(T, Tuple(Ref(T), T))];
+  }],
+  ["L264 !issub(Tuple{Vector{Int},Integer}, @UnionAll T<:Integer Tuple{Vector{T},T})", "notsub", () => {
+    const T = tvar(0, Integer);
+    return [Tuple(Ref(Int), Integer), where(T, Tuple(Ref(T), T))];
+  }],
+  ["L267 !issub(Tuple{Integer,Vector{Int}}, @UnionAll T<:Integer Tuple{T,Vector{T}})", "notsub", () => {
+    const T = tvar(0, Integer);
+    return [Tuple(Integer, Ref(Int)), where(T, Tuple(T, Ref(T)))];
+  }],
+  ["L273 issub(Tuple{Integer,Int}, @UnionAll T<:Integer @UnionAll S<:T Tuple{T,S})", "sub", () => {
+    const T = tvar(0, Integer), S = tvar(0, T);
+    return [Tuple(Integer, Int), where(T, where(S, Tuple(T, S)))];
+  }],
+
   // --- existential vs universal (test_3) ---
   ["L99 issub_strict(Tuple{R,R} where R, Tuple{T,S} where {T,S})", "strict", () => {
     const R = tvar(); const T = tvar(); const S = tvar();

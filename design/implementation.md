@@ -341,11 +341,14 @@ mapping is real: per-var `lb`/`ub` narrowing through
 
 Oracle: `runtime/verify_julia_subtype.mjs` runs assertions copied verbatim
 from JuliaLang/julia's own `test/subtype.jl` (mapping `Ref{T}`→`Box{T}`,
-`Int`→`Int64`) — currently 80/80: the unbounded-varargs slice added 19 cases
-(`test/subtype.jl:43–59,587–594`) and the two-parameter `Pair` constructor added
-8 invariant/`where`/diagonal cases (`test/subtype.jl:206–271`), both 2026-07,
-plus 1 tracked known divergence (tuple-over-union distributivity, which needs
-Julia's global union-decision machine; it self-reports if a fix makes it pass).
+`Int`→`Int64`) — currently 87/87 (all 2026-07): the unbounded-varargs slice
+added 19 cases (`test/subtype.jl:43–59,587–594`), the two-parameter `Pair`
+constructor added 8 invariant/`where`/diagonal cases (`:206–271`), and a
+curated expansion added 7 more bounded-typevar and diagonal `test_3` cases
+(`:205,214,238,241,264,267,273`) — expressible with the existing ABI and
+passing on the current engine, so they widen coverage without new code. Plus 1
+tracked known divergence (tuple-over-union distributivity, which needs Julia's
+global union-decision machine; it self-reports if a fix makes it pass).
 
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
