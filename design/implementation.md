@@ -286,7 +286,7 @@ normalization has the right overall algorithm.
 | `Union` | Partial | Faithful | normalized (`jl_type_union`): flatten, subtype-dedup, canonical sort with `union_sort_cmp`'s singleton/isbits tiers (fixed, audit 2026-06); dedup uses full `issubtype` vs the C's typevar-aware `simple_subtype`; type `===` needs structural `jl_types_egal` (Julia does **not** intern unions — `jl_type_union` builds fresh structs, `jltypes.c:706,759`); no `Vararg` merge |
 | `Bottom` | Partial | Faithful | a `DataType`; Julia uses a `TypeofBottom` instance (`jl_typeofbottom_type`, `jltypes.c:651`) |
 | `UnionAll` / `TypeVar` | Partial | Faithful | `jl_unionall_t`/`jl_tvar_t` objects (var + bounds + body); no `where`-var renaming/aliasing or `innervars` |
-| `Type{T}` kinds | Planned | Faithful | — |
+| `Type{T}` kinds | Partial | Faithful | landed 2026-07: an abstract `Type` builtin whose TypeName is shared by every uniqued `Type{T}` instantiation; `DataType`/`Union`/`UnionAll` re-supered under it (boot.jl); the kind rules of `subtype.c:2094–2121` (the pin phrases them on its TypeEq node — same semantics): `Type{X}` with concrete `X` dispatches as `typeof(X)` (so `Type{Int} <: DataType`), `Type{typevar}` reduces to `Kind <: y`, and `x <: Type{typevar}` requires `x` to be a kind, recursing as `Type{T'} where T'` to bind the variable; both-`Type{}` queries ride the ordinary invariant-parametric path. Oracle: `test/subtype.jl:536–551` (11 cases). Omitted: `TypeofBottom` (our `Bottom` is a plain DataType — the C's kind-rule exemption for it is achieved structurally by the `Bottom`-left fast path), the bare `Type` as `Type{T} where T` (ours is a bare abstract type — `Type <: Type{T} where T` diverges), the nested `Type{Type{T}}` rule (`:2113–2119`) |
 | Abstract `Tuple` (`jl_anytuple_type`) | Planned | Faithful | tuple super is `Any` for now |
 
 ## Subtyping — `subtype.c` vs `subtype.rs`
@@ -341,7 +341,7 @@ mapping is real: per-var `lb`/`ub` narrowing through
 
 Oracle: `runtime/verify_julia_subtype.mjs` runs assertions copied verbatim
 from JuliaLang/julia's own `test/subtype.jl` (mapping `Ref{T}`→`Box{T}`,
-`Int`→`Int64`) — currently 87/87 (all 2026-07): the unbounded-varargs slice
+`Int`→`Int64`) — currently 106/106 (all 2026-07): the unbounded-varargs slice
 added 19 cases (`test/subtype.jl:43–59,587–594`), the two-parameter `Pair`
 constructor added 8 invariant/`where`/diagonal cases (`:206–271`), and a
 curated expansion added 7 more bounded-typevar and diagonal `test_3` cases

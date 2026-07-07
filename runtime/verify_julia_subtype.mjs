@@ -24,7 +24,7 @@ const x = instance.exports;
 x.rj_init();
 
 // Builtin type ids (match runtime/src/types.rs `id`).
-const ID = { Any: 0, Number: 1, Real: 2, Integer: 3, Signed: 4, Float64: 21, Bool: 8, Int8: 9, Int16: 10, Int32: 11, Int64: 12, Char: 22, Bottom: 26 };
+const ID = { Any: 0, Number: 1, Real: 2, Integer: 3, Signed: 4, Float64: 21, Bool: 8, Int8: 9, Int16: 10, Int32: 11, Int64: 12, Char: 22, Bottom: 26, DataType: 25, UnionT: 28, TypeVarT: 30, UnionAllT: 31, Type: 34 };
 const ty = (id) => x.rj_builtin_type(id);
 
 // Julia type constructors mapped onto the runtime ABI.
@@ -45,6 +45,7 @@ const Tuple = (...ts) => {
 const Vararg = (t) => x.rj_vararg(t); // unbounded Vararg{t}
 const VarargN = (t, n) => x.rj_vararg_n(t, BigInt(n)); // Vararg{t, n}
 const Pair = (a, b) => x.rj_pair_type(a, b); // two-parameter invariant type
+const TypeT = (t) => x.rj_type_type(t); // Type{t}
 const Union = (a, b) => x.rj_union_type(a, b);
 const tvar = (lb, ub) => x.rj_typevar(lb ?? 0, ub ?? 0); // 0 => Bottom / Any
 const where = (v, body) => x.rj_unionall(v, body);
@@ -82,6 +83,31 @@ const cases = [
   ["L592 !issub(Tuple{Vararg{Int32}}, Tuple{Int32})", "notsub", () => [Tuple(Vararg(Int32)), Tuple(Int32)]],
   ["L593 !issub(Tuple{Vararg{Int32}}, Tuple{Number,Integer})", "notsub", () => [Tuple(Vararg(Int32)), Tuple(Number, Integer)]],
   ["L594 !issub(Tuple{Vararg{Integer}}, Tuple{Integer,Integer,Vararg{Integer}})", "notsub", () => [Tuple(Vararg(Integer)), Tuple(Integer, Integer, Vararg(Integer))]],
+
+  // --- Type{T} kinds (test at L536-551) ---
+  ["L536 issub_strict(DataType, Type)", "strict", () => [ty(ID.DataType), ty(ID.Type)]],
+  ["L537 issub_strict(Union, Type)", "strict", () => [ty(ID.UnionT), ty(ID.Type)]],
+  ["L538 issub_strict(UnionAll, Type)", "strict", () => [ty(ID.UnionAllT), ty(ID.Type)]],
+  ["L540 !issub(TypeVar, Type)", "notsub", () => [ty(ID.TypeVarT), ty(ID.Type)]],
+  ["L541 !issub(Type, TypeVar)", "notsub", () => [ty(ID.Type), ty(ID.TypeVarT)]],
+  ["L542 !issub(DataType, @UnionAll T<:Number Type{T})", "notsub", () => {
+    const T = tvar(0, Number);
+    return [ty(ID.DataType), where(T, TypeT(T))];
+  }],
+  ["L543 issub_strict(Type{Int}, DataType)", "strict", () => [TypeT(Int), ty(ID.DataType)]],
+  ["L544 !issub((@UnionAll T<:Integer Type{T}), DataType)", "notsub", () => {
+    const T = tvar(0, Integer);
+    return [where(T, TypeT(T)), ty(ID.DataType)];
+  }],
+  ["L546 !issub(Type{Int}, Type{Integer})", "notsub", () => [TypeT(Int), TypeT(Integer)]],
+  ["L547 issub((@UnionAll T<:Integer Type{T}), (@UnionAll T<:Number Type{T}))", "sub", () => {
+    const T = tvar(0, Integer), S = tvar(0, Number);
+    return [where(T, TypeT(T)), where(S, TypeT(S))];
+  }],
+  ["L551 !(DataType <: (@UnionAll T<:Type Type{T}))", "notsub", () => {
+    const T = tvar(0, ty(ID.Type));
+    return [ty(ID.DataType), where(T, TypeT(T))];
+  }],
 
   // --- fixed-count Vararg{T,N}: expands at construction (test_1) ---
   ["L61 isequal_type(Tuple{Int,Int}, Tuple{Vararg{Int,2}})", "equal", () => [Tuple(Int, Int), Tuple(VarargN(Int, 2))]],

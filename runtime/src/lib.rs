@@ -345,6 +345,13 @@ pub extern "C" fn rj_pair_type(a: u32, b: u32) -> u32 {
     types::pair_type(a as Offset, b as Offset)
 }
 
+/// Construct `Type{t}` (invariant, uniqued).
+#[no_mangle]
+pub extern "C" fn rj_type_type(t: u32) -> u32 {
+    ensure_init();
+    types::type_type(t as Offset)
+}
+
 /// Instantiate the `UnionAll` at `u` with the type `p` (`jl_instantiate_unionall`).
 #[no_mangle]
 pub extern "C" fn rj_instantiate(u: u32, p: u32) -> u32 {
@@ -627,6 +634,37 @@ mod tests {
         assert!(!types::issubtype(t(id::INT64), t(id::FLOAT64)));
         assert!(!types::issubtype(t(id::INT64), t(id::UNSIGNED)));
         assert!(!types::issubtype(t(id::NUMBER), t(id::INT64)));
+    }
+
+    #[test]
+    fn type_kind_subtyping() {
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+        let sub = types::issubtype;
+        let tt = types::type_type;
+        let (int, integer, datatype, ty) = (t(id::INT64), t(id::INTEGER), t(id::DATATYPE), t(id::TYPE));
+
+        // The kinds sit under Type (test/subtype.jl:536-538); TypeVar does not (:540).
+        assert!(sub(datatype, ty) && !sub(ty, datatype));
+        assert!(sub(t(id::UNION), ty));
+        assert!(sub(t(id::UNIONALL), ty));
+        assert!(!sub(t(id::TVAR), ty) && !sub(ty, t(id::TVAR)));
+        // Type{Int} dispatches as typeof(Int) (:543) and is invariant (:546).
+        assert!(sub(tt(int), datatype) && !sub(datatype, tt(int)));
+        assert!(!sub(tt(int), tt(integer)));
+        assert!(sub(tt(int), ty)); // Type{Int} <: Type via the shared name
+        assert_eq!(tt(int), tt(int)); // uniqued
+        // Type{T} where T<:Integer is not under DataType — a union's Type is
+        // not a DataType (:544); and Type{Int} binds an existential T (:547-ish).
+        let v = types::make_typevar("T", t(id::BOTTOM), integer);
+        let ua = types::unionall_type(v, tt(v));
+        assert!(!sub(ua, datatype));
+        assert!(sub(tt(int), {
+            let s = types::make_typevar("S", t(id::BOTTOM), t(id::ANY));
+            types::unionall_type(s, tt(s))
+        }));
+        assert_eq!(gc::root_count(), 0);
     }
 
     #[test]

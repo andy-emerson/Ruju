@@ -13,10 +13,10 @@
 //! `var_lt`/`var_gt` (narrowing a variable's bounds via `simple_meet` /
 //! `simple_join`), and the universal-vs-existential dispatch in `subtype`.
 //!
-//! Deliberately omitted for now (tracked in `design/implementation.md`): the diagonal
-//! rule (a covariant variable occurring twice is constrained to concrete
-//! types), `Type{T}` kinds, varargs, type intersection, and the depth-ordered
-//! handling of two interacting existentials. Union backtracking uses a simple
+//! Also ported: the diagonal rule, unbounded varargs in tuple tails, and the
+//! `Type{T}` kind rules (the pin's TypeEq semantics). Deliberately omitted for
+//! now (tracked in `design/implementation.md`): type intersection and the
+//! newer `Intersect`/`Loffset` machinery. Union backtracking uses a simple
 //! save/restore of the environment rather than Julia's union-state bit-stack
 //! iterator — equivalent on the cases handled here, but not the full machine.
 
@@ -129,6 +129,37 @@ fn sub(x: Offset, y: Offset, e: &mut Env, param: Param) -> bool {
     }
     if types::is_unionall(y) {
         return subtype_unionall(x, y, e, true, param);
+    }
+
+    // Kind rules for `Type{T}` (`subtype.c:2094-2121`; the pin phrases them on
+    // its TypeEq node — same semantics). Both-`Type{}` comparisons fall through
+    // to the ordinary invariant-parametric path below.
+    if types::is_type_type(x) && !types::is_type_type(y) {
+        let t0 = types::svec_ref(types::parameters_of(x), 0);
+        if !types::is_typevar(t0) {
+            // `Type{Int}` dispatches as the singleton type of its parameter:
+            // `subtype(jl_typeof(tp0), y)` — hence `Type{Int} <: DataType`.
+            return sub(crate::object::type_of(crate::object::Value(t0)), y, e, param);
+        }
+        // `Type{T}` over a typevar is the kind of every matching type:
+        // `Type{T} <: y` reduces to `Kind <: y` ("Type === Kind").
+        return sub(types::builtin(id::TYPE), y, e, param);
+    }
+    if types::is_type_type(y) && !types::is_type_type(x) {
+        let t0 = types::svec_ref(types::parameters_of(y), 0);
+        if types::is_typevar(t0) {
+            if !types::is_kind(x) {
+                return false;
+            }
+            // Every instance of a kind is a type: recurse as the full
+            // `Type{T'} where T'` against y, binding y's variable.
+            let v = types::make_typevar("T", types::builtin(id::BOTTOM), types::builtin(id::ANY));
+            let ua = types::unionall_type(v, types::type_type(v));
+            return sub(ua, y, e, param);
+        }
+        // `Type{Concrete}` has no broader non-`Type{}` subtypes. (The C exempts
+        // TypeofBottom; our Bottom already returned through the fast path.)
+        return false;
     }
 
     datatype_subtype(x, y, e, param)

@@ -92,7 +92,8 @@ pub mod id {
     pub const UNIONALL: u32 = 31; // jl_unionall_t: a `T where ...` type
     pub const VARARG: u32 = 32; // jl_vararg_t: the `Vararg{T}` tail of a tuple type
     pub const MODULE: u32 = 33; // jl_module_t: name, parent, bindings
-    pub const COUNT: usize = 34;
+    pub const TYPE: u32 = 34; // the abstract `Type`; `Type{T}` shares its TypeName
+    pub const COUNT: usize = 35;
 }
 
 /// Offsets of the bootstrapped core types and the immortal value permboxes.
@@ -309,6 +310,18 @@ pub fn bootstrap() {
     // `Module` (jl_module_t subset): name Symbol, parent Module, bindings
     // Array — all references, so ordinary layout-driven GC tracing suffices.
     types[id::MODULE as usize] = new_type(datatype, tn("Module"), any, 12, 0, &[0, 4, 8]);
+
+    // The abstract `Type`, and the kinds under it: Julia's `DataType`, `Union`,
+    // and `UnionAll` are subtypes of `Type` (boot.jl; `jl_type_type`). Ours is
+    // a bare abstract `Type` whose TypeName is shared by every `Type{T}`
+    // instantiation; the C's bare `Type` is `Type{T} where T` (recorded).
+    // The kinds' supertypes are patched here, after `Type` exists.
+    types[id::TYPE as usize] = new_type(datatype, tn("Type"), any, 0, FLAG_ABSTRACT, &[]);
+    for k in [id::DATATYPE, id::UNION, id::UNIONALL] {
+        unsafe {
+            (*dt(types[k as usize])).super_ = types[id::TYPE as usize];
+        }
+    }
 
     // 6. The shared tuple TypeName: every Tuple{...} type has this `name`, which
     //    is how tuples are identified (jl_tuple_typename). `Box` is a demo
@@ -592,6 +605,29 @@ pub fn array_type(elem: Offset) -> Offset {
 /// Whether `t` is an `Array{T}` type (`a->name == jl_array_typename`).
 pub fn is_array(t: Offset) -> bool {
     is_datatype(t) && name_of(t) == builtins().array_typename
+}
+
+/// Construct `Type{t}` (invariant in `t`), uniqued on the shared `Type`
+/// TypeName; its nominal supertype is the abstract `Type`.
+pub fn type_type(t: Offset) -> Offset {
+    let ty = builtin(id::TYPE);
+    apply_type(name_of(ty), ty, &[t])
+}
+
+/// Whether `t` is a `Type{T}` instantiation (`jl_is_type_type`): the shared
+/// `Type` TypeName *with* a parameter — the bare abstract `Type` is excluded.
+pub fn is_type_type(t: Offset) -> bool {
+    is_datatype(t)
+        && name_of(t) == name_of(builtin(id::TYPE))
+        && parameters_of(t) != NULL
+        && svec_len(parameters_of(t)) > 0
+}
+
+/// Whether `t` is a kind (`jl_is_kind`): the type of a type — `DataType`,
+/// `Union`, or `UnionAll` (Julia also counts `TypeofBottom`, which we do not
+/// model; our `Bottom` is a plain DataType, recorded).
+pub fn is_kind(t: Offset) -> bool {
+    t == builtin(id::DATATYPE) || t == builtin(id::UNION) || t == builtin(id::UNIONALL)
 }
 
 /// A link in a single-variable-at-a-time substitution environment
