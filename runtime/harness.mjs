@@ -253,6 +253,13 @@ check(
 x.rj_gc_collect();
 check("fresh memory after collect", x.rj_memory_len(x.rj_memory_new(ty(T.Int64), 8)), 8);
 
+// throw/catch e from source: the thrown value binds to the catch variable.
+check(
+  "source: throw(42) caught, e bound",
+  evalJulia("x = 0\ntry\nthrow(42)\ncatch e\nx = e\nend\nx"),
+  42n,
+);
+
 // Arrays from source: literals, 1-based indexing, push!/length, growth.
 check("source: [10,20,30][2]", evalJulia("a = [10, 20, 30]\na[2]"), 20n);
 check(

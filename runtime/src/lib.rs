@@ -974,6 +974,19 @@ mod tests {
         assert_eq!(run("x = 0\ntry\nx = 1 ÷ 0\ncatch\nx = 999\nend\nx"), 999);
         // No error: the body runs and the catch is skipped.
         assert_eq!(run("x = 0\ntry\nx = 6 ÷ 2\ncatch\nx = 999\nend\nx"), 3);
+        // throw(v) from source; catch e binds the thrown value.
+        assert_eq!(run("x = 0\ntry\nthrow(42)\ncatch e\nx = e\nend\nx"), 42);
+        // A thrown value can carry data through the handler.
+        assert_eq!(run("x = 0\ntry\nthrow(6 * 7)\ncatch e\nx = e + 1\nend\nx"), 43);
+        // An uncaught throw propagates out as an eval error.
+        assert!(crate::frontend::eval_source("throw(1)").is_err());
+        // A builtin error binds `nothing` to `catch e` (not a stale value):
+        // errors are not yet reified as exception objects (recorded).
+        let v = crate::frontend::eval_source(
+            "x = 0\ntry\nthrow(5)\ncatch e\nx = e\nend\ntry\nx = 1 ÷ 0\ncatch e\nx = e\nend\nx",
+        )
+        .unwrap();
+        assert_eq!(v.raw(), types::nothing_instance(), "builtin error binds nothing");
         assert_eq!(gc::root_count(), 0, "roots released after eval");
     }
 

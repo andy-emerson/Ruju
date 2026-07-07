@@ -273,9 +273,9 @@ enum SrcStmt {
     Expr(Expr),
     If(Expr, Vec<SrcStmt>, Vec<SrcStmt>),
     While(Expr, Vec<SrcStmt>),
-    /// `try <body> catch <handler> end`. The `catch e` variable and `finally`
-    /// are later slices, as is `throw` from source.
-    Try(Vec<SrcStmt>, Vec<SrcStmt>),
+    /// `try <body> catch [e] <handler> end`; the optional name binds the caught
+    /// exception. `finally` is a later slice.
+    Try(Vec<SrcStmt>, Option<String>, Vec<SrcStmt>),
     /// `var[index] = expr` (1-based `setindex!`).
     IndexAssign(String, Expr, Expr),
     /// `[mutable] struct Name; field[::Type]...; end`.
@@ -377,9 +377,17 @@ impl Parser {
                 self.next();
                 let body = self.parse_block()?;
                 self.expect(&Tok::Catch)?;
+                // `catch e` — an identifier before the newline names the exception.
+                let var = match self.peek().clone() {
+                    Tok::Ident(name) => {
+                        self.next();
+                        Some(name)
+                    }
+                    _ => None,
+                };
                 let handler = self.parse_block()?;
                 self.expect(&Tok::End)?;
-                Ok(SrcStmt::Try(body, handler))
+                Ok(SrcStmt::Try(body, var, handler))
             }
             Tok::Ident(name) if self.toks.get(self.pos + 1) == Some(&Tok::Assign) => {
                 self.next(); // identifier
@@ -675,6 +683,10 @@ impl Lower {
                 let (a0, a1) = if swap { (ro, lo) } else { (lo, ro) };
                 Op::Ssa(self.emit(Stmt::Call(b, vec![a0, a1])))
             }
+            Expr::Call(name, args) if name == "throw" && args.len() == 1 => {
+                let v = self.lower_expr(&args[0])?;
+                Op::Ssa(self.emit(Stmt::Throw(v)))
+            }
             Expr::Call(name, args) if name == "push!" && args.len() == 2 => {
                 let a = self.lower_expr(&args[0])?;
                 let v = self.lower_expr(&args[1])?;
@@ -759,16 +771,22 @@ impl Lower {
                 self.patch(gif, end);
                 None
             }
-            SrcStmt::Try(body, handler) => {
+            SrcStmt::Try(body, var, handler) => {
                 // Enter pushes the handler; on normal completion Leave pops it and
                 // Goto skips the catch block. A throw inside the body diverts to
-                // `catch_start` (patched below).
+                // `catch_start` (patched below), where `catch e` binds the
+                // exception before the handler runs.
                 let enter = self.emit(Stmt::Enter(0));
                 self.lower_block(body)?;
                 self.emit(Stmt::Leave(1));
                 let gend = self.emit(Stmt::Goto(0));
                 let catch_start = self.code.len();
                 self.patch(enter, catch_start);
+                if let Some(name) = var {
+                    let c = self.emit(Stmt::Caught);
+                    let slot = self.slot(name);
+                    self.emit(Stmt::Assign(slot, Op::Ssa(c)));
+                }
                 self.lower_block(handler)?;
                 let end = self.code.len();
                 self.patch(gend, end);

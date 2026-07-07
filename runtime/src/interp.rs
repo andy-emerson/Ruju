@@ -98,7 +98,6 @@ pub enum Stmt {
     /// Throw the operand value as an exception (`jl_throw`): divert to the
     /// innermost active handler, binding the value as the current exception; with
     /// no handler it propagates out of the frame.
-    #[allow(dead_code)] // the front-end wiring for `throw` is a later slice
     Throw(Op),
     /// `ssa[i] = [args...]` — a 1-D array literal: element type is the common
     /// concrete type of the elements, or `Any` when they differ (or none).
@@ -113,7 +112,6 @@ pub enum Stmt {
     Len(Op),
     /// Bind the current caught exception as this statement's SSA value
     /// (`Expr(:the_exception)` / `jl_current_exception`), for `catch e`.
-    #[allow(dead_code)] // the front-end wiring for `catch e` is a later slice
     Caught,
 }
 
@@ -229,7 +227,11 @@ pub fn eval_with_args(body: &Body, args: &[Value]) -> Result<Value, String> {
                 Ok(v) => v,
                 Err(e) => {
                     if let Some(catch_ip) = handlers.pop() {
-                        let _ = e; // the exception value binding (`catch e`) is a later slice
+                        // Builtin errors are not yet reified as exception
+                        // objects (rtutils.c is Planned): `catch e` binds
+                        // `nothing`, set freshly so no stale exception leaks in.
+                        let _ = e;
+                        frame.set(exc_slot, Value(types::nothing_instance()));
                         ip = catch_ip;
                         continue;
                     }
