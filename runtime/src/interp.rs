@@ -100,6 +100,17 @@ pub enum Stmt {
     /// no handler it propagates out of the frame.
     #[allow(dead_code)] // the front-end wiring for `throw` is a later slice
     Throw(Op),
+    /// `ssa[i] = [args...]` — a 1-D array literal: element type is the common
+    /// concrete type of the elements, or `Any` when they differ (or none).
+    ArrayLit(Vec<Op>),
+    /// `ssa[i] = a[idx]` — 1-based `getindex` over `arrayref`.
+    ArrayRef(Op, Op),
+    /// `a[idx] = rhs` (1-based `setindex!`); the statement's value is `rhs`.
+    ArraySet(Op, Op, Op),
+    /// `push!(a, v)`; the statement's value is the array.
+    Push(Op, Op),
+    /// `ssa[i] = length(a)`.
+    Len(Op),
     /// Bind the current caught exception as this statement's SSA value
     /// (`Expr(:the_exception)` / `jl_current_exception`), for `catch e`.
     #[allow(dead_code)] // the front-end wiring for `catch e` is a later slice
@@ -324,7 +335,78 @@ pub fn eval_with_args(body: &Body, args: &[Value]) -> Result<Value, String> {
             Stmt::Caught => {
                 frame.set(ssa_base + ip, frame.get(exc_slot));
             }
+            Stmt::ArrayLit(args) => {
+                let argf = Frame::new(args.len());
+                for (j, op) in args.iter().enumerate() {
+                    argf.set(j, read_op(*op, &frame, ssa_base));
+                }
+                // Common concrete element type, or Any (Julia's typed literals
+                // come from base/'s promotion; this is the bootstrap subset).
+                let any = types::builtin(id::ANY);
+                let elem = if args.is_empty() {
+                    any
+                } else {
+                    let t0 = object::type_of(argf.get(0));
+                    if (1..args.len()).all(|j| object::type_of(argf.get(j)) == t0) {
+                        t0
+                    } else {
+                        any
+                    }
+                };
+                let a = guard!(crate::array::alloc_1d(elem, args.len() as u32));
+                for j in 0..args.len() {
+                    guard!(crate::array::aset(a, j as u32, argf.get(j)));
+                }
+                drop(argf);
+                frame.set(ssa_base + ip, a);
+            }
+            Stmt::ArrayRef(a, idx) => {
+                let (av, i) = (read_op(*a, &frame, ssa_base), read_op(*idx, &frame, ssa_base));
+                let r = guard!(index_checked(av, i).and_then(|i0| crate::array::aref(av, i0)));
+                frame.set(ssa_base + ip, r);
+            }
+            Stmt::ArraySet(a, idx, rhs) => {
+                let (av, i) = (read_op(*a, &frame, ssa_base), read_op(*idx, &frame, ssa_base));
+                let r = read_op(*rhs, &frame, ssa_base);
+                guard!(index_checked(av, i).and_then(|i0| crate::array::aset(av, i0, r)));
+                frame.set(ssa_base + ip, r);
+            }
+            Stmt::Push(a, v) => {
+                let av = read_op(*a, &frame, ssa_base);
+                let vv = read_op(*v, &frame, ssa_base);
+                guard!(expect_array(av));
+                guard!(crate::array::push(av, vv));
+                frame.set(ssa_base + ip, av);
+            }
+            Stmt::Len(a) => {
+                let av = read_op(*a, &frame, ssa_base);
+                guard!(expect_array(av));
+                frame.set(ssa_base + ip, box_int(crate::array::len(av) as i64));
+            }
         }
         ip += 1;
     }
+}
+
+/// `v` must be an array (a `MethodError` otherwise, in spirit).
+fn expect_array(v: Value) -> Result<(), String> {
+    if types::is_array(object::type_of(v)) {
+        Ok(())
+    } else {
+        Err("MethodError: expected an Array".to_string())
+    }
+}
+
+/// Convert a 1-based boxed index into a checked 0-based one.
+fn index_checked(a: Value, i: Value) -> Result<u32, String> {
+    expect_array(a)?;
+    let i = unbox_int(i);
+    if i < 1 || i > crate::array::len(a) as i64 {
+        return Err(format!(
+            "BoundsError: attempt to access {}-element Array at index [{}]",
+            crate::array::len(a),
+            i
+        ));
+    }
+    Ok((i - 1) as u32)
 }

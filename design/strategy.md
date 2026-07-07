@@ -147,7 +147,7 @@ Unblocked now, in no required order — pick by the selection principles below.
 
 | Increment | What it is | What it unblocks |
 | - | - | - |
-| **arrays & GenericMemory** | ~~`GenericMemory` core~~ (landed 2026-07: the linear-memory buffer, get/set/length, GC element tracing + barrier); remaining: the `Array` wrapper (`array.c`) — `arrayref`/`arrayset`, growth (`push!`), front-end syntax | most real Julia programs; `base/` code |
+| **arrays & GenericMemory** | landed 2026-07: ~~`GenericMemory` core~~ (the linear-memory buffer, get/set/length, GC element tracing + barrier), ~~1-D `Array` + growth~~ (`jl_array_grow_end`), ~~front-end syntax~~ (`[literals]`, `a[i]`, `push!`, `length`); remaining depth: N-D arrays, `popfirst!`/`deleteat!` (offset motion), shared views, isbits-struct/union elements | most real Julia programs; `base/` code |
 | **modules & bindings** | `module.c`/`toplevel.c`: globals, bindings, top-level eval beyond expressions | `base/` code; method definitions from source |
 | **subtype expressibility** | landed 2026-07 (oracle 53→89): ~~unbounded varargs in tuples~~, ~~two-parameter `Pair` (multi-param invariant/diagonal)~~, ~~curated bounded/diagonal `test_3` expansion~~; remaining: bounded `Vararg{T,N}`, `Type{T}` kinds, `UnionAll` instantiation in `apply_type` — bounded slices, each unlocking a tranche of `test/subtype.jl` for the oracle | grows the oracle toward the coverage the **engine slice** needs to be measurable; varargs also feeds dispatch |
 | **exceptions** | `enter`/`leave` in the interpreter (`interpreter.c`), error throwing (`rtutils.c`) | real lowering; `base/` code throws |

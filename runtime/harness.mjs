@@ -253,6 +253,19 @@ check(
 x.rj_gc_collect();
 check("fresh memory after collect", x.rj_memory_len(x.rj_memory_new(ty(T.Int64), 8)), 8);
 
+// Arrays from source: literals, 1-based indexing, push!/length, growth.
+check("source: [10,20,30][2]", evalJulia("a = [10, 20, 30]\na[2]"), 20n);
+check(
+  "source: push!-driven sum of squares",
+  evalJulia("a = []\ni = 1\nwhile i <= 20\npush!(a, i * i)\ni = i + 1\nend\ns = 0\nj = 1\nwhile j <= length(a)\ns = s + a[j]\nj = j + 1\nend\ns"),
+  2870n,
+);
+check(
+  "source: BoundsError caught by try/catch",
+  evalJulia("a = [1]\nx = 0\ntry\nx = a[2]\ncatch\nx = 777\nend\nx"),
+  777n,
+);
+
 // --- Array{T}: the growable wrapper over GenericMemory ---
 const arr = x.rj_array_new(ty(T.Int64), 0);
 check("Array{Int64}() allocates empty", x.rj_array_len(arr), 0);

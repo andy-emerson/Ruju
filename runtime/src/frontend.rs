@@ -42,6 +42,8 @@ enum Tok {
     Assign,
     LParen,
     RParen,
+    LBracket,
+    RBracket,
     Dot,
     Comma,
     ColonColon,
@@ -131,6 +133,14 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 out.push(Tok::RParen);
                 i += 1;
             }
+            b'[' => {
+                out.push(Tok::LBracket);
+                i += 1;
+            }
+            b']' => {
+                out.push(Tok::RBracket);
+                i += 1;
+            }
             b'<' => {
                 if b.get(i + 1) == Some(&b'<') {
                     out.push(Tok::Shl);
@@ -193,6 +203,10 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
                     i += 1;
                 }
+                // Julia identifiers may end in `!` (mutating convention: push!).
+                while i < b.len() && b[i] == b'!' {
+                    i += 1;
+                }
                 out.push(match &src[s..i] {
                     "if" => Tok::If,
                     "else" => Tok::Else,
@@ -246,6 +260,10 @@ enum Expr {
     Call(String, Vec<Expr>),
     /// `base.field` — field access.
     Field(Box<Expr>, String),
+    /// `[e1, e2, ...]` — a 1-D array literal.
+    ArrayLit(Vec<Expr>),
+    /// `base[index]` — 1-based indexing.
+    Index(Box<Expr>, Box<Expr>),
 }
 
 enum SrcStmt {
@@ -258,6 +276,8 @@ enum SrcStmt {
     /// `try <body> catch <handler> end`. The `catch e` variable and `finally`
     /// are later slices, as is `throw` from source.
     Try(Vec<SrcStmt>, Vec<SrcStmt>),
+    /// `var[index] = expr` (1-based `setindex!`).
+    IndexAssign(String, Expr, Expr),
     /// `[mutable] struct Name; field[::Type]...; end`.
     StructDef { name: String, mutabl: bool, fields: Vec<(String, Option<String>)> },
 }
@@ -365,6 +385,23 @@ impl Parser {
                 self.next(); // identifier
                 self.next(); // `=`
                 Ok(SrcStmt::Assign(name, self.parse_expr()?))
+            }
+            // `var[index] = expr` — tried speculatively: if no `=` follows the
+            // closing `]`, rewind and let the expression path have it.
+            Tok::Ident(name) if self.toks.get(self.pos + 1) == Some(&Tok::LBracket) => {
+                let save = self.pos;
+                self.next(); // identifier
+                self.next(); // `[`
+                let idx = self.parse_expr()?;
+                if *self.peek() == Tok::RBracket
+                    && self.toks.get(self.pos + 1) == Some(&Tok::Assign)
+                {
+                    self.next(); // `]`
+                    self.next(); // `=`
+                    return Ok(SrcStmt::IndexAssign(name, idx, self.parse_expr()?));
+                }
+                self.pos = save;
+                Ok(SrcStmt::Expr(self.parse_expr()?))
             }
             _ => Ok(SrcStmt::Expr(self.parse_expr()?)),
         }
@@ -482,6 +519,12 @@ impl Parser {
                         t => return Err(format!("expected field name after `.`, found {:?}", t)),
                     }
                 }
+                Tok::LBracket => {
+                    self.next();
+                    let idx = self.parse_expr()?;
+                    self.expect(&Tok::RBracket)?;
+                    e = Expr::Index(Box::new(e), Box::new(idx));
+                }
                 _ => break,
             }
         }
@@ -517,6 +560,22 @@ impl Parser {
                 let e = self.parse_expr()?;
                 self.expect(&Tok::RParen)?;
                 Ok(e)
+            }
+            Tok::LBracket => {
+                let mut elems = Vec::new();
+                if *self.peek() == Tok::RBracket {
+                    self.next();
+                } else {
+                    loop {
+                        elems.push(self.parse_expr()?);
+                        match self.next() {
+                            Tok::Comma => continue,
+                            Tok::RBracket => break,
+                            t => return Err(format!("expected `,` or `]`, found {:?}", t)),
+                        }
+                    }
+                }
+                Ok(Expr::ArrayLit(elems))
             }
             Tok::Minus => Ok(Expr::Bin(BinOp::Sub, Box::new(Expr::Int(0)), Box::new(self.parse_atom()?))),
             t => Err(format!("unexpected token {:?}", t)),
@@ -616,6 +675,15 @@ impl Lower {
                 let (a0, a1) = if swap { (ro, lo) } else { (lo, ro) };
                 Op::Ssa(self.emit(Stmt::Call(b, vec![a0, a1])))
             }
+            Expr::Call(name, args) if name == "push!" && args.len() == 2 => {
+                let a = self.lower_expr(&args[0])?;
+                let v = self.lower_expr(&args[1])?;
+                Op::Ssa(self.emit(Stmt::Push(a, v)))
+            }
+            Expr::Call(name, args) if name == "length" && args.len() == 1 => {
+                let a = self.lower_expr(&args[0])?;
+                Op::Ssa(self.emit(Stmt::Len(a)))
+            }
             Expr::Call(name, args) => {
                 let t = resolve_type(name)?;
                 let ops = args.iter().map(|a| self.lower_expr(a)).collect::<Result<Vec<_>, _>>()?;
@@ -625,6 +693,15 @@ impl Lower {
                 let b = self.lower_expr(base)?;
                 let sym = crate::symbol::intern(crate::types::builtin(crate::types::id::SYMBOL), fname);
                 Op::Ssa(self.emit(Stmt::GetField(b, sym)))
+            }
+            Expr::ArrayLit(elems) => {
+                let ops = elems.iter().map(|e| self.lower_expr(e)).collect::<Result<Vec<_>, _>>()?;
+                Op::Ssa(self.emit(Stmt::ArrayLit(ops)))
+            }
+            Expr::Index(base, idx) => {
+                let b = self.lower_expr(base)?;
+                let i = self.lower_expr(idx)?;
+                Op::Ssa(self.emit(Stmt::ArrayRef(b, i)))
             }
         })
     }
@@ -650,6 +727,13 @@ impl Lower {
                 let obj = Op::Slot(self.slot(var));
                 let sym = crate::symbol::intern(crate::types::builtin(crate::types::id::SYMBOL), field);
                 self.emit(Stmt::SetField(obj, sym, rhs));
+                Some(rhs)
+            }
+            SrcStmt::IndexAssign(var, idx, e) => {
+                let i = self.lower_expr(idx)?;
+                let rhs = self.lower_expr(e)?;
+                let a = Op::Slot(self.slot(var));
+                self.emit(Stmt::ArraySet(a, i, rhs));
                 Some(rhs)
             }
             SrcStmt::Expr(e) => Some(self.lower_expr(e)?),

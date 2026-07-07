@@ -945,6 +945,27 @@ mod tests {
     }
 
     #[test]
+    fn source_arrays_end_to_end() {
+        let _g = serial();
+        rj_init();
+        let run = |s: &str| crate::value::unbox_int(crate::frontend::eval_source(s).unwrap());
+        // Literal, 1-based indexing, and setindex!.
+        assert_eq!(run("a = [10, 20, 30]\na[2]"), 20);
+        assert_eq!(run("a = [1, 2, 3]\na[1] = 99\na[1] + a[3]"), 102);
+        // length and push! (whose statement value is the array).
+        assert_eq!(run("a = [1, 2]\nlength(a)"), 2);
+        assert_eq!(run("a = [5]\npush!(a, 6)\npush!(a, 7)\na[3] * length(a)"), 21);
+        // A push!-driven sum loop: literals + growth + indexing together.
+        assert_eq!(
+            run("a = []\ni = 1\nwhile i <= 50\npush!(a, i * i)\ni = i + 1\nend\ns = 0\nj = 1\nwhile j <= length(a)\ns = s + a[j]\nj = j + 1\nend\ns"),
+            (1..=50i64).map(|k| k * k).sum::<i64>()
+        );
+        // An out-of-bounds read is a catchable BoundsError.
+        assert_eq!(run("a = [1]\nx = 0\ntry\nx = a[2]\ncatch\nx = 777\nend\nx"), 777);
+        assert_eq!(gc::root_count(), 0, "roots released after eval");
+    }
+
+    #[test]
     fn source_try_catch_recovers() {
         let _g = serial();
         rj_init();
