@@ -197,21 +197,42 @@ fn apply(b: Builtin, args: &Frame) -> Result<Value, String> {
 
 /// Evaluate `body` with no arguments.
 pub fn eval(body: &Body) -> Result<Value, String> {
-    eval_with_args(body, &[])
+    eval_core(body, &[], |_| Ok(()))
 }
 
 /// Evaluate `body`, binding `args` to its leading slots (a method invocation).
-/// The slots and SSA values live in one GC frame and are roots throughout; each
-/// call's argument temporaries get their own short-lived frame. `Err` carries
-/// a would-be exception upward until real exception handling exists.
 pub fn eval_with_args(body: &Body, args: &[Value]) -> Result<Value, String> {
+    let seeds: Vec<(usize, Value)> = args.iter().copied().enumerate().collect();
+    eval_core(body, &seeds, |_| Ok(()))
+}
+
+/// Evaluate a top-level `body`: seed the given slots first (globals flowing
+/// in), and pass the frame to `flush` at successful return — while it is still
+/// rooted — so final slot values can flow out to module bindings.
+pub fn eval_toplevel(
+    body: &Body,
+    seed: &[(usize, Value)],
+    flush: impl FnOnce(&Frame) -> Result<(), String>,
+) -> Result<Value, String> {
+    eval_core(body, seed, flush)
+}
+
+/// The interpreter core: seeded slots, the ip loop, and a rooted flush hook at
+/// the return point. The slots and SSA values live in one GC frame and are
+/// roots throughout; each call's argument temporaries get their own
+/// short-lived frame. `Err` carries an uncaught exception out of the frame.
+fn eval_core(
+    body: &Body,
+    seed: &[(usize, Value)],
+    flush: impl FnOnce(&Frame) -> Result<(), String>,
+) -> Result<Value, String> {
     let ssa_base = body.nslots;
     // One extra slot past the SSA values holds the current caught exception, so
     // it stays rooted (in the frame) across allocations inside a catch block.
     let exc_slot = body.nslots + body.code.len();
     let frame = Frame::new(exc_slot + 1);
-    for (i, &a) in args.iter().enumerate() {
-        frame.set(i, a);
+    for &(i, v) in seed {
+        frame.set(i, v);
     }
 
     let mut ip = 0usize;
@@ -254,7 +275,12 @@ pub fn eval_with_args(body: &Body, args: &[Value]) -> Result<Value, String> {
                 }
             }
             Stmt::Return(op) => {
-                return Ok(read_op(*op, &frame, ssa_base));
+                let v = read_op(*op, &frame, ssa_base);
+                let root = crate::gc::Rooted::new(v); // survives flush allocations
+                flush(&frame)?;
+                let v = root.get();
+                drop(root);
+                return Ok(v);
             }
             Stmt::Assign(slot, op) => {
                 let v = read_op(*op, &frame, ssa_base);

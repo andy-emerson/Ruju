@@ -560,6 +560,9 @@ fn push_roots(work: &mut Vec<Value>) {
     work.push(Value(b.pair_typename)); // demo two-parameter constructor
     work.push(Value(b.memory_typename)); // shared across all GenericMemory types
     work.push(Value(b.array_typename)); // shared across all Array types
+    if crate::module::main_offset() != region::NULL {
+        work.push(Value(crate::module::main_offset())); // the Main module
+    }
     crate::symbol::each_interned(|s| work.push(Value(s))); // symbols are immortal
     crate::dispatch::each_sig(|s| work.push(Value(s))); // method signatures
     crate::types::each_registered_struct(|t| work.push(Value(t))); // source-defined types

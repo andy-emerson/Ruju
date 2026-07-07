@@ -17,6 +17,7 @@ mod object;
 mod region;
 mod array;
 mod memory;
+mod module;
 mod subtype;
 mod symbol;
 mod types;
@@ -37,6 +38,7 @@ fn init_runtime() {
     gc::reset_heap();
     dispatch::reset();
     types::bootstrap();
+    module::init_main();
     install_methods();
 }
 
@@ -942,6 +944,31 @@ mod tests {
         };
         assert!(eval(&uncaught).is_err());
         assert_eq!(gc::root_count(), 0, "roots released after eval");
+    }
+
+    #[test]
+    fn toplevel_globals_persist_in_main() {
+        let _g = serial();
+        rj_init();
+        let run = |s: &str| crate::value::unbox_int(crate::frontend::eval_source(s).unwrap());
+        // A top-level assignment binds a Main global that later evals see.
+        assert_eq!(run("gx = 41"), 41);
+        assert_eq!(run("gx + 1"), 42);
+        // Rebinding replaces the value; heap values (arrays) persist too, and
+        // survive the collections later evals may trigger.
+        assert_eq!(run("gx = 5"), 5);
+        assert_eq!(run("ga = [1, 2, 3]\nga[3]"), 3);
+        gc::collect_full();
+        assert_eq!(run("push!(ga, gx)\nga[4] + length(ga)"), 9);
+        // The module API agrees with what source-level eval sees.
+        let main = Value(crate::module::main_offset());
+        let sym = crate::symbol::intern(types::builtin(id::SYMBOL), "gx");
+        let v = crate::module::get_global(main, sym).expect("gx is bound");
+        assert_eq!(crate::value::unbox_int(v), 5);
+        // Unbound names are None, not garbage.
+        let missing = crate::symbol::intern(types::builtin(id::SYMBOL), "nope");
+        assert!(crate::module::get_global(main, missing).is_none());
+        assert_eq!(gc::root_count(), 0);
     }
 
     #[test]

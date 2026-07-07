@@ -91,7 +91,8 @@ pub mod id {
     pub const TVAR: u32 = 30; // jl_tvar_t: a `where` type variable
     pub const UNIONALL: u32 = 31; // jl_unionall_t: a `T where ...` type
     pub const VARARG: u32 = 32; // jl_vararg_t: the `Vararg{T}` tail of a tuple type
-    pub const COUNT: usize = 33;
+    pub const MODULE: u32 = 33; // jl_module_t: name, parent, bindings
+    pub const COUNT: usize = 34;
 }
 
 /// Offsets of the bootstrapped core types and the immortal value permboxes.
@@ -304,6 +305,9 @@ pub fn bootstrap() {
     // tail of a tuple type. We represent only the unbounded form (element T@0,
     // the count parameter N absent); `Vararg{T,N}` is not yet modelled.
     types[id::VARARG as usize] = new_type(datatype, tn("Vararg"), any, 4, 0, &[0]);
+    // `Module` (jl_module_t subset): name Symbol, parent Module, bindings
+    // Array — all references, so ordinary layout-driven GC tracing suffices.
+    types[id::MODULE as usize] = new_type(datatype, tn("Module"), any, 12, 0, &[0, 4, 8]);
 
     // 6. The shared tuple TypeName: every Tuple{...} type has this `name`, which
     //    is how tuples are identified (jl_tuple_typename). `Box` is a demo

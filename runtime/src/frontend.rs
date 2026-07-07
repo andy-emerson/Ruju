@@ -819,7 +819,7 @@ impl Lower {
     }
 }
 
-fn lower_program(stmts: &[SrcStmt]) -> Result<Body, String> {
+fn lower_program(stmts: &[SrcStmt]) -> Result<(Body, HashMap<String, usize>), String> {
     let mut l = Lower {
         code: Vec::new(),
         slots: HashMap::new(),
@@ -828,10 +828,13 @@ fn lower_program(stmts: &[SrcStmt]) -> Result<Body, String> {
     let last = l.lower_block(stmts)?;
     let ret = last.unwrap_or(Op::Int(0));
     l.emit(Stmt::Return(ret));
-    Ok(Body {
-        nslots: l.nslots,
-        code: l.code,
-    })
+    Ok((
+        Body {
+            nslots: l.nslots,
+            code: l.code,
+        },
+        l.slots,
+    ))
 }
 
 /// Resolve a type name from source: the builtin tower by name, then the
@@ -869,9 +872,34 @@ fn resolve_type(name: &str) -> Result<crate::region::Offset, String> {
 }
 
 /// Parse, lower, and evaluate a Julia source string, returning its value.
+///
+/// Top-level variables are `Main` globals, REPL-style: named slots seed from
+/// existing bindings before evaluation and flush back on success
+/// (`jl_get_global`/`jl_set_global`), so state persists across `rj_eval`
+/// calls. Real toplevel scoping (`toplevel.c`, hard/soft scope) arrives with
+/// real lowering — this is the bootstrap front-end's divergence.
 pub fn eval_source(src: &str) -> Result<Value, String> {
     let toks = lex(src)?;
     let mut parser = Parser { toks, pos: 0 };
     let program = parser.parse_program()?;
-    interp::eval(&lower_program(&program)?)
+    let (body, names) = lower_program(&program)?;
+    let main = Value(crate::module::main_offset());
+    let symbol_t = crate::types::builtin(crate::types::id::SYMBOL);
+    let mut seed: Vec<(usize, Value)> = Vec::new();
+    for (name, &slot) in &names {
+        let sym = crate::symbol::intern(symbol_t, name);
+        if let Some(v) = crate::module::get_global(main, sym) {
+            seed.push((slot, v));
+        }
+    }
+    interp::eval_toplevel(&body, &seed, |frame| {
+        for (name, &slot) in &names {
+            let v = frame.get(slot);
+            if !v.is_null() {
+                let sym = crate::symbol::intern(symbol_t, name);
+                crate::module::set_global(main, sym, v)?;
+            }
+        }
+        Ok(())
+    })
 }

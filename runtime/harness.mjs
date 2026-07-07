@@ -253,6 +253,10 @@ check(
 x.rj_gc_collect();
 check("fresh memory after collect", x.rj_memory_len(x.rj_memory_new(ty(T.Int64), 8)), 8);
 
+// Top-level globals: bindings in Main persist across separate rj_eval calls.
+check("source: global gx = 41", evalJulia("gx = 41"), 41n);
+check("source: gx visible in a later eval", evalJulia("gx + 1"), 42n);
+
 // throw/catch e from source: the thrown value binds to the catch variable.
 check(
   "source: throw(42) caught, e bound",

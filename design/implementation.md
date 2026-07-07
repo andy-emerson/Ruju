@@ -546,13 +546,13 @@ strategy's "GC exactness & tuning" frontier item).**
 | Scheduler | Planned | Faithful | — |
 | Locks / atomics | Planned | Faithful | WASM atomics exist |
 
-## Modules & top level — `module.c`, `toplevel.c`
+## Modules & top level — `module.c`, `toplevel.c` vs `module.rs`
 
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
-| Modules & bindings | Planned | Faithful | — |
-| Global variables | Planned | Faithful | — |
-| Top-level eval | Partial | Faithful | the front-end evaluates expressions; no module/global system |
+| Modules & bindings | Partial | Faithful | core landed (modules slice 1, 2026-07), `module.rs`: `jl_module_t` subset `{name, parent, bindings}` (`julia.h` — the C additionally carries the `bindingkeyset` hash index, usings, world-age binding partitions, uuids); `jl_new_module` (`module.c:674`, `Main` self-parents); `get_global`/`set_global` per `jl_get_global`/`jl_set_global` (`:1664,1670`) minus world age and constness. Bindings live in an `Array{Any}` of `[symbol, value]` pairs — same reachability shape as the C's svec-of-bindings (module → table → values, stores barriered), linear scan instead of the hash keyset, no `jl_binding_t` objects (recorded) |
+| Global variables | Partial | Faithful | `Main` created at init and pinned as a GC root; global heap values survive collections across evals |
+| Top-level eval | Partial | **Divergence** | REPL-style: `eval_source` seeds named slots from `Main` bindings and flushes them back at successful return (while the frame is rooted) — state persists across `rj_eval` calls end-to-end (`harness.mjs`). Julia's real toplevel (`toplevel.c` thunks, hard/soft scope, `global` declarations) arrives with real lowering; flushing only on success is a further recorded simplification |
 | Imports / exports | Planned | Faithful | — |
 
 ## Runtime utilities — `rtutils.c`, `iddict.c`, `idset.c`, `smallintset.c`
