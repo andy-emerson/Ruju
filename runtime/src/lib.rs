@@ -655,6 +655,32 @@ mod tests {
     }
 
     #[test]
+    fn interpreter_catch_binds_the_exception() {
+        use crate::interp::{eval, Body, Op, Stmt};
+        let _g = serial();
+        rj_init();
+        // try; throw(42); catch e; return e; end
+        let body = Body {
+            nslots: 0,
+            code: vec![
+                Stmt::Enter(2),         // 0: catch at ip 2
+                Stmt::Throw(Op::Int(42)), // 1: throw 42 -> ip 2
+                Stmt::Caught,           // 2: (catch) ssa2 = the exception
+                Stmt::Return(Op::Ssa(2)), // 3: return e
+            ],
+        };
+        let e = eval(&body).expect("the caught exception is bound");
+        assert_eq!(crate::value::unbox_int(e), 42);
+        // An uncaught throw propagates out of the frame.
+        let uncaught = Body {
+            nslots: 0,
+            code: vec![Stmt::Throw(Op::Int(7))],
+        };
+        assert!(eval(&uncaught).is_err());
+        assert_eq!(gc::root_count(), 0, "roots released after eval");
+    }
+
+    #[test]
     fn primitive_sizes_match_julia() {
         let _g = serial();
         rj_init();

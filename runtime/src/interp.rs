@@ -97,6 +97,15 @@ pub enum Stmt {
     /// (`:leave`, `interpreter.c:608`).
     #[allow(dead_code)] // the front-end wiring for `try`/`catch` is the next slice
     Leave(usize),
+    /// Throw the operand value as an exception (`jl_throw`): divert to the
+    /// innermost active handler, binding the value as the current exception; with
+    /// no handler it propagates out of the frame.
+    #[allow(dead_code)] // the front-end wiring for `throw` is a later slice
+    Throw(Op),
+    /// Bind the current caught exception as this statement's SSA value
+    /// (`Expr(:the_exception)` / `jl_current_exception`), for `catch e`.
+    #[allow(dead_code)] // the front-end wiring for `catch e` is a later slice
+    Caught,
 }
 
 /// A lowered method body: its statements and its number of local slots. For a
@@ -190,7 +199,10 @@ pub fn eval(body: &Body) -> Result<Value, String> {
 /// a would-be exception upward until real exception handling exists.
 pub fn eval_with_args(body: &Body, args: &[Value]) -> Result<Value, String> {
     let ssa_base = body.nslots;
-    let frame = Frame::new(body.nslots + body.code.len());
+    // One extra slot past the SSA values holds the current caught exception, so
+    // it stays rooted (in the frame) across allocations inside a catch block.
+    let exc_slot = body.nslots + body.code.len();
+    let frame = Frame::new(exc_slot + 1);
     for (i, &a) in args.iter().enumerate() {
         frame.set(i, a);
     }
@@ -301,6 +313,18 @@ pub fn eval_with_args(body: &Body, args: &[Value]) -> Result<Value, String> {
                 for _ in 0..*n {
                     handlers.pop();
                 }
+            }
+            Stmt::Throw(op) => {
+                let exc = read_op(*op, &frame, ssa_base);
+                if let Some(catch_ip) = handlers.pop() {
+                    frame.set(exc_slot, exc); // rooted in the frame across the catch block
+                    ip = catch_ip;
+                    continue;
+                }
+                return Err("uncaught exception".to_string());
+            }
+            Stmt::Caught => {
+                frame.set(ssa_base + ip, frame.get(exc_slot));
             }
         }
         ip += 1;
