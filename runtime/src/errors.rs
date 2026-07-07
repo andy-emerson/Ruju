@@ -4,7 +4,7 @@
 //! construct them: `DivideError`/`UndefRefError`/`OutOfMemoryError` return the
 //! bootstrap singletons (boot.jl declares them fieldless), `BoundsError`
 //! carries the container and the (1-based) index as its `a`/`i` fields
-//! (`jl_bounds_error`, `rtutils.c:190`), and `ErrorException` carries a
+//! (`jl_bounds_error_int`, `rtutils.c:222`), and `ErrorException` carries a
 //! message — an interned `Symbol` until a `String` type exists (a recorded
 //! adaptation; interning unique messages pins them immortally, acceptable for
 //! the bootstrap front-end's error volume).
@@ -13,7 +13,7 @@ use crate::gc::Rooted;
 use crate::object::{self, Value};
 use crate::types::{self, id};
 
-/// The `DivideError()` singleton (`jl_divide_by_zero_error`).
+/// The `DivideError()` singleton (`jl_diverror_exception`).
 pub fn divide_error() -> Value {
     Value(types::instance_of(types::builtin(id::DIVIDEERROR)))
 }

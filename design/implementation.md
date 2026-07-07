@@ -285,18 +285,31 @@ normalization has the right overall algorithm.
    instantiates the wrapper's declared super with the parameters
    (`inst_type_w_` on `dt->super`, `jltypes.c:2554–2555`).
 9. The primitive tower omits `BFloat16 <: AbstractFloat` (in `boot.jl`).
+22. **The `AbstractArray` tower is absent (open, audit 2026-07).**
+    `array_type`/`memory_type` instantiate with super `Any`
+    (`types.rs:612–628`); `boot.jl` places `Array{T,N} <: DenseArray{T,N} <:
+    AbstractArray{T,N}` (`boot.jl:56–57,76`) and `GenericMemory` under
+    `DenseVector` (`:62`). None of the three abstract types exist in the
+    bootstrap. The hierarchy row is downgraded to Partial until they land.
+23. Fixed-count `Vararg{T,N}` expansion at construction is **unconditional**;
+    the C expands only when `nt == 0 || !jl_has_free_typevars(va0)`
+    (`jltypes.c:2361`), so `Tuple{Vararg{T,2}}` with a free `T` stays a
+    `Vararg` upstream but expands to `Tuple{T,T}` here. Deliberately kept —
+    it is what guarantees the engine never sees a ground fixed-N vararg —
+    and heals with the typevar-N slice (engine slice 3). Recorded, audit
+    2026-07.
 
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
 | `jl_init_types` bootstrap | Done | Faithful | incl. the `DataType : DataType` cycle |
-| Hierarchy & primitive sizes | Done | Faithful | verified vs `boot.jl` |
+| Hierarchy & primitive sizes | Partial | Faithful | primitive tower verified vs `boot.jl`; the M1-added `Array`/`GenericMemory` sit directly under `Any` — the `AbstractArray`/`DenseArray`/`DenseVector` tower (`boot.jl:56–57,62,76`) is absent (finding 22, audit 2026-07); `Exception <: Any` and the exception types are placed per `boot.jl:372–400` |
 | `TypeName` | Partial | Faithful | name + cache; missing module/wrapper/names/hash |
 | `apply_type` instantiation | Partial | Faithful | tuples + parametrics; `UnionAll` instantiation via `instantiate_unionall`/`inst_type` (`jl_instantiate_unionall`/`inst_type_w_`, `jltypes.c:1606,2752`, varargs-era 2026-07): single-variable substitution over typevars, nested `UnionAll` (with bound-var remap), `Union`, `Vararg`, and datatype/tuple parameters, re-uniquing rebuilt parametrics. Omitted: the recursive-type stack, `check`/`nothrow` bound validation, and parametric-supertype re-instantiation (nominal supers carried through unchanged — our demo parametrics are `Any`-supered) |
 | Uniquing (hash-consing) | Partial | Faithful | on `TypeName`; linear scan vs sorted/hashed |
 | `Union` | Partial | Faithful | normalized (`jl_type_union`): flatten, subtype-dedup, canonical sort with `union_sort_cmp`'s singleton/isbits tiers (fixed, audit 2026-06); dedup uses full `issubtype` vs the C's typevar-aware `simple_subtype`; type `===` needs structural `jl_types_egal` (Julia does **not** intern unions — `jl_type_union` builds fresh structs, `jltypes.c:706,759`); no `Vararg` merge |
 | `Bottom` | Partial | Faithful | a `DataType`; Julia uses a `TypeofBottom` instance (`jl_typeofbottom_type`, `jltypes.c:651`) |
 | `UnionAll` / `TypeVar` | Partial | Faithful | `jl_unionall_t`/`jl_tvar_t` objects (var + bounds + body); no `where`-var renaming/aliasing or `innervars` |
-| `Type{T}` kinds | Partial | Faithful | landed 2026-07: an abstract `Type` builtin whose TypeName is shared by every uniqued `Type{T}` instantiation; `DataType`/`Union`/`UnionAll` re-supered under it (boot.jl); the kind rules of `subtype.c:2094–2121` (the pin phrases them on its TypeEq node — same semantics): `Type{X}` with concrete `X` dispatches as `typeof(X)` (so `Type{Int} <: DataType`), `Type{typevar}` reduces to `Kind <: y`, and `x <: Type{typevar}` requires `x` to be a kind, recursing as `Type{T'} where T'` to bind the variable; both-`Type{}` queries ride the ordinary invariant-parametric path. Oracle: `test/subtype.jl:536–551` (11 cases). Omitted: `TypeofBottom` (our `Bottom` is a plain DataType — the C's kind-rule exemption for it is achieved structurally by the `Bottom`-left fast path), the bare `Type` as `Type{T} where T` (ours is a bare abstract type — `Type <: Type{T} where T` diverges), the nested `Type{Type{T}}` rule (`:2113–2119`) |
+| `Type{T}` kinds | Partial | Faithful | landed 2026-07: an abstract `Type` builtin whose TypeName is shared by every uniqued `Type{T}` instantiation; `DataType`/`Union`/`UnionAll` re-supered under it (boot.jl); the kind rules of `subtype.c:2094–2121` (the pin phrases them on its TypeEq node — same semantics): `Type{X}` with concrete `X` dispatches as `typeof(X)` (so `Type{Int} <: DataType`), `Type{typevar}` reduces to `Kind <: y`, and `x <: Type{typevar}` requires `x` to be a kind, recursing as `Type{T'} where T'` to bind the variable; both-`Type{}` queries ride the ordinary invariant-parametric path. Oracle: `test/subtype.jl:536–551` (the 11 cases expressible in our ABI). Omitted: `TypeofBottom` (no such value exists — the C's exemptions at `subtype.c:2081,2106` concern `typeof(Union{})` the *kind*; our `Bottom`-left fast path covers `Union{}` the *type*, and `typeof(Bottom)` is not constructible here — refined, audit 2026-07), the bare `Type` as `Type{T} where T` (ours is a bare abstract type — `Type <: Type{T} where T` diverges), the nested `Type{Type{T}}` rule (`:2113–2119`). The C's right-hand rule recurses via the immortal `jl_type_type` (`subtype.c:2111`); ours allocates a fresh `Type{T'} where T'` per query — the rooting half is finding 24 |
 | Abstract `Tuple` (`jl_anytuple_type`) | Planned | Faithful | tuple super is `Any` for now |
 
 ## Subtyping — `subtype.c` vs `subtype.rs`
@@ -348,6 +361,18 @@ mapping is real: per-var `lb`/`ub` narrowing through
     immediately caught a fourth bug — the diagonal rule rejected typevar
     lower bounds, breaking UnionAll alpha-equivalence (**fixed** per
     `subtype.c:1404–1419`; `concrete`-flag propagation still absent).
+24. **The query path allocates with nothing rooted (open, audit 2026-07;
+    = `design/research/research-subtype-engine.md` §7 risk 5).**
+    `subtype.rs` contains no `Rooted`/`Frame`. Allocation sites reachable
+    mid-query: `simple_join` → `types::union_type` (`subtype.rs:643`,
+    pre-existing) and the kind rule's fresh `make_typevar`/`type_type`/
+    `unionall_type` (`subtype.rs:156–158`, M1). A collection triggered
+    there can free the query types (the JS caller's offsets are not
+    rooted), any binding's narrowed `lb`/`ub` whose only reference is the
+    env, and the `e.vars.clone()` snapshots' bounds. The C roots exactly
+    these (`jl_savedenv_t.roots`, `subtype.c:331–337,385–414`; per-frame
+    `JL_GC_PUSH` in `subtype_unionall`). Fix is engine slice 1's first
+    commit.
 
 Oracle: `runtime/verify_julia_subtype.mjs` runs assertions copied verbatim
 from JuliaLang/julia's own `test/subtype.jl` (mapping `Ref{T}`→`Box{T}`,
@@ -372,7 +397,7 @@ backtracking cannot; both self-report if a fix makes them pass.
 | `simple_meet` / `simple_join` | Partial | Faithful | join defers to the normalized `union_type` (keeps free vars, so `S>:T` survives); meet over-estimates to `b` for typevar operands (no `Intersect` node) |
 | `jl_type_intersection` | Planned | Faithful | — |
 | `jl_type_morespecific` | Partial | Faithful | subtype-based approximation |
-| Varargs | Partial | Faithful | unbounded `Vararg{T}` in tuple tails (varargs slice 2026-07): its own `jl_vararg_t`-analog value kind (element `T@0`, count `N@4`), the `subtype_tuple` length classification (`JL_VARARG_UNBOUND` vs `NONE`) and `subtype_tuple_tail`/`subtype_tuple_varargs` walk (`subtype.c:1740–1899`), and a `Vararg` arm in `var_occurs_invariant`. Fixed-count `Vararg{T,N}` (the `INT` kind) landed 2026-07: a trailing one **expands at tuple construction** as `inst_datatype_inner` does, so `Tuple{Int,Vararg{Int,2}} === Tuple{Int,Int,Int}` through uniquing (oracle: `test/subtype.jl:61–68`) and the subtype engine never sees a ground fixed-N vararg. Omitted: typevar-valued `N` (the `BOUND` kind — the `N` length algebra and `check_vararg_length` land with it), vararg uniquing, and the repeated-element/separable tail fast paths |
+| Varargs | Partial | Faithful | unbounded `Vararg{T}` in tuple tails (varargs slice 2026-07): its own `jl_vararg_t`-analog value kind (element `T@0`, count `N@4`), the `subtype_tuple` length classification (`JL_VARARG_UNBOUND` vs `NONE`) and `subtype_tuple_tail`/`subtype_tuple_varargs` walk (`subtype.c:1740–1899`), and a `Vararg` arm in `var_occurs_invariant`. Fixed-count `Vararg{T,N}` (the `INT` kind) landed 2026-07: a trailing one **expands at tuple construction** as `inst_datatype_inner` does, so `Tuple{Int,Vararg{Int,2}} === Tuple{Int,Int,Int}` through uniquing (oracle: `test/subtype.jl:61–68`) and the subtype engine never sees a ground fixed-N vararg — expansion is unconditional, unlike the C's free-typevar guard (finding 23). Omitted: typevar-valued `N` (the `BOUND` kind — the `N` length algebra and `check_vararg_length` land with it), vararg uniquing, and the repeated-element/separable tail fast paths |
 | Fast paths (`obviously_egal`) | Planned | Faithful | — |
 
 ## Method dispatch — `gf.c`, `typemap.c` vs `dispatch.rs`
@@ -421,13 +446,24 @@ flowchart LR
 loop and the slots-then-SSA-values single-frame layout match the C exactly
 (`locals[jl_source_nslots + ip]` ↔ `frame[ssa_base + ip]`).
 
+**Audit finding (M1 session-start audit, 2026-07).**
+25. The exceptions rework re-verified end to end: the setjmp→handler-stack
+    divergence, `Leave(n)` count semantics (`jl_pop_handler`), the rooted
+    exception frame cell, and the single-cell-vs-`jl_excstack_t` remaining
+    gap all match their descriptions. Two corrections: the
+    `jl_current_exception` citation pointed at `:521,608` (enter/leave)
+    instead of `interpreter.c:350–351` (fixed above); and `ArrayLit` holds
+    its fresh array in a bare local across the element-fill loop
+    (`interp.rs:400–405`) — safe only because `aset` never allocates; root
+    it if that changes.
+
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
 | `eval_body` loop | Done | Faithful | instruction-pointer loop |
 | Statements (`Goto`/`GotoIfNot`/`Return`/`:call`/`:(=)`) | Partial | Faithful | `GotoIfNot` skips the `Bool` `TypeError` (`interpreter.c:505–507`); a builtin error (`DivideError`) now diverts to the innermost active handler's catch block, else propagates as a `Result` eval error (exceptions slice 1, 2026-07) |
 | Operands (SSA / slot / const) | Done | Faithful | — |
 | Phi / phic / upsilon | Planned | Faithful | SSA-form nodes |
-| Exception handling (`enter`/`leave`) | Partial | **Divergence** | control flow + value binding ported (exceptions slices 1–2, 2026-07): `Enter`/`Leave` + an explicit handler stack, and `Throw`/`Caught` for `throw`/`catch e` — a thrown value diverts to the innermost handler's catch destination and is bound there via `Caught` (`Expr(:the_exception)`), held in a rooted frame cell across the catch block (`EnterNode`/`:leave`/`jl_throw`/`jl_current_exception`, `interpreter.c:521,608`). the front-end lexes/parses/lowers `try <body> catch [e] <handler> end` and `throw(v)` to these statements (exceptions slices 3–4), so a `DivideError` inside a `try` is recovered in the `catch`, and a thrown value binds to the `catch e` variable, **end-to-end from source through WASM** (`harness.mjs`). **Divergence** because WASM has no `setjmp`/`longjmp` — the C's per-handler `jl_setjmp` + recursive `eval_body` becomes a handler stack + catch-dest jump in the single ip-loop (the shape compiled code will reuse, per the AOT carry-forward ledger). Exceptions are **reified values** (exceptions slice 5, 2026-07): the eval error channel carries `jl_throw`-shaped exception objects — `DivideError`/`UndefRefError`/`OutOfMemoryError` singletons, `BoundsError{a,i}` with the container and 1-based index (`rtutils.c:190`; boot.jl:373–400), and `ErrorException{msg}` with an interned-`Symbol` message until a String type exists (recorded) — `errors.rs` is the `rtutils.c` analog and the host boundary formats uncaught ones. `finally` lowers by cleanup duplication with a `Rethrow` on the exception path, incl. the `try/catch/finally` desugar. Remaining: the exception *stack* (`pop_exception` — a nested `catch` inside a `finally` clobbers the single current-exception cell before the rethrow), scoped `EnterNode`s |
+| Exception handling (`enter`/`leave`) | Partial | **Divergence** | control flow + value binding ported (exceptions slices 1–2, 2026-07): `Enter`/`Leave` + an explicit handler stack, and `Throw`/`Caught` for `throw`/`catch e` — a thrown value diverts to the innermost handler's catch destination and is bound there via `Caught` (`Expr(:the_exception)`), held in a rooted frame cell across the catch block (`EnterNode` at `interpreter.c:521`, `:leave` at `:608`; `Expr(:the_exception)` → `jl_current_exception` lives at `:350–351`, and `jl_throw` in `rtutils.c` — citations corrected, audit 2026-07). the front-end lexes/parses/lowers `try <body> catch [e] <handler> end` and `throw(v)` to these statements (exceptions slices 3–4), so a `DivideError` inside a `try` is recovered in the `catch`, and a thrown value binds to the `catch e` variable, **end-to-end from source through WASM** (`harness.mjs`). **Divergence** because WASM has no `setjmp`/`longjmp` — the C's per-handler `jl_setjmp` + recursive `eval_body` becomes a handler stack + catch-dest jump in the single ip-loop (the shape compiled code will reuse, per the AOT carry-forward ledger). Exceptions are **reified values** (exceptions slice 5, 2026-07): the eval error channel carries `jl_throw`-shaped exception objects — `DivideError`/`UndefRefError`/`OutOfMemoryError` singletons, `BoundsError{a,i}` with the container and 1-based index (`jl_bounds_error_int`, `rtutils.c:222–228`; boot.jl:373–400; field metadata absent — finding 28), and `ErrorException{msg}` with an interned-`Symbol` message until a String type exists (recorded) — `errors.rs` is the `rtutils.c` analog and the host boundary formats uncaught ones. `finally` lowers by cleanup duplication with a `Rethrow` on the exception path, incl. the `try/catch/finally` desugar. Remaining: the exception *stack* (`pop_exception` — a nested `catch` inside a `finally` clobbers the single current-exception cell before the rethrow), scoped `EnterNode`s |
 | `:new` / `getfield` / `setfield!` / globals / closures | Partial | Faithful | `New`/`GetField`/`SetField` statements over the slice-1 runtime core (structs 2026-06); field resolution by interned symbol at run time; globals and closures still Planned |
 | IR source | Partial | **Divergence** | hand-built Rust IR via a Rust front-end; faithful path is heap `CodeInfo` from `JuliaLowering` |
 
@@ -558,18 +594,42 @@ strategy's "GC exactness & tuning" frontier item).**
 
 ## Modules & top level — `module.c`, `toplevel.c` vs `module.rs`
 
+**Audit finding (M1 session-start audit, 2026-07).**
+26. Citation sharpened: `Main` is built by `jl_new_module_` with a NULL
+    parent at `toplevel.c:54` (self-parenting per `module.c:526`);
+    `jl_new_module` at `:674` is the general entry. Latent rooting gap:
+    `new_module` roots `name_sym` and the fresh bindings array but not
+    `parent` across its two allocations (`module.rs:40–55`) — unreachable
+    today (the sole caller passes NULL); root it when nested modules land.
+    "Same reachability shape" is a GC-topology claim only: the C's chain is
+    module → svec → `jl_binding_t` → partition → value; the dropped
+    `jl_binding_t`/partition layers were already recorded.
+
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
-| Modules & bindings | Partial | Faithful | core landed (modules slice 1, 2026-07), `module.rs`: `jl_module_t` subset `{name, parent, bindings}` (`julia.h` — the C additionally carries the `bindingkeyset` hash index, usings, world-age binding partitions, uuids); `jl_new_module` (`module.c:674`, `Main` self-parents); `get_global`/`set_global` per `jl_get_global`/`jl_set_global` (`:1664,1670`) minus world age and constness. Bindings live in an `Array{Any}` of `[symbol, value]` pairs — same reachability shape as the C's svec-of-bindings (module → table → values, stores barriered), linear scan instead of the hash keyset, no `jl_binding_t` objects (recorded) |
+| Modules & bindings | Partial | Faithful | core landed (modules slice 1, 2026-07), `module.rs`: `jl_module_t` subset `{name, parent, bindings}` (`julia.h` — the C additionally carries the `bindingkeyset` hash index, usings, world-age binding partitions, uuids); `jl_new_module_` (`module.c:674` general entry; `Main` via `toplevel.c:54`, self-parents per `module.c:526` — finding 26); `get_global`/`set_global` per `jl_get_global`/`jl_set_global` (`:1664,1670`) minus world age and constness. Bindings live in an `Array{Any}` of `[symbol, value]` pairs — same reachability shape as the C's svec-of-bindings (module → table → values, stores barriered), linear scan instead of the hash keyset, no `jl_binding_t` objects (recorded) |
 | Global variables | Partial | Faithful | `Main` created at init and pinned as a GC root; global heap values survive collections across evals |
 | Top-level eval | Partial | **Divergence** | REPL-style: `eval_source` seeds named slots from `Main` bindings and flushes them back at successful return (while the frame is rooted) — state persists across `rj_eval` calls end-to-end (`harness.mjs`). Julia's real toplevel (`toplevel.c` thunks, hard/soft scope, `global` declarations) arrives with real lowering; flushing only on success is a further recorded simplification |
 | Imports / exports | Planned | Faithful | — |
 
 ## Runtime utilities — `rtutils.c`, `iddict.c`, `idset.c`, `smallintset.c`
 
+**Audit finding (M1 session-start audit, 2026-07).**
+28. **Exception values carry no field metadata (open).** `BoundsError` and
+    `ErrorException` are bootstrapped through the lightweight `new_type`
+    path, which sets `nfields = 0`, `types = NULL`, and registers no field
+    names (`types.rs:161–182,350–351`); `errors.rs` reads/writes them by
+    hard-coded byte offsets. The values are correct positional records with
+    a GC bitmap, but `fieldcount`/`getfield(:a)` on them would diverge from
+    `boot.jl:373–384` — re-register them through the struct machinery when
+    exceptions meet `getfield`. Also corrected: the boxing analog is
+    `jl_bounds_error_int` (`rtutils.c:222–228`), not `jl_bounds_error`
+    (`:190`, which takes an already-boxed index); the `DivideError`
+    singleton's C name is `jl_diverror_exception` (`jltypes.c:4188`).
+
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
-| Error / exception throwing | Partial | Faithful | `errors.rs` (exceptions slice 5, 2026-07): exception values built at throw sites — `DivideError`/`UndefRefError`/`OutOfMemoryError` bootstrap singletons, `BoundsError(a,i)` (`jl_bounds_error`, `rtutils.c:190`), `ErrorException` over an interned `Symbol` (msg is `AbstractString` in Julia — recorded until strings). String-channel layers (`types.rs` struct machinery, dispatch) wrap as `ErrorException` at the interpreter boundary |
+| Error / exception throwing | Partial | Faithful | `errors.rs` (exceptions slice 5, 2026-07): exception values built at throw sites — `DivideError`/`UndefRefError`/`OutOfMemoryError` bootstrap singletons, `BoundsError(a,i)` (`jl_bounds_error_int`, `rtutils.c:222–228`), `ErrorException` over an interned `Symbol` (msg is `AbstractString` in Julia — recorded until strings); field metadata absent (finding 28). String-channel layers (`types.rs` struct machinery, dispatch) wrap as `ErrorException` at the interpreter boundary |
 | Display / printing (`jl_show`) | Planned | Faithful | — |
 | Internal hash collections | n/a | **Divergence** | Rust `std` collections used internally instead of Julia's C IdDict/IdSet |
 
@@ -583,10 +643,29 @@ strategy's "GC exactness & tuning" frontier item).**
 
 ## Arrays & memory — `array.c`, `genericmemory.c` vs `memory.rs`
 
+**Audit finding (M1 session-start audit, 2026-07).** Citations and the core
+comparisons (shape, growth arithmetic, barriers, bounds, rooting) all
+verify; the following simplifications were live but unrecorded.
+27. (a) Zero-initialization is unconditional (`memory.rs:98–101`); the C
+    memsets only when the element type is `zeroinit` (`genericmemory.c:
+    71–72`), so a bits `undef` memory holds zeros here and garbage
+    upstream. Likewise `del_end`'s tail-zeroing skips the C's `zeroinit`
+    guard (`array.c:251`). Benign — zeros are a valid inhabitant.
+    (b) The `elsz == 0` growth branch (`array.c:199–205`, the
+    `MAXINTVAL-2` sentinel memory) is unported; singleton-element arrays
+    run the ordinary capacity sequence. (c) The inline-storage gate is
+    `is_bits` (`memory.rs:51`), which includes isbits tuples — they stay
+    boxed today only because tuple `size` is 0; switch to `is_primitive`
+    or update the recorded rule when tuple layout lands. (d) The
+    `Memory{Symbol}` trace-skip (`gc-stock.c:2449–2450`) is omitted —
+    symbols are immortal, so tracing them is merely redundant. (e) The
+    missing `AbstractArray`/`DenseArray` supertype tower is finding 22
+    (type system).
+
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
-| `GenericMemory` | Partial | Faithful | core landed (arrays slice 1, 2026-07), `memory.rs`: the `jl_genericmemory_t` shape `[length, ptr]` + inline data with `ptr` a real field aimed at the object's own body — the C's pooled path (`jl_alloc_genericmemory_unchecked`, `genericmemory.c:41–52`); overflow-checked, **explicitly zero-initialized** allocation (`_new_genericmemory_`, `:56–74` — a recycled chunk carries stale bytes, so the `memset` is load-bearing for boxed slots); `memoryrefget`/`memoryrefset` for the non-atomic subset (`:343,446`): boxed elements by reference with `UndefRefError` on unset and the **write barrier on the memory object** on store (`:463`), primitive-bits elements inline with `jl_new_bits` re-box on read, zero-size singletons via `instance` (`:361–364`); element-type `isa` check on set; GC marks boxed elements via the typename special-case exactly as `gc-stock.c:2412,2448–2456` (remset/`has_young_ref` flow through the same path, so old-memory→young-element edges work — pinned by a promote-then-store test). The buffer lives in linear memory in Julia's layout — the arrays carry-forward constraint (`design/roadmap.md`) is **honored**: element access is `region[ptr + i*elsz]`. Simplified: data always inline (no `MALLOCD`/string-owned buffers in the bounded region); inline storage for *primitive* isbits only (isbits structs/tuples/unions stay boxed); single type parameter (kind fixed `:not_atomic`, addrspace CPU); no zero-length singleton instance; no `memoryref` object (`jl_genericmemoryref_t`) — get/set take `(mem, i)` directly |
-| `Array` | Partial | Faithful | 1-D core landed (arrays slice 2, 2026-07), `array.rs`: the `jl_array_t` shape `{mem, offset, length}` (`julia.h:190` — `ref.mem` GC-traced, `ref.ptr_or_offset` kept as an element index as the C itself does for isbits-union arrays, `dimsize[0]`); growth is `jl_array_grow_end` (`array.c:191–238`) with the exact capacity sequence (4, then ×1.5 below 48, then ×1.2), prefix copy into the fresh buffer, and the `mem` swap through the write barrier (`jl_gc_wb(a, newmem)`, `:231`); `del_end` zeroes the vacated tail (`:251–254`); `push` is `jl_array_ptr_1d_push` (`:257`) generalized to any element type (the C's is `Any`-only; the generic `push!` is `base/` Julia we don't run yet). Simplified: 1-D only (`N` fixed 1), `offset` always 0 until `popfirst!`/`deleteat!`, no shared-buffer views (`jl_array_isshared`), GC reaches `mem` via a typename special-case rather than layout-driven marking (parametric instantiations carry no layouts yet) |
+| `GenericMemory` | Partial | Faithful | core landed (arrays slice 1, 2026-07), `memory.rs`: the `jl_genericmemory_t` shape `[length, ptr]` + inline data with `ptr` a real field aimed at the object's own body — the C's pooled path (`jl_alloc_genericmemory_unchecked`, `genericmemory.c:41–52`); overflow-checked, **explicitly zero-initialized** allocation (`_new_genericmemory_`, `:56–74` — a recycled chunk carries stale bytes, so the `memset` is load-bearing for boxed slots; ours is unconditional where the C guards on `zeroinit`, finding 27a); `memoryrefget`/`memoryrefset` for the non-atomic subset (`:343,446`): boxed elements by reference with `UndefRefError` on unset and the **write barrier on the memory object** on store (`:463`), primitive-bits elements inline with `jl_new_bits` re-box on read, zero-size singletons via `instance` (`:361–364`); element-type `isa` check on set; GC marks boxed elements via the typename special-case per `gc-stock.c:2412,2448–2456` (minus the `Memory{Symbol}` skip, finding 27d) (remset/`has_young_ref` flow through the same path, so old-memory→young-element edges work — pinned by a promote-then-store test). The buffer lives in linear memory in Julia's layout — the arrays carry-forward constraint (`design/roadmap.md`) is **honored**: element access is `region[ptr + i*elsz]`. Simplified: data always inline (no `MALLOCD`/string-owned buffers in the bounded region); inline storage for *primitive* isbits only (isbits structs/tuples/unions stay boxed); single type parameter (kind fixed `:not_atomic`, addrspace CPU); no zero-length singleton instance; no `memoryref` object (`jl_genericmemoryref_t`) — get/set take `(mem, i)` directly |
+| `Array` | Partial | Faithful | 1-D core landed (arrays slice 2, 2026-07), `array.rs`: the `jl_array_t` shape `{mem, offset, length}` (`julia.h:190` — `ref.mem` GC-traced, `ref.ptr_or_offset` kept as an element index as the C itself does for isbits-union arrays, `dimsize[0]`); growth is `jl_array_grow_end` (`array.c:191–238`) with the exact capacity sequence (4, then ×1.5 below 48, then ×1.2), prefix copy into the fresh buffer, and the `mem` swap through the write barrier (`jl_gc_wb(a, newmem)`, `:231`) — minus the `elsz == 0` sentinel branch (finding 27b); `del_end` zeroes the vacated tail (`:251–254`, unconditionally — finding 27a); `push` is `jl_array_ptr_1d_push` (`:257`) generalized to any element type (the C's is `Any`-only; the generic `push!` is `base/` Julia we don't run yet). Simplified: 1-D only (`N` fixed 1), `offset` always 0 until `popfirst!`/`deleteat!`, no shared-buffer views (`jl_array_isshared`), GC reaches `mem` via a typename special-case rather than layout-driven marking (parametric instantiations carry no layouts yet) |
 | `arrayref`/`arrayset`/`length`/`push!` | Partial | Faithful | runtime ops bound against the array's length (not the buffer's); the bootstrap front-end wires `[literals]`, 1-based `a[i]`, `a[i] = v`, `push!(a, v)`, and `length(a)` to them (arrays slice 2 — a front-end **divergence** like all `frontend.rs` forms: real lowering replaces it); literal element type is the common concrete type, else `Any`; out-of-bounds reads throw catchable `BoundsError`s through the `enter`/`leave` machinery — pinned end-to-end by `harness.mjs` |
 
 ## Serialization & system image — `staticdata.c`, `precompile.c`
@@ -657,5 +736,20 @@ path at `:1352`), and its "lazily freed" pages are an OS-decommit (`madvise`)
 queue (`:863,1326`), not deferred freelist builds. With the `newpages` bump
 path landed (slice D), the single-threaded pool design matches the pin;
 both rows corrected, the phantom work item removed.
+
+**2026-07 (M1 session-start audit, modules: memory, array, module, errors,
+interpreter rework, bootstrap hierarchy).** Method: the six M1 additions read
+in full against their cited reference lines; every citation in the affected
+rows spot-checked in the pin. Verdict: the M1 code is what the tables say it
+is in shape — rooting, barriers, growth arithmetic, and the exceptions
+divergence description all verify — but the pattern held: two substantive
+unrecorded divergences (22: the `AbstractArray` tower absent under a
+"verified vs boot.jl" Done row, now downgraded; 28: exception values carry
+no field metadata behind the `{a,i}`/`{msg}` phrasing), one deliberate but
+unrecorded guard omission (23: unconditional vararg expansion), one latent
+rooting gap (26: `new_module`'s `parent`), a cluster of benign
+simplifications (27), and four citation errors (25, 26, 28 — corrected in
+place). Finding 24 records the subtype query path's pre-existing-but-widened
+GC exposure; its fix is engine slice 1's first commit.
 
 Audits have found over-claims every time they have run.
