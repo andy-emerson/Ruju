@@ -91,11 +91,9 @@ pub enum Stmt {
     /// explicit handler stack plus a catch-destination jump, because WASM has no
     /// `setjmp`/`longjmp` machine-stack unwinding — a recorded divergence, of a
     /// kind with the mandatory shadow stack, and the shape compiled code reuses.
-    #[allow(dead_code)] // the front-end wiring for `try`/`catch` is the next slice
     Enter(usize),
     /// Pop `n` active handlers on normal control flow out of their `try` regions
     /// (`:leave`, `interpreter.c:608`).
-    #[allow(dead_code)] // the front-end wiring for `try`/`catch` is the next slice
     Leave(usize),
     /// Throw the operand value as an exception (`jl_throw`): divert to the
     /// innermost active handler, binding the value as the current exception; with

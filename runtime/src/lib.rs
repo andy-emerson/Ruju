@@ -681,6 +681,18 @@ mod tests {
     }
 
     #[test]
+    fn source_try_catch_recovers() {
+        let _g = serial();
+        rj_init();
+        let run = |s: &str| crate::value::unbox_int(crate::frontend::eval_source(s).unwrap());
+        // A DivideError inside the try is recovered in the catch.
+        assert_eq!(run("x = 0\ntry\nx = 1 ÷ 0\ncatch\nx = 999\nend\nx"), 999);
+        // No error: the body runs and the catch is skipped.
+        assert_eq!(run("x = 0\ntry\nx = 6 ÷ 2\ncatch\nx = 999\nend\nx"), 3);
+        assert_eq!(gc::root_count(), 0, "roots released after eval");
+    }
+
+    #[test]
     fn primitive_sizes_match_julia() {
         let _g = serial();
         rj_init();

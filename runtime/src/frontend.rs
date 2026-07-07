@@ -53,6 +53,8 @@ enum Tok {
     Elseif,
     End,
     While,
+    Try,
+    Catch,
     Eof,
 }
 
@@ -197,6 +199,8 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                     "elseif" => Tok::Elseif,
                     "end" => Tok::End,
                     "while" => Tok::While,
+                    "try" => Tok::Try,
+                    "catch" => Tok::Catch,
                     "struct" => Tok::Struct,
                     "mutable" => Tok::Mutable,
                     w => Tok::Ident(w.to_string()),
@@ -251,6 +255,9 @@ enum SrcStmt {
     Expr(Expr),
     If(Expr, Vec<SrcStmt>, Vec<SrcStmt>),
     While(Expr, Vec<SrcStmt>),
+    /// `try <body> catch <handler> end`. The `catch e` variable and `finally`
+    /// are later slices, as is `throw` from source.
+    Try(Vec<SrcStmt>, Vec<SrcStmt>),
     /// `[mutable] struct Name; field[::Type]...; end`.
     StructDef { name: String, mutabl: bool, fields: Vec<(String, Option<String>)> },
 }
@@ -302,7 +309,7 @@ impl Parser {
         loop {
             self.skip_seps();
             match self.peek() {
-                Tok::End | Tok::Else | Tok::Elseif | Tok::Eof => break,
+                Tok::End | Tok::Else | Tok::Elseif | Tok::Catch | Tok::Eof => break,
                 _ => out.push(self.parse_stmt()?),
             }
         }
@@ -345,6 +352,14 @@ impl Parser {
             Tok::If => {
                 self.next();
                 self.parse_if()
+            }
+            Tok::Try => {
+                self.next();
+                let body = self.parse_block()?;
+                self.expect(&Tok::Catch)?;
+                let handler = self.parse_block()?;
+                self.expect(&Tok::End)?;
+                Ok(SrcStmt::Try(body, handler))
             }
             Tok::Ident(name) if self.toks.get(self.pos + 1) == Some(&Tok::Assign) => {
                 self.next(); // identifier
@@ -660,6 +675,21 @@ impl Lower {
                 self.patch(gif, end);
                 None
             }
+            SrcStmt::Try(body, handler) => {
+                // Enter pushes the handler; on normal completion Leave pops it and
+                // Goto skips the catch block. A throw inside the body diverts to
+                // `catch_start` (patched below).
+                let enter = self.emit(Stmt::Enter(0));
+                self.lower_block(body)?;
+                self.emit(Stmt::Leave(1));
+                let gend = self.emit(Stmt::Goto(0));
+                let catch_start = self.code.len();
+                self.patch(enter, catch_start);
+                self.lower_block(handler)?;
+                let end = self.code.len();
+                self.patch(gend, end);
+                None
+            }
             // A struct definition is a lowering-time side effect (a top-level
             // form); it contributes no IR and its value is not an expression.
             SrcStmt::StructDef { name, mutabl, fields } => {
@@ -681,7 +711,7 @@ impl Lower {
 
     fn patch(&mut self, idx: usize, target: usize) {
         match &mut self.code[idx] {
-            Stmt::Goto(t) | Stmt::GotoIfNot(_, t) => *t = target,
+            Stmt::Goto(t) | Stmt::GotoIfNot(_, t) | Stmt::Enter(t) => *t = target,
             _ => {}
         }
     }
