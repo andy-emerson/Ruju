@@ -345,10 +345,13 @@ from JuliaLang/julia's own `test/subtype.jl` (mapping `Ref{T}`→`Box{T}`,
 added 19 cases (`test/subtype.jl:43–59,587–594`), the two-parameter `Pair`
 constructor added 8 invariant/`where`/diagonal cases (`:206–271`), and a
 curated expansion added 7 more bounded-typevar and diagonal `test_3` cases
-(`:205,214,238,241,264,267,273`) — expressible with the existing ABI and
-passing on the current engine, so they widen coverage without new code. Plus 1
-tracked known divergence (tuple-over-union distributivity, which needs Julia's
-global union-decision machine; it self-reports if a fix makes it pass).
+(`:205,214,238,241,264,267,273`) plus 2 passing tuple-over-union cases
+(`:413,416`) — all expressible with the existing ABI and passing on the current
+engine, so they widen coverage without new code. Plus **2** tracked known
+divergences, both tuple-over-union distributivity (`:371` and `:410` — the
+latter, `Tuple{Union{…}} <: Tuple{Ref{T}} where T`, added 2026-07): each needs
+a per-union-branch choice the global union-decision machine makes but local
+backtracking cannot; both self-report if a fix makes them pass.
 
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |

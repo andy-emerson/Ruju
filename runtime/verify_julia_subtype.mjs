@@ -115,6 +115,16 @@ const cases = [
     return [Pair(Ref(Int), Int), where(T, Pair(Ref(T), T))];
   }],
 
+  // --- tuple-over-union with a bound var (test_2/test_3) ---
+  ["L413 !issub(Tuple{Union{Vector{Int},Vector{Int8}},Vector{Int}}, @UnionAll T Tuple{Vector{T},Vector{T}})", "notsub", () => {
+    const T = tvar();
+    return [Tuple(Union(Ref(Int), Ref(Int8)), Ref(Int)), where(T, Tuple(Ref(T), Ref(T)))];
+  }],
+  ["L416 !issub(Tuple{Union{Vector{Int},Vector{Int8}},Vector{Int8}}, @UnionAll T Tuple{Vector{T},Vector{T}})", "notsub", () => {
+    const T = tvar();
+    return [Tuple(Union(Ref(Int), Ref(Int8)), Ref(Int8)), where(T, Tuple(Ref(T), Ref(T)))];
+  }],
+
   // --- more existential / bounded / diagonal cases (test_3) ---
   ["L205 issub_strict(Vector{Int}, @UnionAll T Vector{T})", "strict", () => {
     const T = tvar();
@@ -320,6 +330,13 @@ const cases = [
 const knownDivergences = [
   ["L371 isequal_type(Tuple{Union{Int,Int8},Int16}, Union{Tuple{Int,Int16},Tuple{Int8,Int16}})", "equal", () =>
     [Tuple(Union(Int, Int8), Int16), Union(Tuple(Int, Int16), Tuple(Int8, Int16))]],
+  // Same family as L371: Tuple{Union{...}} <: (Tuple{Ref{T}} where T) needs a
+  // per-union-branch choice of T, which the global union-decision machine makes
+  // but local backtracking cannot. (test/subtype.jl:410, ≡ :449 under Ref->Box.)
+  ["L410 issub(Tuple{Union{Vector{Int},Vector{Int8}}}, @UnionAll T Tuple{Vector{T}})", "sub", () => {
+    const T = tvar();
+    return [Tuple(Union(Ref(Int), Ref(Int8))), where(T, Tuple(Ref(T)))];
+  }],
 ];
 
 const pred = { strict, equal, sub: (a, b) => sub(a, b), notsub: (a, b) => !sub(a, b), noteq: (a, b) => !equal(a, b) };
