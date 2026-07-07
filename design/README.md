@@ -34,6 +34,10 @@ a record. That makes drift detectable, not merely forbidden: a pre-table row
 with no frontier source means the strategy is stale, and a post-table row
 with an empty "Recorded" column means the implementation ledger is.
 
+Supporting materials: `research/` holds the post-M1 deep-research corpus and
+the ratified decision record (`research/README.md` indexes it and states the
+next session's opening order); `roadmap.md` is the derived effort-wave view.
+
 The documents are load-bearing, not decorative: `implementation.md` is the
 evidence ledger that the claim ladder requires, and `strategy.md`'s frontier
 is the menu the next session starts from. A document that lags the code is
