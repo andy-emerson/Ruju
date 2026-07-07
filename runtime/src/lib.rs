@@ -567,6 +567,30 @@ mod tests {
     }
 
     #[test]
+    fn parametric_typenames_survive_collection() {
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+        // Note the Pair TypeName's offset, then drop every reference to Pair
+        // types: the typename (and its instantiation cache) must survive on the
+        // pinned-roots list alone. A swept object's header becomes a freelist
+        // link, so `type_of` detects a wrongly-freed typename deterministically.
+        let tn = types::name_of(types::pair_type(t(id::INT64), t(id::INT8)));
+        gc::collect_full();
+        gc::collect_full();
+        assert_eq!(
+            type_of(Value(tn)),
+            types::builtin(id::TYPENAME),
+            "the Pair TypeName must not be swept while unreferenced"
+        );
+        // The instantiation cache also survives: uniquing still holds.
+        let p1 = types::pair_type(t(id::INT64), t(id::INT8));
+        assert_eq!(crate::symbol::as_str(types::type_sym(p1)), "Pair");
+        assert_eq!(p1, types::pair_type(t(id::INT64), t(id::INT8)));
+        assert_eq!(gc::root_count(), 0);
+    }
+
+    #[test]
     fn pair_invariant_and_diagonal_subtyping() {
         let _g = serial();
         rj_init();

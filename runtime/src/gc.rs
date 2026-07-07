@@ -557,6 +557,7 @@ fn push_roots(work: &mut Vec<Value>) {
     work.push(Value(b.false_instance));
     work.push(Value(b.tuple_typename)); // shared across all tuple types
     work.push(Value(b.box_typename)); // demo parametric constructor
+    work.push(Value(b.pair_typename)); // demo two-parameter constructor
     crate::symbol::each_interned(|s| work.push(Value(s))); // symbols are immortal
     crate::dispatch::each_sig(|s| work.push(Value(s))); // method signatures
     crate::types::each_registered_struct(|t| work.push(Value(t))); // source-defined types
