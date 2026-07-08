@@ -54,6 +54,13 @@ jobs:
       - name: Package
         working-directory: julia
         run: |
+          # binary-dist -> install depends on the HTML docs, whose rule is
+          # "skipped if already exists, notably in tarballs" (Makefile:67).
+          # Documenter cannot precompile on the runner and a build-time
+          # lowering tool needs no docs — satisfy the target with a stub.
+          mkdir -p doc/_build/html/en
+          echo '<!doctype html><title>docs omitted</title><p>Docs omitted from the Ruju pinned build-time artifact; see docs.julialang.org.</p>' \
+            > doc/_build/html/en/index.html
           make binary-dist
           mv julia-*.tar.gz "../$ARTIFACT"
           cd ..
