@@ -141,7 +141,7 @@ flowchart TD
     SUBXE["subtype expressibility [done: subset —<br/>typevar-N Vararg rides with the engine]"]
     EXC["exceptions [done: subset — reified values,<br/>finally; exception stack later]"]
 
-    ORACLE["oracle capacity [done: 106 cases, growing]"]
+    ORACLE["oracle capacity [done: 120 cases, growing]"]
     SUBXM("subtype engine: union decision machine [done],<br/>Intersect/Loffset, concrete propagation (frontier)")
     ISECT{"type intersection"}
     MORESPEC{"type_morespecific"}

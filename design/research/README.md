@@ -16,14 +16,19 @@ are meant to be worked from, not just read.
 
 ## Next session opens here
 
-1. **Session-start audit** of the M1 additions (`memory.rs`, `array.rs`,
-   `module.rs`, `errors.rs`, the interpreter rework, the bootstrap hierarchy
-   changes) — required by `methodology.md` before new module work.
-2. Then two parallel tracks, both fully specified in this corpus:
-   **engine slice 1** (first commit: the subtype-env rooting fix — the
-   confirmed hazard in `research-subtype-engine.md` §7) and the
-   **AOT thin slice** (spec in `research-aot-backend.md`; its stage 2
-   forces the linear-memory shadow stack + region-base export).
+*(Executed 2026-07-07/08 — kept as the record of what this corpus fed.)*
+
+1. ~~**Session-start audit** of the M1 additions~~ — done (findings 22–28,
+   `implementation.md`).
+2. ~~**Engine slice 1**~~ (rooting fix, then the union-decision machine —
+   both pre-mapped divergences healed on first run) and ~~**slice 2**~~ (the
+   `forall_exists_equal` tail) — done; slices 3–5 remain per
+   `research-subtype-engine.md` §6. **M2 C-0** opened (operands, calls
+   through values); the pinned-Julia artifact (D1's distribution decision)
+   builds via `.github/workflows/build-pinned-julia.yml`. The **AOT thin
+   slice** (spec in `research-aot-backend.md`; its stage 2 forces the
+   linear-memory shadow stack + region-base export) is still unstarted —
+   the frontier's next untouched item.
 
 The faer track proceeds independently in its own repository
 (starter kit + roadmap delivered 2026-07); Ruju-side work for it (the LBT
