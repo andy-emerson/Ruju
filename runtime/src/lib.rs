@@ -1163,6 +1163,63 @@ mod tests {
     }
 
     #[test]
+    fn interpreter_defines_methods_from_ir() {
+        use crate::interp::{eval, Body, Builtin, Op, Stmt};
+        let _g = serial();
+        rj_init();
+        let sym = |s: &str| crate::symbol::intern(types::builtin(id::SYMBOL), s);
+
+        // Expr(:method, :inc); Expr(:method, inc, Tuple{Int64}, body);
+        // then inc(41) through the Main binding — a function declared,
+        // defined, and called entirely from IR.
+        let inc = sym("inc");
+        let inner = Body {
+            nslots: 1,
+            code: vec![
+                Stmt::Call(Builtin::Add, vec![Op::Slot(0), Op::Int(1)]),
+                Stmt::Return(Op::Ssa(0)),
+            ],
+        };
+        let sig = types::tuple_type(&[types::builtin(id::INT64)]);
+        let b = Body {
+            nslots: 0,
+            code: vec![
+                Stmt::MethodFunc(inc),
+                Stmt::MethodDef(Op::Ssa(0), Op::Const(sig), inner),
+                Stmt::CallValue(vec![Op::Global(inc), Op::Int(41)]),
+                Stmt::Return(Op::Ssa(2)),
+            ],
+        };
+        assert_eq!(crate::value::unbox_int(eval(&b).expect("declare/define/call")), 42);
+
+        // Re-declaring the same name returns the same function value.
+        let b = Body {
+            nslots: 0,
+            code: vec![
+                Stmt::MethodFunc(inc),
+                Stmt::Call(Builtin::Egal, vec![Op::Ssa(0), Op::Global(inc)]),
+                Stmt::Return(Op::Ssa(1)),
+            ],
+        };
+        assert!(crate::value::unbox_bool(eval(&b).expect("redeclare")), "same value");
+
+        // Declaring over a non-function binding throws catchably.
+        let xsym = sym("not_a_function");
+        let b = Body {
+            nslots: 0,
+            code: vec![
+                Stmt::AssignGlobal(xsym, Op::Int(5)),
+                Stmt::Enter(5),
+                Stmt::MethodFunc(xsym),
+                Stmt::Leave(1),
+                Stmt::Return(Op::Int(0)), // not reached: the declare throws
+                Stmt::Return(Op::Int(-1)), // catch
+            ],
+        };
+        assert_eq!(crate::value::unbox_int(eval(&b).expect("caught")), -1);
+    }
+
+    #[test]
     fn interpreter_calls_through_values() {
         use crate::interp::{eval, Body, Builtin, Op, Stmt};
         let _g = serial();

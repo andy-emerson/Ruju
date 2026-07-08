@@ -50,10 +50,24 @@ fn functions() -> &'static mut Vec<(Offset, u32)> {
     unsafe { &mut *FUNCTIONS.0.get() }
 }
 
+/// Runtime-allocated generic-function ids, kept far above the small ids
+/// hand-picked by tests and the bootstrap front-end.
+struct NextFunc(core::cell::Cell<u32>);
+unsafe impl Sync for NextFunc {}
+static NEXT_FUNC: NextFunc = NextFunc(core::cell::Cell::new(1 << 20));
+
+/// A fresh generic-function id (for `:method`-declared functions).
+pub fn fresh_func_id() -> u32 {
+    let id = NEXT_FUNC.0.get();
+    NEXT_FUNC.0.set(id + 1);
+    id
+}
+
 /// Clear all methods and function values (called when the runtime resets).
 pub fn reset() {
     table().clear();
     functions().clear();
+    NEXT_FUNC.0.set(1 << 20);
 }
 
 /// Create the callable value for generic function `func` (the shape of

@@ -143,6 +143,26 @@ pub enum Stmt {
     Push(Op, Op),
     /// `ssa[i] = length(a)`.
     Len(Op),
+    /// `Expr(:method, name)` — declare (or fetch) the generic function bound
+    /// to the interned symbol in `Main` (`eval_methoddef`'s 1-arg arm,
+    /// `interpreter.c:80–97,366` → `jl_declare_const_gf`, minus constness as
+    /// `module.rs` records): unbound creates a fresh function value and binds
+    /// it; bound-to-a-function returns it; bound-to-anything-else throws.
+    /// The function value is this statement's SSA result.
+    #[allow(dead_code)] // pre-lowered code (M2 C-1) constructs it; tests exercise it now
+    MethodFunc(crate::region::Offset),
+    /// `Expr(:method, fname, atypes, meth)` — define a method
+    /// (`eval_methoddef`'s 3-arg arm, `interpreter.c:99–111,642` →
+    /// `jl_method_def`): the callee operand must evaluate to a function
+    /// value, the signature operand to a tuple type. The body rides inline
+    /// in the statement until the heap-`CodeInfo` reshape (the C evaluates
+    /// it as a `CodeInfo` value). Adaptations, recorded: our signatures are
+    /// `Tuple{argtypes...}` (Julia's argdata svec carries `typeof(f)` and
+    /// the sparam typevars), the result is `nothing` (no `jl_method_t`
+    /// objects yet), and the C confines the 3-arg form to toplevel frames
+    /// (`:641`) — we have no toplevel/method frame distinction yet.
+    #[allow(dead_code)] // pre-lowered code (M2 C-1) constructs it; tests exercise it now
+    MethodDef(Op, Op, Body),
     /// Bind the current caught exception as this statement's SSA value
     /// (`Expr(:the_exception)` / `jl_current_exception`), for `catch e`.
     Caught,
@@ -436,6 +456,53 @@ fn eval_core(
                     continue;
                 }
                 return Err(exc);
+            }
+            Stmt::MethodFunc(sym) => {
+                let main = Value(crate::module::main_offset());
+                let v = match crate::module::get_global(main, *sym) {
+                    Some(v) => {
+                        let callable: Result<(), Value> = if dispatch::func_of(v).is_none() {
+                            Err(crate::errors::error_exception(&format!(
+                                "cannot define function {}; it already has a value",
+                                crate::symbol::as_str(*sym)
+                            )))
+                        } else {
+                            Ok(())
+                        };
+                        guard!(callable);
+                        v
+                    }
+                    None => {
+                        let f = dispatch::make_function(
+                            crate::symbol::as_str(*sym),
+                            dispatch::fresh_func_id(),
+                        );
+                        // The frame slot roots the fresh value across the
+                        // binding store's possible table growth.
+                        frame.set(ssa_base + ip, f);
+                        guard!(crate::module::set_global(main, *sym, f));
+                        f
+                    }
+                };
+                frame.set(ssa_base + ip, v);
+            }
+            Stmt::MethodDef(fop, sigop, body) => {
+                let f = guard!(read_op(*fop, &frame, ssa_base));
+                let sig = guard!(read_op(*sigop, &frame, ssa_base));
+                let func = guard!(dispatch::func_of(f).ok_or_else(|| {
+                    crate::errors::error_exception("method: not a generic function")
+                }));
+                let tuple_sig: Result<(), Value> =
+                    if types::is_datatype(sig.raw()) && types::is_tuple(sig.raw()) {
+                        Ok(())
+                    } else {
+                        Err(crate::errors::error_exception(
+                            "method: signature must be a Tuple type",
+                        ))
+                    };
+                guard!(tuple_sig);
+                dispatch::add_method(func, sig.raw(), body.clone());
+                frame.set(ssa_base + ip, Value(types::nothing_instance()));
             }
             Stmt::Caught => {
                 frame.set(ssa_base + ip, frame.get(exc_slot));
