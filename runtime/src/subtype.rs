@@ -13,12 +13,22 @@
 //! `var_lt`/`var_gt` (narrowing a variable's bounds via `simple_meet` /
 //! `simple_join`), and the universal-vs-existential dispatch in `subtype`.
 //!
-//! Also ported: the diagonal rule, unbounded varargs in tuple tails, and the
-//! `Type{T}` kind rules (the pin's TypeEq semantics). Deliberately omitted for
-//! now (tracked in `design/implementation.md`): type intersection and the
-//! newer `Intersect`/`Loffset` machinery. Union backtracking uses a simple
-//! save/restore of the environment rather than Julia's union-state bit-stack
-//! iterator — equivalent on the cases handled here, but not the full machine.
+//! Also ported: the diagonal rule, unbounded varargs in tuple tails, the
+//! `Type{T}` kind rules (the pin's TypeEq semantics), and — engine slice 1 —
+//! the **global union-decision machine**: every `Union` arm choice is a
+//! numbered bit in one of two bit-stacks ([`UnionState`]: `Lunions` for
+//! left-of-`<:` unions, `Runions` for right), and two nested driver loops —
+//! [`forall_exists_subtype`] (∀, left) wrapping [`exists_subtype`] (∃, right)
+//! — re-run the whole query once per bit combination, enumerated as a
+//! lazily-grown binary counter (`subtype.c:35–60, 237–260, 2359–2404`). Local
+//! backtracking cannot revisit a choice made by an *ancestor* in the
+//! recursion; the machine hoists the enumeration above the query, so each
+//! left arm gets a fresh right-side search and fresh existential bindings.
+//!
+//! Deliberately omitted for now (tracked in `design/implementation.md`):
+//! type intersection, the `Intersect`/`Loffset` machinery, and the
+//! freeze/`limit_slow` explosion guards of `local_forall_exists_subtype`
+//! (slice 2 — ours is the unlimited, correct-but-slower form).
 //!
 //! GC rooting (the C's discipline, engine slice 1 first commit): the entry
 //! roots the query types (the C leaves this to callers; our host boundary
@@ -69,17 +79,157 @@ struct VarBinding {
     root_base: usize,
 }
 
-/// The subtype environment (`jl_stenv_t`): the stack of variable bindings and
-/// the current invariant-constructor nesting depth.
+/// One union decision bit-stack (`jl_unionstate_t`, `subtype.c:48–53`): a
+/// lazily-grown binary counter over the union decision points a traversal
+/// discovers. Bit `i` = 0 chooses `Union.a` at the `i`th decision point,
+/// 1 chooses `Union.b`.
+///
+/// - `depth` — index of the next decision point to *read* in the current
+///   traversal; reset to 0 at the start of every pass.
+/// - `used` — number of bits currently meaningful (how deep the previous
+///   pass got). `depth >= used` means a new decision point was discovered.
+/// - `more` — the deepest choice point read as 0 (an untried alternative
+///   remains); 0 ⇒ the enumeration is exhausted.
+#[derive(Default)]
+struct UnionState {
+    depth: i32,
+    more: i32,
+    used: i32,
+    /// The bit store (the C chains 16×u32 chunks, `jl_bits_stack_t`; a
+    /// growable `Vec` is the same store without the chaining).
+    bits: Vec<u32>,
+}
+
+impl UnionState {
+    /// `statestack_get`.
+    fn get(&self, i: i32) -> bool {
+        let (w, b) = ((i as usize) >> 5, (i as usize) & 31);
+        w < self.bits.len() && self.bits[w] & (1 << b) != 0
+    }
+
+    /// `statestack_set` (grows the store on demand).
+    fn set(&mut self, i: i32, val: bool) {
+        let (w, b) = ((i as usize) >> 5, (i as usize) & 31);
+        if w >= self.bits.len() {
+            self.bits.resize(w + 1, 0);
+        }
+        if val {
+            self.bits[w] |= 1 << b;
+        } else {
+            self.bits[w] &= !(1 << b);
+        }
+    }
+}
+
+/// A snapshot of one union state (`jl_saved_unionstate_t`): counters plus the
+/// first `used` bits. `push_unionstate`/`pop_unionstate` (`subtype.c:273–306`)
+/// shield an inner computation's union state from its surroundings.
+struct SavedUnionState {
+    depth: i32,
+    more: i32,
+    used: i32,
+    bits: Vec<u32>,
+}
+
+fn push_unionstate(src: &UnionState) -> SavedUnionState {
+    let words = (src.used as usize + 31) / 32;
+    let mut bits = vec![0u32; words];
+    bits.copy_from_slice(&src.bits[..words.min(src.bits.len())]);
+    SavedUnionState { depth: src.depth, more: src.more, used: src.used, bits }
+}
+
+fn pop_unionstate(dst: &mut UnionState, saved: &SavedUnionState) {
+    dst.depth = saved.depth;
+    dst.more = saved.more;
+    dst.used = saved.used;
+    let words = saved.bits.len();
+    if dst.bits.len() < words {
+        dst.bits.resize(words, 0);
+    }
+    dst.bits[..words].copy_from_slice(&saved.bits);
+}
+
+/// The subtype environment (`jl_stenv_t`): the stack of variable bindings,
+/// the current invariant-constructor nesting depth, and the two union
+/// decision states the driver loops enumerate.
 struct Env {
     vars: Vec<VarBinding>,
     invdepth: i32,
+    /// Decisions for unions on the left of `<:` (`Lunions`).
+    lunions: UnionState,
+    /// Decisions for unions on the right of `<:` (`Runions`).
+    runions: UnionState,
 }
 
 impl Env {
+    fn new() -> Env {
+        Env {
+            vars: Vec::new(),
+            invdepth: 0,
+            lunions: UnionState::default(),
+            runions: UnionState::default(),
+        }
+    }
+
     /// Innermost binding for `var`, if it is in scope (`lookup_binding`).
     fn lookup(&self, var: Offset) -> Option<usize> {
         self.vars.iter().rposition(|b| b.var == var)
+    }
+
+    fn state(&mut self, r: bool) -> &mut UnionState {
+        if r {
+            &mut self.runions
+        } else {
+            &mut self.lunions
+        }
+    }
+
+    /// `next_union_state` (`subtype.c:237–246`): the binary-counter
+    /// increment. Truncate to the deepest untried choice point, flip its bit
+    /// to 1, and let `pick_union_decision` re-initialize anything deeper as
+    /// it is rediscovered. Returns false when the enumeration is exhausted.
+    fn next_union_state(&mut self, r: bool) -> bool {
+        let st = self.state(r);
+        if st.more == 0 {
+            return false;
+        }
+        st.used = st.more;
+        let i = st.used - 1;
+        st.set(i, true);
+        true
+    }
+
+    /// `pick_union_decision` (`subtype.c:248–260`): read (or discover) the
+    /// decision bit at the current traversal depth. Reading a 0 records this
+    /// as the deepest choice point that still has an untried alternative.
+    fn pick_union_decision(&mut self, r: bool) -> bool {
+        let st = self.state(r);
+        if st.depth >= st.used {
+            let i = st.used;
+            st.set(i, false);
+            st.used += 1;
+        }
+        let ui = st.get(st.depth);
+        st.depth += 1;
+        if !ui {
+            st.more = st.depth; // deepest available choice, memorized
+        }
+        ui
+    }
+
+    /// `pick_union_element` (`subtype.c:262–271`): descend a nested `Union`
+    /// spine, one recorded decision per level, to a single leaf arm.
+    fn pick_union_element(&mut self, mut u: Offset, r: bool) -> Offset {
+        loop {
+            u = if self.pick_union_decision(r) {
+                types::union_b(u)
+            } else {
+                types::union_a(u)
+            };
+            if !types::is_union(u) {
+                return u;
+            }
+        }
     }
 
     /// Narrow a binding's lower bound, keeping its rooted mirror current.
@@ -99,8 +249,12 @@ impl Env {
 /// `subtype.c:331–337`): the saved `lb`/`ub` values occupy their own
 /// shadow-stack frame (the C's GC-rooted `roots` array), so bounds the
 /// search narrows past before a restore cannot be reclaimed meanwhile.
+/// `rdepth` rides along (`se->rdepth`, `subtype.c:382`): restoring the env
+/// without restoring the right-union bit cursor would desynchronize nested
+/// re-traversals from the bits they are meant to re-read (`:476`).
 struct SavedVars {
     vars: Vec<VarBinding>,
+    rdepth: i32,
     _roots: Frame,
 }
 
@@ -111,11 +265,28 @@ fn save_vars(e: &Env) -> SavedVars {
         roots.set(i * 2, Value(b.lb));
         roots.set(i * 2 + 1, Value(b.ub));
     }
-    SavedVars { vars: e.vars.clone(), _roots: roots }
+    SavedVars { vars: e.vars.clone(), rdepth: e.runions.depth, _roots: roots }
+}
+
+/// Re-snapshot into an existing save (`re_save_env`): after a successful ∀
+/// pass, the accumulated constraints become the state later restores return
+/// to — constraints on outer-scope existentials persist across left arms.
+/// The binding count matches the original save (balanced push/pop), so the
+/// rooting frame is reused in place.
+fn re_save_vars(e: &Env, saved: &mut SavedVars) {
+    debug_assert_eq!(e.vars.len(), saved.vars.len(), "re-save at a different binding depth");
+    for (i, b) in e.vars.iter().enumerate() {
+        saved._roots.set(i * 2, Value(b.lb));
+        saved._roots.set(i * 2 + 1, Value(b.ub));
+    }
+    saved.vars.clear();
+    saved.vars.extend_from_slice(&e.vars);
+    saved.rdepth = e.runions.depth;
 }
 
 /// Restore the environment to a snapshot taken at the same binding depth
-/// (`restore_env`), re-syncing each binding's live bounds mirror.
+/// (`restore_env`), re-syncing each binding's live bounds mirror and the
+/// right-union bit cursor.
 fn restore_vars(e: &mut Env, saved: &SavedVars) {
     e.vars.clear();
     e.vars.extend_from_slice(&saved.vars);
@@ -123,9 +294,10 @@ fn restore_vars(e: &mut Env, saved: &SavedVars) {
         gc::set_slot(b.root_base, Value(b.lb));
         gc::set_slot(b.root_base + 1, Value(b.ub));
     }
+    e.runions.depth = saved.rdepth;
 }
 
-/// Entry point: decide `a <: b`.
+/// Entry point: decide `a <: b` (`jl_subtype_env` → `forall_exists_subtype`).
 pub fn subtype(a: Offset, b: Offset) -> bool {
     // The C expects the caller to root the query types; our host boundary
     // passes raw offsets, so the engine entry roots them for the query's
@@ -133,32 +305,110 @@ pub fn subtype(a: Offset, b: Offset) -> bool {
     // bound, or is itself freshly rooted at its allocation site).
     let _ra = Rooted::new(Value(a));
     let _rb = Rooted::new(Value(b));
-    let mut e = Env {
-        vars: Vec::new(),
-        invdepth: 0,
-    };
-    sub(a, b, &mut e, Param::None)
+    let mut e = Env::new();
+    forall_exists_subtype(a, b, &mut e, Param::None)
 }
 
-/// The main algorithm (`subtype` in `subtype.c`).
-fn sub(x: Offset, y: Offset, e: &mut Env, param: Param) -> bool {
+/// The ∀ driver (`forall_exists_subtype`, `subtype.c:2383–2404`): enumerate
+/// left-union arm combinations; each gets a complete fresh ∃ search. Failed
+/// ∃ attempts roll the env back to the snapshot; each *successful* ∀ pass
+/// re-saves, so constraints recorded on outer existentials accumulate across
+/// left arms (all arms must be satisfied by one assignment of any variable
+/// bound outside the split).
+fn forall_exists_subtype(x: Offset, y: Offset, e: &mut Env, param: Param) -> bool {
+    // The depth recursion has the following shape, after simplification:
+    // ∀₁ { ∃₁ }
+    debug_assert_eq!(e.runions.depth, 0);
+    debug_assert_eq!(e.lunions.depth, 0);
+    let mut se = save_vars(e);
+    e.lunions.used = 0;
+    loop {
+        let sub = exists_subtype(x, y, e, &se, param);
+        if !sub || !e.next_union_state(false) {
+            return sub;
+        }
+        re_save_vars(e, &mut se);
+    }
+}
+
+/// The ∃ driver (`exists_subtype`, `subtype.c:2359–2381`): under one fixed
+/// set of left-arm bits, enumerate right-union arm combinations until one
+/// full traversal succeeds. The right enumeration restarts fresh per ∀ pass
+/// (`Runions.used = 0`); the fixed L bits are re-read each attempt by
+/// resetting only the cursor and `more`.
+fn exists_subtype(x: Offset, y: Offset, e: &mut Env, se: &SavedVars, param: Param) -> bool {
+    e.runions.used = 0;
+    loop {
+        e.runions.depth = 0;
+        e.runions.more = 0;
+        e.lunions.depth = 0;
+        e.lunions.more = 0;
+        if sub(x, y, e, param) {
+            return true;
+        }
+        let more = e.next_union_state(true);
+        restore_vars(e, se);
+        if !more {
+            return false;
+        }
+    }
+}
+
+/// The main algorithm (`subtype` in `subtype.c:1903`).
+fn sub(mut x: Offset, mut y: Offset, e: &mut Env, param: Param) -> bool {
     if x == y {
         return true; // reflexive / uniqued-identical fast path
     }
 
-    // Union on the left is a forall: every member must be a subtype.
+    // Union on the left (`subtype.c:1905–1932`): pick ONE arm per the current
+    // `Lunions` bits and continue — the ∀ obligation ("every arm") is
+    // discharged by the outer driver re-running the query, not by `&&` here.
     if types::is_union(x) {
-        return sub(types::union_a(x), y, e, param) && sub(types::union_b(x), y, e, param);
-    }
-    // Union on the right is an exists: try each member, restoring the
-    // environment between attempts (a simplified `exists_subtype`).
-    if types::is_union(y) {
-        let saved = save_vars(e);
-        if sub(x, types::union_a(y), e, param) {
+        if obviously_egal(x, y) {
             return true;
         }
-        restore_vars(e, &saved);
-        return sub(x, types::union_b(y), e, param);
+        // Typevar-right fast path (`:1908–1931`, minus the intersection arm):
+        // with no right-union decisions pending and a ground union on the
+        // left, handle the variable against the whole union — matching or
+        // rejecting it wholesale via the binding's bounds. Skipped when the
+        // binding's upper bound references another existential, whose
+        // accumulated env changes could falsify the local check.
+        if e.runions.depth == 0 && types::is_typevar(y) && !has_free_typevars(x) {
+            let handle = match e.lookup(y) {
+                Some(i) => {
+                    !e.vars[i].existential || !has_existential_typevar(e.vars[i].ub, e)
+                }
+                None => true,
+            };
+            if handle {
+                return subtype_var(y, x, e, true, param);
+            }
+        }
+        x = e.pick_union_element(x, false);
+    }
+    // Union on the right (`subtype.c:1934–1951`): a left `UnionAll`
+    // introduces its ∀ variable *before* the union splits; a left typevar
+    // makes even the split-or-not decision a recorded machine choice (the
+    // `convert(Type{T},T)` pattern — try the whole union against the
+    // variable first, revisitably). Otherwise pick ONE arm per the current
+    // `Runions` bits; the ∃ obligation is the inner driver loop's.
+    if types::is_union(y) {
+        if obviously_in_union(y, x) {
+            return true;
+        }
+        if types::is_unionall(x) {
+            return subtype_unionall(y, x, e, false, param);
+        }
+        let mut ui = true;
+        if types::is_typevar(x) {
+            // For a forall var there is no need to split y unless it has
+            // free typevars (`:1940–1948`).
+            let xx_existential = e.lookup(x).map_or(false, |i| e.vars[i].existential);
+            ui = (xx_existential || has_free_typevars(y)) && e.pick_union_decision(true);
+        }
+        if ui {
+            y = e.pick_union_element(y, true);
+        }
     }
 
     // Type variables, handled before the ground cases (as in subtype.c).
@@ -349,26 +599,43 @@ fn var_gt(a: Offset, e: &mut Env, idx: usize, param: Param) -> bool {
     true
 }
 
-/// Run a variable's bound-consistency `sub` check in its own diagonal-rule
-/// scope (`subtype_ccheck` with `push`/`pop_consistency_scope`): covariant
-/// occurrences recorded inside fold into each variable's `cov_diag` (via max)
-/// rather than accumulating in the outer `occurs_cov`. Without this, checking
-/// one variable's bound would falsely make another variable diagonal.
-/// The check enters at `Param::None`, as `subtype_ccheck` does — a top-level
-/// variable occurrence inside a bound check is not a covariant occurrence.
+/// Run a variable's bound-consistency check in its own diagonal-rule scope
+/// (`subtype_ccheck`, `subtype.c:846–873`, with `push`/`pop_consistency_scope`):
+/// covariant occurrences recorded inside fold into each variable's `cov_diag`
+/// (via max) rather than accumulating in the outer `occurs_cov` — otherwise
+/// checking one variable's bound would falsely make another diagonal. The
+/// caller's `Lunions` is shielded (`:862, :871`) so the check's own left
+/// enumeration cannot corrupt the live traversal's bits, and the check enters
+/// at `Param::None` — a top-level occurrence inside a bound check is not a
+/// covariant occurrence. (The `Loffset` boxed-long arm waits for slice 3;
+/// the pin's `limit_slow = 1` explosion guard for slice 2.)
 fn ccheck(a: Offset, b: Offset, e: &mut Env) -> bool {
+    if a == b {
+        return true;
+    }
+    if a == types::builtin(id::BOTTOM) || b == types::builtin(id::ANY) {
+        return true;
+    }
+    if a == types::builtin(id::ANY) && types::is_datatype(b) {
+        return false;
+    }
+    if obviously_in_union(b, a) {
+        return true;
+    }
+    let old_l = push_unionstate(&e.lunions);
     let saved: Vec<i8> = e.vars.iter().map(|v| v.occurs_cov).collect();
     for v in e.vars.iter_mut() {
         v.occurs_cov = 0;
     }
-    let ok = sub(a, b, e, Param::None);
-    // Bindings pushed inside `sub` are balanced out by now; fold the survivors.
+    let ok = local_forall_exists_subtype(a, b, e, Param::None);
+    // Bindings pushed inside are balanced out by now; fold the survivors.
     for (i, v) in e.vars.iter_mut().enumerate() {
         if i < saved.len() {
             v.cov_diag = v.cov_diag.max(v.occurs_cov);
             v.occurs_cov = saved[i];
         }
     }
+    pop_unionstate(&mut e.lunions, &old_l);
     ok
 }
 
@@ -652,13 +919,19 @@ fn subtype_tuple_varargs(vtx: Offset, vty: Offset, e: &mut Env) -> bool {
     sub(xp0, yp0, e, Param::Covariant) && sub(xp0, yp0, e, Param::Covariant)
 }
 
-/// Invariant equality of two type parameters (`forall_exists_equal`): subtype in
-/// both directions. The forward direction runs at `Invariant`; the reverse runs
-/// at `Param::None`, as in the C — the occurrences were already recorded going
-/// forward. The environment is restored if the first direction narrows it but
-/// the second fails.
+/// Invariant equality of two type parameters (`forall_exists_equal`,
+/// `subtype.c:2311–2357`): subtype in both directions, each through
+/// [`local_forall_exists_subtype`]. The forward direction runs at
+/// `Invariant`; the reverse runs at `Param::None`, as in the C — the
+/// occurrences were already recorded going forward. The caller's `Lunions`
+/// is shielded around both directions (`:2347, 2355`); `Runions` is shared —
+/// that sharing is what makes the machine global (a right decision made deep
+/// inside an invariant check is revisitable by the outer ∃ loop).
+///
+/// Slice-2 remainders: the definite/indefinite tuple-length gate, the
+/// two-union greedy path, and the `equal_var` fast path.
 fn forall_exists_equal(x: Offset, y: Offset, e: &mut Env) -> bool {
-    if x == y {
+    if obviously_egal(x, y) {
         return true;
     }
     // Same-name nested constructor fast path: distinct constructors can never
@@ -673,12 +946,85 @@ fn forall_exists_equal(x: Offset, y: Offset, e: &mut Env) -> bool {
             return sub(x, y, e, Param::Invariant);
         }
     }
-    let saved = save_vars(e);
-    if !sub(x, y, e, Param::Invariant) {
-        restore_vars(e, &saved);
-        return false;
+    let old_l = push_unionstate(&e.lunions);
+    let mut ans = local_forall_exists_subtype(x, y, e, Param::Invariant);
+    if ans {
+        ans = local_forall_exists_subtype(y, x, e, Param::None);
     }
-    sub(y, x, e, Param::None)
+    pop_unionstate(&mut e.lunions, &old_l);
+    ans
+}
+
+/// A subtype query nested inside a larger one (`local_forall_exists_subtype`,
+/// `subtype.c:2189–2268`), continuing the caller's `Runions` stack with its
+/// own `Lunions` enumeration. Slice 1 ports the regime subset:
+///
+/// 1. `obviously_in_union` fast path (#49857).
+/// 2. Both sides ground → a completely fresh machine (nothing here can
+///    constrain the live query).
+/// 3. Neither side mentions an in-scope existential → a full nested
+///    [`forall_exists_subtype`] with both union states zeroed and `Runions`
+///    restored after ("saves some bits in union stack") — safe for the same
+///    reason.
+/// 4. Otherwise the general path, **without** the pin's freeze/`limit_slow`
+///    heuristics (`:2239–2251` — explosion guards, slice 2): enumerate ∀
+///    passes over `Lunions`, accumulating env changes; when a pass fails
+///    with a new right decision pending, flip it, roll the env back to the
+///    entry snapshot, and restart the ∀ enumeration from scratch. Correct,
+///    possibly slower — the answer set only grows without `limited`.
+fn local_forall_exists_subtype(x: Offset, y: Offset, e: &mut Env, param: Param) -> bool {
+    if obviously_in_union(y, x) {
+        return true;
+    }
+    let kindx = !has_free_typevars(x);
+    let kindy = !has_free_typevars(y);
+    if kindx && kindy {
+        return types::issubtype(x, y); // fresh machine (`jl_subtype`, `:2196–2199`)
+    }
+    let has_exists = (!kindx && has_existential_typevar(x, e))
+        || (!kindy && has_existential_typevar(y, e));
+    if !has_exists {
+        let old_r = push_unionstate(&e.runions);
+        e.lunions.used = 0;
+        e.lunions.depth = 0;
+        e.lunions.more = 0;
+        e.runions.used = 0;
+        e.runions.depth = 0;
+        e.runions.more = 0;
+        let ans = forall_exists_subtype(x, y, e, param);
+        pop_unionstate(&mut e.runions, &old_r);
+        return ans;
+    }
+    let old_rmore = e.runions.more;
+    let se = save_vars(e);
+    let mut ans;
+    loop {
+        // A fresh ∀ enumeration under the current right-bit prefix. Env
+        // changes accumulate across ∀ passes (the bound updates in
+        // `var_lt`/`var_gt` are the accumulation).
+        e.lunions.used = 0;
+        loop {
+            e.lunions.more = 0;
+            e.lunions.depth = 0;
+            ans = sub(x, y, e, param);
+            if !ans || !e.next_union_state(false) {
+                break;
+            }
+        }
+        if ans || e.runions.more == old_rmore {
+            break;
+        }
+        // A right decision discovered in here remains untried: flip it, roll
+        // back to the entry snapshot, and re-run the whole ∀ enumeration.
+        debug_assert!(e.runions.more > old_rmore);
+        e.next_union_state(true);
+        restore_vars(e, &se); // also restores the R bit cursor (`rdepth`)
+        e.runions.more = old_rmore;
+    }
+    if !ans {
+        debug_assert_eq!(e.runions.more, old_rmore);
+    }
+    ans
 }
 
 /// Greatest lower bound (`simple_meet`). For ground operands the GLB is the
@@ -721,4 +1067,131 @@ fn simple_join(a: Offset, b: Offset) -> Offset {
         return a;
     }
     types::union_type(a, b)
+}
+
+// --- structural fast-path helpers (`subtype.c:501–641, 1329–1344`) ----------
+
+/// Cheap structural equality (`obviously_egal`, `subtype.c:501–538`): never
+/// wrongly true, may be false for types that are semantically equal. Uniqued
+/// forms usually hit the identity fast path; the recursion matters for
+/// non-uniqued spines (unions, UnionAlls) and for uniqued constructors whose
+/// parameters embed them. Distinct type variables are never obviously egal.
+fn obviously_egal(a: Offset, b: Offset) -> bool {
+    if a == b {
+        return true;
+    }
+    if types::is_datatype(a) && types::is_datatype(b) {
+        if types::name_of(a) != types::name_of(b) {
+            return false;
+        }
+        let (pa, pb) = (types::parameters_of(a), types::parameters_of(b));
+        if pa == NULL || pb == NULL {
+            return false; // same non-parametric type would have been `==`
+        }
+        let n = types::svec_len(pa);
+        if n != types::svec_len(pb) {
+            return false;
+        }
+        return (0..n).all(|i| obviously_egal(types::svec_ref(pa, i), types::svec_ref(pb, i)));
+    }
+    if types::is_union(a) && types::is_union(b) {
+        return obviously_egal(types::union_a(a), types::union_a(b))
+            && obviously_egal(types::union_b(a), types::union_b(b));
+    }
+    if types::is_unionall(a) && types::is_unionall(b) {
+        return types::unionall_var(a) == types::unionall_var(b)
+            && obviously_egal(types::unionall_body(a), types::unionall_body(b));
+    }
+    if types::is_vararg(a) && types::is_vararg(b) {
+        if !obviously_egal(types::vararg_elem(a), types::vararg_elem(b)) {
+            return false;
+        }
+        let (na, nb) = (types::vararg_num(a), types::vararg_num(b));
+        if na == NULL && nb == NULL {
+            return true;
+        }
+        return na != NULL
+            && nb != NULL
+            && crate::builtins::egal(crate::object::Value(na), crate::object::Value(nb));
+    }
+    false
+}
+
+/// Whether every member of `x` is obviously a member of union `u`
+/// (`obviously_in_union`, `subtype.c:621–641`) — the cheap
+/// union-membership fast path both union arms and `ccheck` consult.
+fn obviously_in_union(u: Offset, x: Offset) -> bool {
+    if types::is_union(x) {
+        return obviously_in_union(u, types::union_a(x))
+            && obviously_in_union(u, types::union_b(x));
+    }
+    if types::is_union(u) {
+        return obviously_in_union(types::union_a(u), x)
+            || obviously_in_union(types::union_b(u), x);
+    }
+    obviously_egal(u, x)
+}
+
+/// Structural walk shared by [`has_free_typevars`] and
+/// [`has_existential_typevar`]: does `t` contain a *free* occurrence (not
+/// bound by a `UnionAll` within `t`) of a variable satisfying `pred`? A
+/// `UnionAll`'s variable binds only in its body; its declared bounds are
+/// checked with the variable still free, as `jl_has_free_typevars` does.
+fn has_free_var_where(
+    t: Offset,
+    bound: &mut Vec<Offset>,
+    pred: &dyn Fn(Offset) -> bool,
+) -> bool {
+    if types::is_typevar(t) {
+        return !bound.contains(&t) && pred(t);
+    }
+    if types::is_union(t) {
+        return has_free_var_where(types::union_a(t), bound, pred)
+            || has_free_var_where(types::union_b(t), bound, pred);
+    }
+    if types::is_vararg(t) {
+        if has_free_var_where(types::vararg_elem(t), bound, pred) {
+            return true;
+        }
+        let n = types::vararg_num(t);
+        return n != NULL && has_free_var_where(n, bound, pred);
+    }
+    if types::is_unionall(t) {
+        let v = types::unionall_var(t);
+        if has_free_var_where(types::tvar_lb(v), bound, pred)
+            || has_free_var_where(types::tvar_ub(v), bound, pred)
+        {
+            return true;
+        }
+        bound.push(v);
+        let r = has_free_var_where(types::unionall_body(t), bound, pred);
+        bound.pop();
+        return r;
+    }
+    if types::is_datatype(t) {
+        let p = types::parameters_of(t);
+        if p == NULL {
+            return false;
+        }
+        return (0..types::svec_len(p))
+            .any(|i| has_free_var_where(types::svec_ref(p, i), bound, pred));
+    }
+    false
+}
+
+/// `jl_has_free_typevars`: does `t` contain any type variable not bound by a
+/// `UnionAll` within `t` itself?
+fn has_free_typevars(t: Offset) -> bool {
+    has_free_var_where(t, &mut Vec::new(), &|_| true)
+}
+
+/// `has_existential_typevar` (`subtype.c:1329–1344`): does `t` mention (as a
+/// free occurrence) any variable whose binding in `e` is existential?
+fn has_existential_typevar(t: Offset, e: &Env) -> bool {
+    if !e.vars.iter().any(|b| b.existential) {
+        return false;
+    }
+    has_free_var_where(t, &mut Vec::new(), &|v| {
+        e.lookup(v).map_or(false, |i| e.vars[i].existential)
+    })
 }

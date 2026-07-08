@@ -358,23 +358,66 @@ const cases = [
     [Union(Union(Int, Int16), Int32), Union(Union(Int, Int8), Union(Int16, Int32))]],
   ["L393 !issub(Union{Union{A,B,C},Union{D}}, Union{A,C,D})", "notsub", () =>
     [Union(Union(Int, Union(Int8, Int16)), Int32), Union(Int, Union(Int16, Int32))]],
-];
 
-// Known divergences from the local union backtracking (vs Julia's global
-// Lunions/Runions decision machine — design/implementation.md, subtyping
-// findings 11/15 and "Union backtracking"). Run and reported, not failed; if one
-// starts passing, the machine has improved — promote it to `cases`.
-const knownDivergences = [
+  // --- the union-decision machine (engine slice 1, 2026-07): the two
+  // --- long-tracked divergences, healed and promoted, plus the tranche the
+  // --- machine unlocks (tuple-over-union distributivity, the nested-union
+  // --- stress canary, and the convert(Type{T},T) split-or-not pattern) ---
   ["L371 isequal_type(Tuple{Union{Int,Int8},Int16}, Union{Tuple{Int,Int16},Tuple{Int8,Int16}})", "equal", () =>
     [Tuple(Union(Int, Int8), Int16), Union(Tuple(Int, Int16), Tuple(Int8, Int16))]],
-  // Same family as L371: Tuple{Union{...}} <: (Tuple{Ref{T}} where T) needs a
-  // per-union-branch choice of T, which the global union-decision machine makes
-  // but local backtracking cannot. (test/subtype.jl:410, ≡ :449 under Ref->Box.)
   ["L410 issub(Tuple{Union{Vector{Int},Vector{Int8}}}, @UnionAll T Tuple{Vector{T}})", "sub", () => {
     const T = tvar();
     return [Tuple(Union(Ref(Int), Ref(Int8))), where(T, Tuple(Ref(T)))];
   }],
+  ["L373 issub_strict(Tuple{Int,Int8,Int}, Tuple{Vararg{Union{Int,Int8}}})", "strict", () =>
+    [Tuple(Int, Int8, Int), Tuple(Vararg(Union(Int, Int8)))]],
+  ["L374 issub_strict(Tuple{Int,Int8,Int}, Tuple{Vararg{Union{Int,Int8,Int16}}})", "strict", () =>
+    [Tuple(Int, Int8, Int), Tuple(Vararg(Union(Int, Union(Int8, Int16))))]],
+  ["L377 !issub(Union{Int,Ref{Union{Int,Int8}}}, Union{Int,Ref{Union{Int8,Int16}}})", "notsub", () =>
+    [Union(Int, Ref(Union(Int, Int8))), Union(Int, Ref(Union(Int8, Int16)))]],
+  // L396-401: "obviously these unions can be simplified, but when they aren't
+  // there's trouble" — the 8-way nested-union stress, a performance canary for
+  // the machine's binary counter (A=Int64 B=Int8 C=Int16 D=Int32).
+  ["L401 issub_strict(X8, Y8) — the nested-union stress", "strict", () => {
+    const [A, B, C, D] = [Int, Int8, Int16, Int32];
+    const abc = () => Union(A, Union(B, C));
+    const dbc = () => Union(D, Union(B, C));
+    const four = (m) => Union(m(), Union(m(), Union(m(), m())));
+    const X = Union(four(abc), four(abc));
+    const Y = Union(four(dbc), Union(dbc(), Union(dbc(), Union(dbc(), abc()))));
+    return [X, Y];
+  }],
+  // The convert(Type{T},T) pattern (u = Union{Int8,Int}): matching the whole
+  // union against the variable first is itself a recorded machine choice
+  // (subtype.c:1940-1948).
+  ["L445 issub(Tuple{Vector{u},Int}, @UnionAll T Tuple{Vector{T},T})", "sub", () => {
+    const T = tvar();
+    return [Tuple(Ref(Union(Int8, Int)), Int), where(T, Tuple(Ref(T), T))];
+  }],
+  ["L446 issub(Tuple{Vector{u},Int}, @UnionAll T @UnionAll S<:T Tuple{Vector{T},S})", "sub", () => {
+    const T = tvar();
+    const S = tvar(0, T);
+    return [Tuple(Ref(Union(Int8, Int)), Int), where(T, where(S, Tuple(Ref(T), S)))];
+  }],
+  // L448/L450: the same union under an *invariant* constructor stays false —
+  // the machine must not over-heal (forall_exists_equal needs both directions).
+  ["L448 !issub(Ref{Union{Ref{Int},Ref{Int8}}}, @UnionAll T Ref{Ref{T}})", "notsub", () => {
+    const T = tvar();
+    return [Ref(Union(Ref(Int), Ref(Int8))), where(T, Ref(Ref(T)))];
+  }],
+  ["L449 issub(Tuple{Union{Ref{Int},Ref{Int8}}}, @UnionAll T Tuple{Ref{T}})", "sub", () => {
+    const T = tvar();
+    return [Tuple(Union(Ref(Int), Ref(Int8))), where(T, Tuple(Ref(T)))];
+  }],
+  ["L450 !issub(Ref{Union{Ref{Int},Ref{Int8}}}, Union{Ref{Ref{Int}},Ref{Ref{Int8}}})", "notsub", () =>
+    [Ref(Union(Ref(Int), Ref(Int8))), Union(Ref(Ref(Int)), Ref(Ref(Int8)))]],
 ];
+
+// Known divergences (currently none — the union-decision machine healed both
+// tracked tuple-over-union cases, promoted above). Mechanism retained: a
+// behavior we cannot yet match goes here, runs on every invocation, reports
+// without failing the build, and announces itself if a fix heals it.
+const knownDivergences = [];
 
 // `identical` is Julia's `===` on types: with hash-consed construction, equal
 // tuples are the same object.

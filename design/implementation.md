@@ -324,12 +324,13 @@ flowchart LR
         CV["var_lt / var_gt — ccheck at PARAM_NONE,<br/>simple_meet→Intersect (#61917)"]
         CF --> CE --> CSUB --> CV
     end
-    subgraph R["Ruju Rust (~500 lines)"]
+    subgraph R["Ruju Rust (~1.1k lines)"]
         direction TB
-        RS2["subtype() — single entry"]
-        RSUB["sub() — unions split first, locally:<br/>left &&, right try/restore"]
+        RF["forall_exists_subtype — ∀ loop over<br/>Lunions states, re_save between (slice 1)"]
+        RE["exists_subtype — ∃ loop over Runions<br/>states, restore (incl. rdepth) between"]
+        RSUB["sub() — pick_union_element per machine bits;<br/>typevar/UnionAll priority over union split"]
         RV["var_lt / var_gt — ccheck at Param::None,<br/>simple_meet over-estimates"]
-        RS2 --> RSUB --> RV
+        RF --> RE --> RSUB --> RV
     end
     C ~~~ R
 ```
@@ -344,10 +345,13 @@ mapping is real: per-var `lb`/`ub` narrowing through
 **Audit findings.**
 10. ~~Two free typevars consulted bounds~~ — **fixed**: unconditionally
     false, as `subtype.c:1970`.
-11. **Dispatch-order divergences (open).** Julia gives typevar-left and
-    UnionAll-left priority over splitting a right-side union, and has a
-    typevar-right fast path before splitting a left union; Ruju splits
-    unions first, unconditionally. Changes which bounds get recorded.
+11. ~~Dispatch-order divergences~~ — **fixed (engine slice 1, 2026-07)**:
+    the typevar-right fast path before a left-union pick (`subtype.c:
+    1908–1931`, minus the intersection arm), UnionAll-left priority over a
+    right-union pick (`:1937–1938`), and the typevar-left split-or-not
+    machine decision (`:1940–1948`, the `convert(Type{T},T)` pattern,
+    oracle `test/subtype.jl:445–446`) all landed with the union-decision
+    machine.
 12. ~~`ccheck` ran at the caller's param~~ — **fixed**: enters at
     `Param::None`, as `subtype_ccheck` does.
 13. ~~`forall_exists_equal` reverse direction at Invariant~~ — **fixed**:
@@ -386,29 +390,32 @@ mapping is real: per-var `lb`/`ub` narrowing through
 
 Oracle: `runtime/verify_julia_subtype.mjs` runs assertions copied verbatim
 from JuliaLang/julia's own `test/subtype.jl` (mapping `Ref{T}`→`Box{T}`,
-`Int`→`Int64`) — currently 106/106 (all 2026-07): the unbounded-varargs slice
-added 19 cases (`test/subtype.jl:43–59,587–594`), the two-parameter `Pair`
-constructor added 8 invariant/`where`/diagonal cases (`:206–271`), and a
-curated expansion added 7 more bounded-typevar and diagonal `test_3` cases
-(`:205,214,238,241,264,267,273`) plus 2 passing tuple-over-union cases
-(`:413,416`) — all expressible with the existing ABI and passing on the current
-engine, so they widen coverage without new code. Plus **2** tracked known
-divergences, both tuple-over-union distributivity (`:371` and `:410` — the
-latter, `Tuple{Union{…}} <: Tuple{Ref{T}} where T`, added 2026-07): each needs
-a per-union-branch choice the global union-decision machine makes but local
-backtracking cannot; both self-report if a fix makes them pass.
+`Int`→`Int64`) — currently **117/117, 0 known divergences** (engine slice 1,
+2026-07). History: the unbounded-varargs slice added 19 cases
+(`test/subtype.jl:43–59,587–594`), the two-parameter `Pair` constructor added
+8 invariant/`where`/diagonal cases (`:206–271`), a curated expansion added 7
+bounded-typevar and diagonal `test_3` cases plus 2 passing tuple-over-union
+cases (106 total); the union-decision machine then **healed the two
+long-tracked distributivity divergences** (`:371`, `:410` — each needs a
+per-union-branch choice local backtracking cannot make; both self-reported
+FIXED on the machine's first run and were promoted to regular cases) and
+added 9 more: the vararg-over-union pair (`:373–374`), a nested-union reject
+(`:377`), the 8-way nested-union stress canary (`:396–401`), the
+`convert(Type{T},T)` pattern (`:445–446`), and the invariant-position
+family that must *stay* false (`:448–450`). The known-divergence mechanism
+is retained empty.
 
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
-| `jl_subtype` structural core | Partial | Faithful | reflexive/`Any`/`Bottom`, Union forall–exists, covariant tuples (incl. an unbounded-`Vararg` tail — `subtype_tuple`/`subtype_tuple_tail`/`subtype_tuple_varargs` length classification + tail walk, `subtype.c:1740–1899`, varargs slice 2026-07), nominal, invariant parametrics, `UnionAll`/`TypeVar` via the env. Audit 2026-06 fixes landed: free-vs-free typevars now unconditionally false; `forall_exists_equal` reverse check at `PARAM_NONE` + same-name-datatype fast path. Remaining divergences: unions split before typevar/UnionAll handling (Julia prioritizes the latter, `subtype.c:1934–1948`); no two-union greedy path; local union backtracking vs the global decision machine (see oracle's known divergence) |
+| `jl_subtype` structural core | Partial | Faithful | reflexive/`Any`/`Bottom`, Union forall–exists via the **global union-decision machine** (below), covariant tuples (incl. an unbounded-`Vararg` tail — `subtype_tuple`/`subtype_tuple_tail`/`subtype_tuple_varargs` length classification + tail walk, `subtype.c:1740–1899`, varargs slice 2026-07), nominal, invariant parametrics, `UnionAll`/`TypeVar` via the env, and the pin's dispatch order (typevar/UnionAll priority over union splits — finding 11, fixed). Remaining (slice 2+): the two-union greedy path, `equal_var`, the definite/indefinite tuple-length gate, regime 4 of `local_forall_exists_subtype`, the freeze/`limit_slow`/`env_unchanged` explosion guards, and the ∃-var-left guard on eager `UnionAll`-right unwrap (`subtype.c:2040–2052` — ours unwraps unconditionally, pre-existing shape) |
 | Existential env (`jl_stenv_t`) | Partial | Faithful | `var_lt`/`var_gt` narrow per-var `lb`/`ub`; ∀/∃ via the `existential` flag; `invdepth`/`depth0` order interacting existentials (`var_outside`, ∀∃-vs-∃∀). GC-rooted (engine slice 1, 2026-07): binding bounds mirrored in per-frame shadow-stack slots with write-through, snapshots root their saved bounds, the entry roots the query (`subtype.c:1378`, `:331–337`; finding 24). No `where`-var renaming or `innervars` leak handling |
 | Diagonal rule | Partial | Faithful | `occurs_cov` + `cov_diag` consistency-scope folding (`subtype_ccheck`), static `var_occurs_invariant`, `is_leaf_bound`; `ccheck` enters at `PARAM_NONE` (fixed, audit 2026-06); typevar lower bounds accepted (fixed — Julia also propagates `concrete=1` to that var, `subtype.c:1411–1415`, which we still don't); pinned C has newer machinery the port predates (`Intersect` #61917, `push_forall_bound_scope`, `Loffset`) |
-| Union backtracking | Partial | Faithful | env save/restore on the exists branch; not Julia's `Lunions`/`Runions` bit-stack iterator (`forall_exists_subtype`, `subtype.c:2383`) |
+| Union backtracking (the decision machine) | Partial | Faithful | **engine slice 1 (2026-07), reference-verified against the pin**: `jl_unionstate_t` as a bit-stack binary counter ×2 (`Lunions`/`Runions`; `statestack_get/set`, `next_union_state`, `pick_union_decision`, `pick_union_element` — `subtype.c:203–271`); the ∀/∃ driver loops `forall_exists_subtype`/`exists_subtype` (`:2359–2404`) with the exact save-discipline asymmetry (`re_save_env` after each successful ∀ pass so cross-arm constraints on outer existentials accumulate; `restore_env` between ∃ attempts), `Runions.depth` riding in the snapshot (`:382,476`); `push`/`pop_unionstate` shields in `forall_exists_equal` (`:2347,2355`) and `subtype_ccheck` (`:862,871`); `local_forall_exists_subtype` regimes 1–3 (`:2194–2211`) + the general path *without* the freeze/`limit_slow` heuristics (`:2239–2251` — explosion guards, pure pruning; ours is unlimited: correct, worst-case slower) and without regime 4 (a specialization). Healed both tracked oracle divergences (`:371,:410`) on first run |
 | `simple_meet` / `simple_join` | Partial | Faithful | join defers to the normalized `union_type` (keeps free vars, so `S>:T` survives); meet over-estimates to `b` for typevar operands (no `Intersect` node) |
 | `jl_type_intersection` | Planned | Faithful | — |
 | `jl_type_morespecific` | Partial | Faithful | subtype-based approximation |
 | Varargs | Partial | Faithful | unbounded `Vararg{T}` in tuple tails (varargs slice 2026-07): its own `jl_vararg_t`-analog value kind (element `T@0`, count `N@4`), the `subtype_tuple` length classification (`JL_VARARG_UNBOUND` vs `NONE`) and `subtype_tuple_tail`/`subtype_tuple_varargs` walk (`subtype.c:1740–1899`), and a `Vararg` arm in `var_occurs_invariant`. Fixed-count `Vararg{T,N}` (the `INT` kind) landed 2026-07: a trailing one **expands at tuple construction** as `inst_datatype_inner` does, so `Tuple{Int,Vararg{Int,2}} === Tuple{Int,Int,Int}` through uniquing (oracle: `test/subtype.jl:61–68`) and the subtype engine never sees a ground fixed-N vararg — expansion is unconditional, unlike the C's free-typevar guard (finding 23). Omitted: typevar-valued `N` (the `BOUND` kind — the `N` length algebra and `check_vararg_length` land with it), vararg uniquing, and the repeated-element/separable tail fast paths |
-| Fast paths (`obviously_egal`) | Planned | Faithful | — |
+| Fast paths (`obviously_egal`) | Partial | Faithful | `obviously_egal` (`subtype.c:501–538`, minus the `isconcretetype` early-out — an optimization over uniquing — and the TypeEq/Intersect arms whose node kinds don't exist here) and `obviously_in_union` (`:621–641`) landed with slice 1 as the machine's guards; `jl_obvious_subtype` and the repeated-element/separable tuple fast paths remain Planned |
 
 ## Method dispatch — `gf.c`, `typemap.c` vs `dispatch.rs`
 

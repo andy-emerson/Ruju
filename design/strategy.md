@@ -61,6 +61,13 @@ which needs a lowerer), AOT-first (roadmap inversion), and a flisp port
 source becomes a separate post-M5 milestone; `frontend.rs` is retained as a
 dev convenience; Emscripten is used at no stage in any role; the build-time
 Julia dependency is temporary — self-hosting removes it post-M5.
+*Distribution (decided 2026-07-07):* the pinned Julia (`d99fded` — a DEV
+commit with no official binary) is built **once** and published as a
+checksummed release artifact; the dev environment fetches and verifies that
+single pinned URL at setup. Agent-autonomous regeneration with a minimal,
+auditable supply-chain surface and no per-session source build; the build
+recipe is committed for reproducibility, and rebuilding the artifact is part
+of any pin advance.
 
 **AOT architecture (M4, decided 2026-07).** Typed IR comes from the pinned
 `Compiler/` loaded as a package in the build-time Julia (`typeinf_ircode`) —
@@ -135,7 +142,7 @@ flowchart TD
     EXC["exceptions [done: subset — reified values,<br/>finally; exception stack later]"]
 
     ORACLE["oracle capacity [done: 106 cases, growing]"]
-    SUBXM("subtype engine: union decision machine,<br/>Intersect/Loffset, concrete propagation (frontier)")
+    SUBXM("subtype engine: union decision machine [done],<br/>Intersect/Loffset, concrete propagation (frontier)")
     ISECT{"type intersection"}
     MORESPEC{"type_morespecific"}
     DISPX{"dispatch hardening: cache, ambiguity, MethodError"}
@@ -192,7 +199,7 @@ the frontier now, alongside depth work in the landed subsets.
 
 | Increment | What it is | What it unblocks |
 | - | - | - |
-| **subtype engine** | the global union-decision machine (`Lunions`/`Runions`), `Intersect`/`Loffset` from the pin, `concrete` propagation, typevar-count `Vararg{T,N}` — **research-grade**; measured by the 106-case oracle, which pre-maps 2 divergences it must heal. Slice 1 begun 2026-07: the ~~subtype-env rooting fix~~ landed first (finding 24 — the env, snapshots, and query are GC roots, stress-enforced), clearing the machine's widened-exposure risk before the driver loops land | type intersection → `type_morespecific` → dispatch hardening (the M3 spine) |
+| **subtype engine** | ~~slice 1~~ **landed 2026-07**: the rooting fix (finding 24, stress-enforced), then the global union-decision machine (`Lunions`/`Runions` bit-stacks, the ∀/∃ driver loops, dispatch-order fixes — finding 11 closed) — healed both pre-mapped oracle divergences on its first run; oracle 106→**117**, 0 known divergences. Remaining slices per `design/research/research-subtype-engine.md` §6: (2) full `local_forall_exists_subtype` + `forall_exists_equal` tail (greedy path, `equal_var`, freeze/`limit_slow`), (3) `Loffset` + typevar-count `Vararg{T,N}`, (4) `Intersect` + `concrete` propagation, (5) `envout` for dispatch | type intersection → `type_morespecific` → dispatch hardening (the M3 spine) |
 | **real `CodeInfo` (M2)** | build-time pre-lowering (decided 2026-07): the pinned native Julia lowers offline; Ruju loads serialized `CodeInfo` as data; grow `interp.rs` to the full lowered statement set (phi/phic/upsilon, `GlobalRef`, `QuoteNode`, `:method`, …); real toplevel scoping comes with it — plan in `design/research/research-real-lowering.md` | M2; `base/` code; method definitions from source |
 | **build-time pipeline** | the offline harness both M2 and M4 share: run the pinned Julia, serialize compiler artifacts (`CodeInfo` now, typed `IRCode` later) | real `CodeInfo`; the AOT backend |
 | **AOT thin slice** | the go/no-go experiment (spec: `design/research/research-aot-backend.md`): hand-transcribed typed IR → ~500-line `wasm-encoder` backend → registered in dispatch → benchmarked (≥100× interpreter; ≤3× native-Rust-in-wasm). Stage 2 forces the linear-memory shadow stack + region-base export | probes the AOT semantic-gap risk before M3/M4 invest; validates two-module linking |

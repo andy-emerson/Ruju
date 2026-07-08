@@ -1034,6 +1034,54 @@ mod tests {
     }
 
     #[test]
+    fn union_decision_machine_distributivity() {
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+        let tup = |elems: &[Offset]| types::tuple_type(elems);
+        let uall = types::unionall_type;
+        let tv = || types::make_typevar("T", types::builtin(id::BOTTOM), types::builtin(id::ANY));
+        let (int, int8, int16) = (t(id::INT64), t(id::INT8), t(id::INT16));
+        let u = |a, b| types::union_type(a, b);
+        let sub = types::issubtype;
+
+        // test/subtype.jl:371 — the backtrack point (the right union arm) is an
+        // ancestor of the left union: each left arm must choose its own right
+        // arm, which only the global machine's ∀-outside-∃ enumeration can do.
+        let lhs = tup(&[u(int, int8), int16]);
+        let rhs = u(tup(&[int, int16]), tup(&[int8, int16]));
+        assert!(sub(lhs, rhs) && sub(rhs, lhs), "L371 heals under the machine");
+
+        // test/subtype.jl:410/:449 — a fresh ∃T binding per ∀ pass lets each
+        // union branch pick its own T.
+        let t1 = tv();
+        let y = uall(t1, tup(&[types::box_type(t1)]));
+        let x = tup(&[u(types::box_type(int), types::box_type(int8))]);
+        assert!(sub(x, y), "L410/L449 heals under the machine");
+
+        // test/subtype.jl:448/:450 — under an *invariant* constructor the same
+        // union stays false; the machine must not over-heal.
+        let t2 = tv();
+        let y_inv = uall(t2, types::box_type(types::box_type(t2)));
+        let x_inv = types::box_type(u(types::box_type(int), types::box_type(int8)));
+        assert!(!sub(x_inv, y_inv), "L448 stays false (invariant position)");
+        let y_u = u(
+            types::box_type(types::box_type(int)),
+            types::box_type(types::box_type(int8)),
+        );
+        assert!(!sub(x_inv, y_u), "L450 stays false (invariant position)");
+
+        // test/subtype.jl:445 — the convert(Type{T},T) pattern: matching the
+        // whole union against the variable is a recorded, revisitable choice.
+        let t3 = tv();
+        let y_cv = uall(t3, tup(&[types::box_type(t3), t3]));
+        let x_cv = tup(&[types::box_type(u(int8, int)), int]);
+        assert!(sub(x_cv, y_cv), "L445 convert-pattern");
+
+        assert_eq!(gc::root_count(), 0, "roots released after machine queries");
+    }
+
+    #[test]
     fn interpreter_try_catch_transfers_control() {
         use crate::interp::{eval, Body, Builtin, Op, Stmt};
         let _g = serial();
