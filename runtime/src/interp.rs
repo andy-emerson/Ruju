@@ -89,6 +89,14 @@ pub enum Stmt {
     Call(Builtin, Vec<Op>),
     /// `ssa[i] = <dispatch generic function `id`>(args...)`
     CallGeneric(u32, Vec<Op>),
+    /// `ssa[i] = (args[0])(args[1..])` — the real `:call` shape
+    /// (`interpreter.c:242` → `jl_apply`): the callee is itself an evaluated
+    /// operand (typically an [`Op::Global`]), and dispatch keys off
+    /// `typeof(callee)` as `jl_apply_generic` does. A non-callable callee
+    /// throws (a `MethodError` in Julia; an `ErrorException` here until the
+    /// `MethodError` type lands with dispatch hardening — recorded).
+    #[allow(dead_code)] // pre-lowered code (M2 C-1) constructs it; tests exercise it now
+    CallValue(Vec<Op>),
     /// `slot[k] = op` (the assigned value is also `ssa[i]`)
     Assign(usize, Op),
     /// `global name = op` — assign the interned symbol's `Main` binding (the
@@ -357,6 +365,23 @@ fn eval_core(
                 guard!(read_args(args, &frame, ssa_base, &argf));
                 let vals: Vec<Value> = (0..args.len()).map(|j| argf.get(j)).collect();
                 let result = dispatch::invoke(*func, &vals);
+                drop(argf);
+                frame.set(ssa_base + ip, guard!(result));
+            }
+            Stmt::CallValue(args) => {
+                let argf = Frame::new(args.len());
+                guard!(read_args(args, &frame, ssa_base, &argf));
+                let callee = argf.get(0);
+                let result = match dispatch::func_of(callee) {
+                    Some(func) => {
+                        let vals: Vec<Value> = (1..args.len()).map(|j| argf.get(j)).collect();
+                        dispatch::invoke(func, &vals)
+                    }
+                    None => Err(crate::errors::error_exception(&format!(
+                        "MethodError: objects of type {} are not callable",
+                        crate::symbol::as_str(types::type_sym(object::type_of(callee)))
+                    ))),
+                };
                 drop(argf);
                 frame.set(ssa_base + ip, guard!(result));
             }

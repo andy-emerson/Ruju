@@ -613,6 +613,7 @@ fn push_roots(work: &mut Vec<Value>) {
     }
     crate::symbol::each_interned(|s| work.push(Value(s))); // symbols are immortal
     crate::dispatch::each_sig(|s| work.push(Value(s))); // method signatures
+    crate::dispatch::each_function(|t| work.push(Value(t))); // function singleton types
     crate::types::each_registered_struct(|t| work.push(Value(t))); // source-defined types
 }
 

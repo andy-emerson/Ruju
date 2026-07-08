@@ -37,9 +37,50 @@ fn table() -> &'static mut Vec<Entry> {
     unsafe { &mut *TABLE.0.get() }
 }
 
-/// Clear all methods (called when the runtime resets).
+/// Function values: each generic function is a zero-size singleton whose
+/// *type* identifies it — `jl_apply_generic` dispatches on `typeof(f)`, and
+/// this registry is the (type → function id) half of what Julia hangs off
+/// the type's method table. (offset of the singleton type, function id).
+struct Functions(UnsafeCell<Vec<(Offset, u32)>>);
+// Sound only because the runtime is single-threaded under wasm32 for now.
+unsafe impl Sync for Functions {}
+static FUNCTIONS: Functions = Functions(UnsafeCell::new(Vec::new()));
+
+fn functions() -> &'static mut Vec<(Offset, u32)> {
+    unsafe { &mut *FUNCTIONS.0.get() }
+}
+
+/// Clear all methods and function values (called when the runtime resets).
 pub fn reset() {
     table().clear();
+    functions().clear();
+}
+
+/// Create the callable value for generic function `func` (the shape of
+/// `jl_new_generic_function`): a fresh zero-size immutable type under the
+/// abstract `Function`, whose eager singleton instance *is* the function
+/// value. Dispatch keys off that type.
+#[allow(dead_code)] // the `:method` statement (M2 C-0 stage 3) constructs these; tests now
+pub fn make_function(name: &str, func: u32) -> Value {
+    let t = types::define_struct(name, types::builtin(types::id::FUNCTION), &[], false);
+    functions().push((t, func));
+    Value(types::instance_of(t))
+}
+
+/// The generic-function id of a callable value, by its type (`typeof(f)`,
+/// as `jl_apply_generic` keys its method-table lookup), or `None` if the
+/// value is not a registered function.
+pub fn func_of(v: Value) -> Option<u32> {
+    let t = object::type_of(v);
+    functions().iter().rev().find(|&&(ft, _)| ft == t).map(|&(_, f)| f)
+}
+
+/// Visit every function singleton type; the collector roots them (their
+/// instances are reachable through the types' `instance` fields).
+pub fn each_function(mut f: impl FnMut(Offset)) {
+    for &(t, _) in functions().iter() {
+        f(t);
+    }
 }
 
 /// Register a method: function `func`, signature tuple type `sig`, body `body`.

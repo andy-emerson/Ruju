@@ -1163,6 +1163,57 @@ mod tests {
     }
 
     #[test]
+    fn interpreter_calls_through_values() {
+        use crate::interp::{eval, Body, Builtin, Op, Stmt};
+        let _g = serial();
+        rj_init();
+        let sym = |s: &str| crate::symbol::intern(types::builtin(id::SYMBOL), s);
+
+        // double(x::Int64) = x + x, as a callable value bound to Main.double —
+        // then `double(21)` in Julia's lowered shape: the callee is a Global
+        // operand evaluated like any other, dispatch keys off typeof(callee).
+        const F_DOUBLE: u32 = 900;
+        dispatch::add_method(
+            F_DOUBLE,
+            types::tuple_type(&[types::builtin(id::INT64)]),
+            Body {
+                nslots: 1,
+                code: vec![
+                    Stmt::Call(Builtin::Add, vec![Op::Slot(0), Op::Slot(0)]),
+                    Stmt::Return(Op::Ssa(0)),
+                ],
+            },
+        );
+        let fval = dispatch::make_function("double", F_DOUBLE);
+        let dsym = sym("double");
+        let main = object::Value(crate::module::main_offset());
+        crate::module::set_global(main, dsym, fval).expect("bind Main.double");
+        assert!(types::issubtype(object::type_of(fval), types::builtin(id::FUNCTION)));
+
+        let b = Body {
+            nslots: 0,
+            code: vec![
+                Stmt::CallValue(vec![Op::Global(dsym), Op::Int(21)]),
+                Stmt::Return(Op::Ssa(0)),
+            ],
+        };
+        assert_eq!(crate::value::unbox_int(eval(&b).expect("call through value")), 42);
+
+        // A non-callable callee throws a catchable MethodError-shaped error.
+        let b = Body {
+            nslots: 0,
+            code: vec![
+                Stmt::Enter(3),
+                Stmt::CallValue(vec![Op::Int(3), Op::Int(4)]),
+                Stmt::Leave(1),
+                Stmt::Return(Op::Int(-1)),
+            ],
+        };
+        // ip 2 (Leave) is skipped on the throw; the catch lands at ip 3.
+        assert_eq!(crate::value::unbox_int(eval(&b).expect("caught")), -1);
+    }
+
+    #[test]
     fn interpreter_try_catch_transfers_control() {
         use crate::interp::{eval, Body, Builtin, Op, Stmt};
         let _g = serial();
