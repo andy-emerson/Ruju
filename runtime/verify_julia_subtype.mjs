@@ -411,6 +411,22 @@ const cases = [
   }],
   ["L450 !issub(Ref{Union{Ref{Int},Ref{Int8}}}, Union{Ref{Ref{Int}},Ref{Ref{Int8}}})", "notsub", () =>
     [Ref(Union(Ref(Int), Ref(Int8))), Union(Ref(Ref(Int)), Ref(Ref(Int8)))]],
+
+  // --- forall_exists_equal tail (engine slice 2, 2026-07): L371's property
+  // --- in *invariant* position, through the shared-Runions local machine ---
+  ["L452 isequal_type(Ref{Tuple{Union{Int,Int8},Int16}}, Ref{Union{Tuple{Int,Int16},Tuple{Int8,Int16}}})", "equal", () =>
+    [Ref(Tuple(Union(Int, Int8), Int16)), Ref(Union(Tuple(Int, Int16), Tuple(Int8, Int16)))]],
+  ["L453 isequal_type(Ref{T} where T<:Tuple{Union{Int,Int8},Int16}, Ref{T} where T<:Union{Tuple{Int,Int16},Tuple{Int8,Int16}})", "equal", () => {
+    const T1 = tvar(0, Tuple(Union(Int, Int8), Int16));
+    const T2 = tvar(0, Union(Tuple(Int, Int16), Tuple(Int8, Int16)));
+    return [where(T1, Ref(T1)), where(T2, Ref(T2))];
+  }],
+  ["L456 isequal_type(Ref{Tuple{Union{Int,Int8},Int16,T}} where T, Ref{Union{Tuple{Int,Int16,S},Tuple{Int8,Int16,S}}} where S)", "equal", () => {
+    const T = tvar();
+    const S = tvar();
+    return [where(T, Ref(Tuple(Union(Int, Int8), Int16, T))),
+            where(S, Ref(Union(Tuple(Int, Int16, S), Tuple(Int8, Int16, S))))];
+  }],
 ];
 
 // Known divergences (currently none — the union-decision machine healed both

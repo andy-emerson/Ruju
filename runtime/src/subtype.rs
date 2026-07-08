@@ -69,6 +69,17 @@ struct VarBinding {
     /// scope (`cov_diag`). The diagonal-rule test is `max(occurs_cov, cov_diag)
     /// > 1`, so checking one variable's bound does not make another diagonal.
     cov_diag: i8,
+    /// Invariant-position occurrences at a depth below the variable's
+    /// introduction, saturating at 2 (`occurs_inv`, `subtype.c:72,898–900`).
+    /// Recorded now; consumed by the envout fill and `Type{x}` widening
+    /// (slices 4–5) — an invariant occurrence *at* `depth0` still counts as
+    /// covariant, which is why the counter changes `occurs_cov` too.
+    occurs_inv: i8,
+    /// Whether the variable occurs invariantly in its `UnionAll` body —
+    /// `var_occurs_invariant(u->body, u->var)`, computed once at push as the
+    /// pin does (`subtype.c:1381,1385`) and consumed by the diagonal decision
+    /// and `env_unchanged`'s became-diagonal check.
+    body_occurs_inv: bool,
     /// Invariant-constructor nesting depth at which the variable was introduced
     /// (`depth0`). Distinguishes `∀A ∃B` from `∃B ∀A` when an existential and a
     /// universal variable interact.
@@ -506,6 +517,8 @@ fn subtype_unionall(t: Offset, u: Offset, e: &mut Env, r: bool, param: Param) ->
         existential: r,
         occurs_cov: 0,
         cov_diag: 0,
+        occurs_inv: 0,
+        body_occurs_inv: var_occurs_invariant(body, var, false),
         depth0: e.invdepth,
         root_base: mirror.slot_index(0),
     });
@@ -520,9 +533,8 @@ fn subtype_unionall(t: Offset, u: Offset, e: &mut Env, r: bool, param: Param) ->
     // concrete types, so its inferred lower bound must be a leaf type. E.g.
     // `Tuple{Int,Int} <: Tuple{T,T} where T` but not `Tuple{Int,Float64} <: ...`.
     let vb = e.vars[idx];
-    let body_occurs_inv = var_occurs_invariant(body, var, false);
     let cov = vb.occurs_cov.max(vb.cov_diag); // cov_count
-    let diagonal = cov > 1 && !body_occurs_inv;
+    let diagonal = cov > 1 && !vb.body_occurs_inv;
     // A typevar lower bound does not reject: each value of the referenced
     // (universal) variable is a single type, so the diagonal is satisfied.
     // Julia additionally propagates `concrete = 1` to that variable's binding —
@@ -559,14 +571,67 @@ fn subtype_var(b: Offset, a: Offset, e: &mut Env, r: bool, param: Param) -> bool
     }
 }
 
+/// Fast paths shared by comparisons against an expanded ∀-variable bound
+/// (`subtype_left_var`, `subtype.c:875–891`), minus the boxed-long `Loffset`
+/// arm (slice 3). The union-egal arm uses [`obviously_egal`] — a sound subset
+/// of the C's `jl_egal`; misses fall through to the full algorithm.
+fn subtype_left_var(x: Offset, y: Offset, e: &mut Env, param: Param) -> bool {
+    if x == y && !types::is_unionall(y) {
+        return true;
+    }
+    if x == types::builtin(id::BOTTOM) || y == types::builtin(id::ANY) {
+        return true;
+    }
+    if types::is_union(x) && obviously_egal(x, y) {
+        return true;
+    }
+    if x == types::builtin(id::ANY) && types::is_datatype(y) {
+        return false;
+    }
+    sub(x, y, e, param)
+}
+
+/// `push_forall_bound_scope` (`subtype.c:957–983`): when a ∀-variable's
+/// declared bound is expanded in `var_lt`/`var_gt`, occurrences contributed
+/// by the bound (which can only mention forall-side vars) must not combine
+/// with occurrences in the enclosing tuple body. Forall-side counters are
+/// reset before the recursive call and folded into `cov_diag` afterward;
+/// exists-side vars keep accumulating in the current scope.
+fn push_forall_bound_scope(e: &mut Env) -> Vec<i8> {
+    let saved: Vec<i8> = e.vars.iter().map(|v| v.occurs_cov).collect();
+    for v in e.vars.iter_mut() {
+        if !v.existential {
+            v.occurs_cov = 0;
+        }
+    }
+    saved
+}
+
+fn pop_forall_bound_scope(e: &mut Env, saved: &[i8]) {
+    for (i, v) in e.vars.iter_mut().enumerate() {
+        if i >= saved.len() {
+            break;
+        }
+        if !v.existential {
+            v.cov_diag = v.cov_diag.max(v.occurs_cov);
+            v.occurs_cov = saved[i];
+        }
+    }
+}
+
 /// `var_lt`: constrain the variable at `idx` by `<: a`, narrowing its upper
 /// bound when it is existential.
 fn var_lt(a: Offset, e: &mut Env, idx: usize, param: Param) -> bool {
     record_occurrence(e, idx, param);
     let bb = e.vars[idx];
     if !bb.existential {
-        // ∀b . b <: a   ⟺   ub <: a (the variable's widest value).
-        return sub(bb.ub, a, e, param);
+        // ∀b . b <: a   ⟺   ub <: a (the variable's widest value). The
+        // expanded bound's occurrences live in their own forall scope
+        // (`subtype.c:1040–1043`).
+        let saved = push_forall_bound_scope(e);
+        let ans = subtype_left_var(bb.ub, a, e, param);
+        pop_forall_bound_scope(e, &saved);
+        return ans;
     }
     if bb.ub == a {
         return true;
@@ -585,8 +650,12 @@ fn var_gt(a: Offset, e: &mut Env, idx: usize, param: Param) -> bool {
     record_occurrence(e, idx, param);
     let bb = e.vars[idx];
     if !bb.existential {
-        // ∀b . a <: b   ⟺   a <: lb (the variable's narrowest value).
-        return sub(a, bb.lb, e, param);
+        // ∀b . a <: b   ⟺   a <: lb (the variable's narrowest value), with
+        // the expanded bound's occurrences scoped (`subtype.c:1090–1093`).
+        let saved = push_forall_bound_scope(e);
+        let ans = subtype_left_var(a, bb.lb, e, param);
+        pop_forall_bound_scope(e, &saved);
+        return ans;
     }
     if bb.lb == a {
         return true;
@@ -627,7 +696,7 @@ fn ccheck(a: Offset, b: Offset, e: &mut Env) -> bool {
     for v in e.vars.iter_mut() {
         v.occurs_cov = 0;
     }
-    let ok = local_forall_exists_subtype(a, b, e, Param::None);
+    let ok = local_forall_exists_subtype(a, b, e, Param::None, 1);
     // Bindings pushed inside are balanced out by now; fold the survivors.
     for (i, v) in e.vars.iter_mut().enumerate() {
         if i < saved.len() {
@@ -692,12 +761,23 @@ fn subtype_two_vars(x: Offset, y: Offset, e: &mut Env, param: Param) -> bool {
     sub(xub, y, e, param) || sub(x, ylb, e, param)
 }
 
-/// Record a covariant occurrence of the variable at `idx` for the diagonal rule
-/// (`record_var_occurrence`). The counter saturates at 2; invariant occurrences
-/// are recognised statically (`var_occurs_invariant`) rather than counted here.
+/// Record where the variable at `idx` occurred (`record_var_occurrence`,
+/// `subtype.c:894–904`). Counters saturate at 2. An invariant occurrence
+/// counts toward `occurs_inv` only when it sits *below* the variable's
+/// introduction depth; an invariant occurrence at `depth0` (and every
+/// covariant one) counts toward `occurs_cov`. (`max_offset` waits for
+/// slice 3 with the vararg length algebra.)
 fn record_occurrence(e: &mut Env, idx: usize, param: Param) {
-    if param == Param::Covariant && e.vars[idx].occurs_cov < 2 {
-        e.vars[idx].occurs_cov += 1;
+    if param == Param::None {
+        return;
+    }
+    let vb = &mut e.vars[idx];
+    if param == Param::Invariant && e.invdepth > vb.depth0 {
+        if vb.occurs_inv < 2 {
+            vb.occurs_inv += 1;
+        }
+    } else if vb.occurs_cov < 2 {
+        vb.occurs_cov += 1;
     }
 }
 
@@ -922,18 +1002,25 @@ fn subtype_tuple_varargs(vtx: Offset, vty: Offset, e: &mut Env) -> bool {
 /// Invariant equality of two type parameters (`forall_exists_equal`,
 /// `subtype.c:2311–2357`): subtype in both directions, each through
 /// [`local_forall_exists_subtype`]. The forward direction runs at
-/// `Invariant`; the reverse runs at `Param::None`, as in the C — the
-/// occurrences were already recorded going forward. The caller's `Lunions`
-/// is shielded around both directions (`:2347, 2355`); `Runions` is shared —
-/// that sharing is what makes the machine global (a right decision made deep
-/// inside an invariant check is revisitable by the outer ∃ loop).
-///
-/// Slice-2 remainders: the definite/indefinite tuple-length gate, the
-/// two-union greedy path, and the `equal_var` fast path.
+/// `Invariant` with `limit_slow = -1`; the reverse runs at `Param::None`
+/// unlimited, as in the C — the occurrences were already recorded going
+/// forward. The caller's `Lunions` is shielded around both directions
+/// (`:2347, 2355`); `Runions` is shared — that sharing is what makes the
+/// machine global (a right decision made deep inside an invariant check is
+/// revisitable by the outer ∃ loop).
 fn forall_exists_equal(x: Offset, y: Offset, e: &mut Env) -> bool {
     if obviously_egal(x, y) {
         return true;
     }
+
+    // A tuple of definite length can never invariant-equal one of indefinite
+    // length (`:2315–2317`).
+    if (is_indefinite_length_tuple(x, e) && is_definite_length_tuple(y, e))
+        || (is_definite_length_tuple(x, e) && is_indefinite_length_tuple(y, e))
+    {
+        return false;
+    }
+
     // Same-name nested constructor fast path: distinct constructors can never
     // be invariant-equal, and for a same-name non-tuple constructor the
     // parameter comparison forwards to `forall_exists_equal` pairwise, which
@@ -946,18 +1033,144 @@ fn forall_exists_equal(x: Offset, y: Offset, e: &mut Env) -> bool {
             return sub(x, y, e, Param::Invariant);
         }
     }
+
+    // The two-union greedy path (`:2331–2339`): first try comparing the
+    // unions componentwise — itself a recorded right decision, so on failure
+    // the machine memorizes that this branch is to be skipped and the retry
+    // takes the general path. Sound only because the machine owns the bit.
+    if types::is_union(x) && types::is_union(y) && !e.pick_union_decision(true) {
+        return forall_exists_equal(types::union_a(x), types::union_a(y), e)
+            && forall_exists_equal(types::union_b(x), types::union_b(y), e);
+    }
+
+    // `TypeVar == Type` fast path (`:2341–2345`, `Loffset == 0` implicit
+    // until slice 3): merged var_gt+var_lt without the duplicated `<:`.
+    if types::is_typevar(y) && !types::is_typevar(x) {
+        return equal_var(y, x, e);
+    }
+
     let old_l = push_unionstate(&e.lunions);
-    let mut ans = local_forall_exists_subtype(x, y, e, Param::Invariant);
+    let mut ans = local_forall_exists_subtype(x, y, e, Param::Invariant, -1);
     if ans {
-        ans = local_forall_exists_subtype(y, x, e, Param::None);
+        ans = local_forall_exists_subtype(y, x, e, Param::None, 0);
     }
     pop_unionstate(&mut e.lunions, &old_l);
     ans
 }
 
+/// `equal_var` (`subtype.c:2270–2309`, minus the intersection/innervar arms):
+/// `TypeVar == Type` as a merged `var_gt`+`var_lt` that skips the redundant
+/// checks — after `ccheck(x, ub)` proves `x <: ub`, the upper bound is set to
+/// `x` directly ("skip `simple_meet` here as we have proven `x <: vb->ub`").
+fn equal_var(v: Offset, x: Offset, e: &mut Env) -> bool {
+    match e.lookup(v) {
+        None => x == v, // a free variable equals only itself
+        Some(idx) => {
+            record_occurrence(e, idx, Param::Invariant);
+            if !e.vars[idx].existential {
+                // ∀v: both directions against the fixed declared bounds.
+                let lb = e.vars[idx].lb;
+                let ub = e.vars[idx].ub;
+                return local_forall_exists_subtype(
+                    x,
+                    lb,
+                    e,
+                    Param::Invariant,
+                    (!has_free_typevars(x)) as i32,
+                ) && local_forall_exists_subtype(ub, x, e, Param::None, 0);
+            }
+            if e.vars[idx].lb == x {
+                return var_lt(x, e, idx, Param::None);
+            }
+            if !ccheck(x, e.vars[idx].ub, e) {
+                return false;
+            }
+            let j = simple_join(e.vars[idx].lb, x);
+            e.set_lb(idx, j);
+            if e.vars[idx].ub == x {
+                return true;
+            }
+            if !ccheck(e.vars[idx].lb, x, e) {
+                return false;
+            }
+            e.set_ub(idx, x);
+            true
+        }
+    }
+}
+
+/// `is_indefinite_length_tuple_type` (`subtype.c:2156–2163`): a tuple type
+/// whose last parameter is an unbounded `Vararg`.
+fn is_indefinite_length_tuple(x: Offset, _e: &Env) -> bool {
+    let x = unwrap_unionall(x);
+    if !types::is_datatype(x) || !types::is_tuple(x) {
+        return false;
+    }
+    let p = types::parameters_of(x);
+    let n = if p == NULL { 0 } else { types::svec_len(p) };
+    if n == 0 {
+        return false;
+    }
+    let last = types::svec_ref(p, n - 1);
+    types::is_vararg(last) && types::vararg_num(last) == NULL
+}
+
+/// `is_definite_length_tuple_type` (`subtype.c:2166–2177`): a tuple type of
+/// fixed arity (no trailing `Vararg`, or a ground-count one — which our
+/// construction expands, so `NONE` covers it). A typevar is judged by its
+/// declared upper bound.
+fn is_definite_length_tuple(x: Offset, _e: &Env) -> bool {
+    let x = if types::is_typevar(x) { types::tvar_ub(x) } else { x };
+    let x = unwrap_unionall(x);
+    if !types::is_datatype(x) || !types::is_tuple(x) {
+        return false;
+    }
+    let p = types::parameters_of(x);
+    let n = if p == NULL { 0 } else { types::svec_len(p) };
+    if n == 0 {
+        return true;
+    }
+    let last = types::svec_ref(p, n - 1);
+    !types::is_vararg(last) || types::vararg_num(last) != NULL
+}
+
+/// `jl_unwrap_unionall`: strip `where` wrappers to the underlying body.
+fn unwrap_unionall(mut t: Offset) -> Offset {
+    while types::is_unionall(t) {
+        t = types::unionall_body(t);
+    }
+    t
+}
+
+/// `env_unchanged` (`subtype.c:811–840`): did the search leave every
+/// existential binding's bounds untouched relative to the snapshot, without
+/// turning a previously non-diagonal leaf variable diagonal? Gates hiding
+/// newly-discovered right decisions on success (pure pruning: equivalent
+/// alternatives need not be revisited).
+fn env_unchanged(e: &Env, se: &SavedVars) -> bool {
+    debug_assert_eq!(e.vars.len(), se.vars.len());
+    for (v, s) in e.vars.iter().zip(se.vars.iter()) {
+        if !v.existential {
+            continue;
+        }
+        if v.lb != s.lb || v.ub != s.ub {
+            return false;
+        }
+        let saved_max = s.occurs_cov.max(s.cov_diag);
+        if is_leaf_typevar(v.var)
+            && !v.body_occurs_inv
+            && v.occurs_cov.max(v.cov_diag) > 1
+            && saved_max <= 1
+        {
+            return false; // a variable became diagonal from non-diagonal
+        }
+    }
+    true
+}
+
 /// A subtype query nested inside a larger one (`local_forall_exists_subtype`,
 /// `subtype.c:2189–2268`), continuing the caller's `Runions` stack with its
-/// own `Lunions` enumeration. Slice 1 ports the regime subset:
+/// own `Lunions` enumeration. The regimes:
 ///
 /// 1. `obviously_in_union` fast path (#49857).
 /// 2. Both sides ground → a completely fresh machine (nothing here can
@@ -966,13 +1179,25 @@ fn forall_exists_equal(x: Offset, y: Offset, e: &mut Env) -> bool {
 ///    [`forall_exists_subtype`] with both union states zeroed and `Runions`
 ///    restored after ("saves some bits in union stack") — safe for the same
 ///    reason.
-/// 4. Otherwise the general path, **without** the pin's freeze/`limit_slow`
-///    heuristics (`:2239–2251` — explosion guards, slice 2): enumerate ∀
-///    passes over `Lunions`, accumulating env changes; when a pass fails
-///    with a new right decision pending, flip it, roll the env back to the
-///    entry snapshot, and restart the ∀ enumeration from scratch. Correct,
-///    possibly slower — the answer set only grows without `limited`.
-fn local_forall_exists_subtype(x: Offset, y: Offset, e: &mut Env, param: Param) -> bool {
+/// 4. Exactly one side is an existential typevar → loop over `Lunions` only,
+///    no env save/restore between passes: with no cross-side ∃ choice to
+///    backtrack, the bound updates *are* the accumulation (`:2213–2223`).
+/// 5. The general slow path (`:2224–2267`), with the pin's two heuristics
+///    (slice 2): **freeze** — after a successful ∀ step that discovered no
+///    new right decisions (or when `limited`), commit the env and the
+///    `Lunions` prefix so later right-flips resume from it instead of
+///    restarting at pass 0; **`limit_slow`** — saturate at 4 ∀ passes, then
+///    freeze eagerly and hide the leftover right decisions from the caller.
+///    Lossy by design (can only flip answers `true`→`false`, never unsound
+///    `true`): the pin's explosion guard, `limit_slow == -1` resolving to
+///    "either side is ground".
+fn local_forall_exists_subtype(
+    x: Offset,
+    y: Offset,
+    e: &mut Env,
+    param: Param,
+    limit_slow: i32,
+) -> bool {
     if obviously_in_union(y, x) {
         return true;
     }
@@ -995,27 +1220,63 @@ fn local_forall_exists_subtype(x: Offset, y: Offset, e: &mut Env, param: Param) 
         pop_unionstate(&mut e.runions, &old_r);
         return ans;
     }
-    let old_rmore = e.runions.more;
-    let se = save_vars(e);
-    let mut ans;
-    loop {
-        // A fresh ∀ enumeration under the current right-bit prefix. Env
-        // changes accumulate across ∀ passes (the bound updates in
-        // `var_lt`/`var_gt` are the accumulation).
+    if is_existential_typevar(x, e) != is_existential_typevar(y, e) {
         e.lunions.used = 0;
         loop {
             e.lunions.more = 0;
             e.lunions.depth = 0;
+            let ans = sub(x, y, e, param);
+            if !ans || !e.next_union_state(false) {
+                return ans;
+            }
+        }
+    }
+    let limit_slow = if limit_slow == -1 {
+        (kindx || kindy) as i32
+    } else {
+        limit_slow
+    };
+    let old_rmore = e.runions.more;
+    let mut se = save_vars(e);
+    let mut limited = false;
+    let mut ini_count: i32 = 0;
+    let mut latest_l: Option<SavedUnionState> = None;
+    let mut ans;
+    loop {
+        let mut count = ini_count;
+        if ini_count == 0 {
+            e.lunions.used = 0;
+        } else {
+            // Resume from the frozen ∀ prefix rather than restarting at 0.
+            pop_unionstate(&mut e.lunions, latest_l.as_ref().unwrap());
+        }
+        loop {
+            e.lunions.more = 0;
+            e.lunions.depth = 0;
+            if count < 4 {
+                count += 1;
+            }
             ans = sub(x, y, e, param);
+            if limit_slow != 0 && count == 4 {
+                limited = true;
+            }
             if !ans || !e.next_union_state(false) {
                 break;
+            }
+            if limited || e.runions.more == old_rmore {
+                // Re-save the env and freeze the ∃ decisions made for the
+                // previous ∀ arms (`:2245–2251`).
+                ini_count = count;
+                latest_l = Some(push_unionstate(&e.lunions));
+                re_save_vars(e, &mut se);
+                e.runions.more = old_rmore;
             }
         }
         if ans || e.runions.more == old_rmore {
             break;
         }
         // A right decision discovered in here remains untried: flip it, roll
-        // back to the entry snapshot, and re-run the whole ∀ enumeration.
+        // back to the latest snapshot, and re-enumerate.
         debug_assert!(e.runions.more > old_rmore);
         e.next_union_state(true);
         restore_vars(e, &se); // also restores the R bit cursor (`rdepth`)
@@ -1023,8 +1284,17 @@ fn local_forall_exists_subtype(x: Offset, y: Offset, e: &mut Env, param: Param) 
     }
     if !ans {
         debug_assert_eq!(e.runions.more, old_rmore);
+    } else if e.runions.more > old_rmore && (limited || env_unchanged(e, &se)) {
+        // Hide the leftover ∃ decisions if the env is unchanged/limited —
+        // revisiting them cannot change the result (`:2262–2265`).
+        e.runions.more = old_rmore;
     }
     ans
+}
+
+/// `is_existential_typevar` (`subtype.c:2179–2184`).
+fn is_existential_typevar(x: Offset, e: &Env) -> bool {
+    types::is_typevar(x) && e.lookup(x).map_or(false, |i| e.vars[i].existential)
 }
 
 /// Greatest lower bound (`simple_meet`). For ground operands the GLB is the

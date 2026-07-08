@@ -1082,6 +1082,38 @@ mod tests {
     }
 
     #[test]
+    fn consistency_scope_keeps_bound_occurrences_separate() {
+        // test/subtype.jl:127-138 with Float64 standing in for String (no
+        // String type yet; the property is type-agnostic). The diagonal
+        // counter is scoped per consistency check: occurrences of T inside
+        // S's *bound* do not combine with T's occurrence in the outer body,
+        // so `Tuple{S,T} where {T, S<:Tuple{T}}` is not diagonal in T — but
+        // `S<:Tuple{T,T}` still is, both occurrences sharing the bound's
+        // Tuple frame.
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+        let tup = |elems: &[Offset]| types::tuple_type(elems);
+        let uall = types::unionall_type;
+        let (int, f64) = (t(id::INT64), t(id::FLOAT64));
+        let sub = types::issubtype;
+
+        // y1 = Tuple{S, T} where {T, S <: Tuple{T}}
+        let t1 = types::make_typevar("T", t(id::BOTTOM), t(id::ANY));
+        let s1 = types::make_typevar("S", t(id::BOTTOM), tup(&[t1]));
+        let y1 = uall(t1, uall(s1, tup(&[s1, t1])));
+        assert!(sub(tup(&[tup(&[f64]), int]), y1), "L129: bound occurrence is scoped");
+        assert!(sub(tup(&[tup(&[int]), int]), y1), "L131: same, agreeing element");
+
+        // y2 = Tuple{S, T} where {T, S <: Tuple{T, T}} — diagonal inside the bound.
+        let t2 = types::make_typevar("T", t(id::BOTTOM), t(id::ANY));
+        let s2 = types::make_typevar("S", t(id::BOTTOM), tup(&[t2, t2]));
+        let y2 = uall(t2, uall(s2, tup(&[s2, t2])));
+        assert!(!sub(tup(&[tup(&[int, int]), f64]), y2), "L135: still diagonal in the bound frame");
+        assert!(sub(tup(&[tup(&[int, int]), int]), y2), "L137: diagonal satisfied concretely");
+    }
+
+    #[test]
     fn interpreter_try_catch_transfers_control() {
         use crate::interp::{eval, Body, Builtin, Op, Stmt};
         let _g = serial();
