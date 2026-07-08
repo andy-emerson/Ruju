@@ -1,0 +1,70 @@
+# Build the pinned Julia once and publish it as a checksummed release asset
+# (design/strategy.md, D1 distribution note). The pin is a v1.14.0-DEV commit
+# with no official binary; this workflow is the committed, reproducible build
+# recipe. Re-run (with a new tag) whenever the pin advances.
+name: build-pinned-julia
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write # the release + asset upload
+
+env:
+  PIN: d99fded7bf84695d3f7afa1e88db0058529a70bb # reference/README.md
+  TAG: pinned-julia-d99fded
+  ARTIFACT: julia-d99fded-linux-x86_64.tar.gz
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gfortran perl python3 m4 cmake pkg-config curl libatomic1
+
+      - name: Fetch JuliaLang/julia at the pin
+        run: |
+          mkdir julia && cd julia
+          git init -q
+          git remote add origin https://github.com/JuliaLang/julia
+          git fetch --depth 1 origin "$PIN"
+          git checkout -q FETCH_HEAD
+          git rev-parse HEAD
+
+      - name: Build (prebuilt dependencies, portable CPU target)
+        working-directory: julia
+        run: |
+          cat > Make.user <<'EOF'
+          USE_BINARYBUILDER := 1
+          JULIA_CPU_TARGET := generic
+          EOF
+          make -j"$(nproc)"
+
+      - name: Sanity check
+        working-directory: julia
+        run: |
+          ./julia --version
+          ./julia -e 'using InteractiveUtils; versioninfo(); @assert Base.GIT_VERSION_INFO.commit == ENV["PIN"]'
+          # The one capability M2 consumes: parse + lower to CodeInfo.
+          ./julia -e '@assert Meta.lower(Main, :(f(x) = x + 1)).head === :thunk'
+
+      - name: Package
+        working-directory: julia
+        run: |
+          make binary-dist
+          mv julia-*.tar.gz "../$ARTIFACT"
+          cd ..
+          sha256sum "$ARTIFACT" | tee "$ARTIFACT.sha256"
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Pinned build-time Julia ($TAG)" \
+            --notes "Julia built at the reference pin \`$PIN\` (v1.14.0-DEV) with USE_BINARYBUILDER=1 and JULIA_CPU_TARGET=generic, per design/strategy.md D1's distribution decision. Build-time tool only — nothing from this artifact ships to the browser. Verify with the .sha256 file; the fetch script is tools/fetch-pinned-julia.sh." \
+            "$ARTIFACT" "$ARTIFACT.sha256"

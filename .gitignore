@@ -4,3 +4,6 @@
 # OS / editor noise
 .DS_Store
 *.swp
+
+# fetched build-time Julia (tools/fetch-pinned-julia.sh)
+tools/pinned-julia/
