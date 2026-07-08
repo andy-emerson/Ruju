@@ -143,6 +143,14 @@ pub enum Stmt {
     Push(Op, Op),
     /// `ssa[i] = length(a)`.
     Len(Op),
+    /// `Expr(:isdefined, op)` (`interpreter.c:251–260`): whether a slot has
+    /// been assigned (`locals[n] != NULL`) or a global is bound — without
+    /// evaluating it (an unbound global here is `false`, not a throw). SSA
+    /// results and constants are always defined. Boxed `Bool` result.
+    /// (`:splatnew` waits on runtime tuple values, `:static_parameter` on
+    /// the sparams environment — recorded in the ledger.)
+    #[allow(dead_code)] // pre-lowered code (M2 C-1) constructs it; tests exercise it now
+    IsDefined(Op),
     /// `Expr(:method, name)` — declare (or fetch) the generic function bound
     /// to the interned symbol in `Main` (`eval_methoddef`'s 1-arg arm,
     /// `interpreter.c:80–97,366` → `jl_declare_const_gf`, minus constness as
@@ -579,6 +587,17 @@ fn eval_core(
                 let av = guard!(read_op(*a, &frame, ssa_base));
                 guard!(expect_array(av));
                 frame.set(ssa_base + ip, box_int(crate::array::len(av) as i64));
+            }
+            Stmt::IsDefined(op) => {
+                let defined = match op {
+                    Op::Slot(k) => frame.get(*k) != Value::NULL,
+                    Op::Global(sym) => {
+                        crate::module::get_global(Value(crate::module::main_offset()), *sym)
+                            .is_some()
+                    }
+                    _ => true, // SSA results, literals, and constants
+                };
+                frame.set(ssa_base + ip, box_bool(defined));
             }
         }
         ip += 1;

@@ -1164,6 +1164,46 @@ mod tests {
     }
 
     #[test]
+    fn interpreter_isdefined() {
+        use crate::interp::{eval, Body, Op, Stmt};
+        let _g = serial();
+        rj_init();
+        let sym = |s: &str| crate::symbol::intern(types::builtin(id::SYMBOL), s);
+
+        // An unassigned slot is undefined; after assignment it is defined.
+        // An unbound global is undefined *without throwing* (contrast with
+        // reading it, which throws).
+        let g = sym("isdefined_probe");
+        let run1 = |code: Vec<Stmt>, nslots: usize| {
+            crate::value::unbox_bool(eval(&Body { nslots, code }).expect("isdefined"))
+        };
+        assert!(!run1(
+            vec![Stmt::IsDefined(Op::Slot(0)), Stmt::Return(Op::Ssa(0))],
+            1
+        ));
+        assert!(!run1(
+            vec![Stmt::IsDefined(Op::Global(sym("never_bound"))), Stmt::Return(Op::Ssa(0))],
+            0
+        ));
+        assert!(run1(
+            vec![
+                Stmt::Assign(0, Op::Int(1)),
+                Stmt::IsDefined(Op::Slot(0)),
+                Stmt::Return(Op::Ssa(1)),
+            ],
+            1
+        ));
+        assert!(run1(
+            vec![
+                Stmt::AssignGlobal(g, Op::Int(2)),
+                Stmt::IsDefined(Op::Global(g)),
+                Stmt::Return(Op::Ssa(1)),
+            ],
+            0
+        ));
+    }
+
+    #[test]
     fn interpreter_defines_methods_from_ir() {
         use crate::interp::{eval, Body, Builtin, Op, Stmt};
         let _g = serial();
