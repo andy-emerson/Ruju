@@ -1114,6 +1114,55 @@ mod tests {
     }
 
     #[test]
+    fn interpreter_global_and_const_operands() {
+        use crate::interp::{eval, Body, Builtin, Op, Stmt};
+        let _g = serial();
+        rj_init();
+        let sym = |s: &str| crate::symbol::intern(types::builtin(id::SYMBOL), s);
+
+        // global x = 41; return x + 1 — the write goes through Main's
+        // bindings; the read resolves at evaluation time (GlobalRef).
+        let x = sym("x");
+        let b = Body {
+            nslots: 0,
+            code: vec![
+                Stmt::AssignGlobal(x, Op::Int(41)),
+                Stmt::Call(Builtin::Add, vec![Op::Global(x), Op::Int(1)]),
+                Stmt::Return(Op::Ssa(1)),
+            ],
+        };
+        assert_eq!(crate::value::unbox_int(eval(&b).expect("global round-trip")), 42);
+        // ...and the binding persists in Main after the frame is gone.
+        let main = object::Value(crate::module::main_offset());
+        assert_eq!(crate::value::unbox_int(crate::module::get_global(main, x).unwrap()), 41);
+
+        // Reading an unbound global is a catchable exception, not a crash.
+        let b = Body {
+            nslots: 0,
+            code: vec![
+                Stmt::Enter(3),
+                Stmt::Return(Op::Global(sym("surely_undefined"))),
+                Stmt::Leave(1),
+                Stmt::Return(Op::Int(-1)),
+            ],
+        };
+        assert_eq!(crate::value::unbox_int(eval(&b).expect("caught by the handler")), -1);
+
+        // A boxed constant operand (the QuoteNode analog), kept reachable by
+        // the test as the IR's owner — the documented Const contract.
+        let c = box_int(7);
+        let _rc = gc::Rooted::new(c);
+        let b = Body {
+            nslots: 0,
+            code: vec![
+                Stmt::Call(Builtin::Add, vec![Op::Const(c.raw()), Op::Int(1)]),
+                Stmt::Return(Op::Ssa(0)),
+            ],
+        };
+        assert_eq!(crate::value::unbox_int(eval(&b).expect("const operand")), 8);
+    }
+
+    #[test]
     fn interpreter_try_catch_transfers_control() {
         use crate::interp::{eval, Body, Builtin, Op, Stmt};
         let _g = serial();

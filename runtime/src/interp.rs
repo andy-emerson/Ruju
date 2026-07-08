@@ -56,13 +56,30 @@ pub enum Builtin {
     Egal,
 }
 
-/// A statement operand: an SSA result, a local slot, or an integer constant.
+/// A statement operand: an SSA result, a local slot, an inline literal, a
+/// boxed constant, or a global binding (the value forms of `eval_value`,
+/// `interpreter.c:201–226`, for the shapes Ruju represents).
 #[derive(Clone, Copy)]
 pub enum Op {
     Ssa(usize),
     Slot(usize),
+    /// Inline unboxed literal, boxed on read — a bootstrap-front-end
+    /// convenience; pre-lowered code carries [`Op::Const`] instead.
     Int(i64),
     Float(f64),
+    /// A boxed constant (`QuoteNode` / an already-evaluated literal,
+    /// `interpreter.c:217`). The referenced value must stay GC-reachable
+    /// independently of this Rust-side IR (immortal, a singleton, or rooted
+    /// by the IR's owner) — the same contract as [`Stmt::New`]'s type.
+    #[allow(dead_code)] // pre-lowered code (M2 C-1) constructs it; tests exercise it now
+    Const(crate::region::Offset),
+    /// `GlobalRef` (`interpreter.c:220–221` → `jl_eval_globalref`, `:174`):
+    /// resolve the interned symbol's binding in `Main` at evaluation time;
+    /// unbound throws (`jl_undefined_var_error` — an `ErrorException` here
+    /// until `UndefVarError`'s world-age field is representable, recorded).
+    /// The module is implicitly `Main` until nested modules land (recorded).
+    #[allow(dead_code)] // pre-lowered code (M2 C-1) constructs it; tests exercise it now
+    Global(crate::region::Offset),
 }
 
 /// A lowered statement. Its result becomes `SSAValue(index)`.
@@ -74,6 +91,12 @@ pub enum Stmt {
     CallGeneric(u32, Vec<Op>),
     /// `slot[k] = op` (the assigned value is also `ssa[i]`)
     Assign(usize, Op),
+    /// `global name = op` — assign the interned symbol's `Main` binding (the
+    /// GlobalRef arm of `:=`, `interpreter.c:592–606`, via `jl_set_global` —
+    /// minus world age and constness, as `module.rs` records). The assigned
+    /// value is also `ssa[i]`.
+    #[allow(dead_code)] // pre-lowered code (M2 C-1) constructs it; tests exercise it now
+    AssignGlobal(crate::region::Offset, Op),
     /// `ip = target`
     Goto(usize),
     /// `if !cond { ip = target }`
@@ -128,13 +151,30 @@ pub struct Body {
     pub code: Vec<Stmt>,
 }
 
-fn read_op(op: Op, frame: &Frame, ssa_base: usize) -> Value {
+fn read_op(op: Op, frame: &Frame, ssa_base: usize) -> Result<Value, Value> {
     match op {
-        Op::Ssa(i) => frame.get(ssa_base + i),
-        Op::Slot(k) => frame.get(k),
-        Op::Int(c) => box_int(c),
-        Op::Float(c) => box_float64(c),
+        Op::Ssa(i) => Ok(frame.get(ssa_base + i)),
+        Op::Slot(k) => Ok(frame.get(k)),
+        Op::Int(c) => Ok(box_int(c)),
+        Op::Float(c) => Ok(box_float64(c)),
+        Op::Const(o) => Ok(Value(o)),
+        Op::Global(sym) => crate::module::get_global(Value(crate::module::main_offset()), sym)
+            .ok_or_else(|| {
+                crate::errors::error_exception(&format!(
+                    "UndefVarError: `{}` not defined in `Main`",
+                    crate::symbol::as_str(sym)
+                ))
+            }),
     }
+}
+
+/// Read every operand into the (rooted) argument frame; the first failure
+/// (an unbound global) aborts the statement.
+fn read_args(args: &[Op], frame: &Frame, ssa_base: usize, argf: &Frame) -> Result<(), Value> {
+    for (j, op) in args.iter().enumerate() {
+        argf.set(j, read_op(*op, frame, ssa_base)?);
+    }
+    Ok(())
 }
 
 /// Apply a numeric builtin, choosing the `Int64` or `Float64` intrinsic by the
@@ -275,14 +315,14 @@ fn eval_core(
                 continue;
             }
             Stmt::GotoIfNot(cond, target) => {
-                let c = read_op(*cond, &frame, ssa_base);
+                let c = guard!(read_op(*cond, &frame, ssa_base));
                 if !unbox_bool(c) {
                     ip = *target;
                     continue;
                 }
             }
             Stmt::Return(op) => {
-                let v = read_op(*op, &frame, ssa_base);
+                let v = guard!(read_op(*op, &frame, ssa_base));
                 let root = crate::gc::Rooted::new(v); // survives flush allocations
                 flush(&frame)?;
                 let v = root.get();
@@ -290,24 +330,31 @@ fn eval_core(
                 return Ok(v);
             }
             Stmt::Assign(slot, op) => {
-                let v = read_op(*op, &frame, ssa_base);
+                let v = guard!(read_op(*op, &frame, ssa_base));
                 frame.set(*slot, v);
                 frame.set(ssa_base + ip, v);
             }
+            Stmt::AssignGlobal(sym, op) => {
+                let v = guard!(read_op(*op, &frame, ssa_base));
+                // The frame slot roots the value across the binding store's
+                // possible table growth.
+                frame.set(ssa_base + ip, v);
+                guard!(crate::module::set_global(
+                    Value(crate::module::main_offset()),
+                    *sym,
+                    v
+                ));
+            }
             Stmt::Call(builtin, args) => {
                 let argf = Frame::new(args.len());
-                for (j, op) in args.iter().enumerate() {
-                    argf.set(j, read_op(*op, &frame, ssa_base));
-                }
+                guard!(read_args(args, &frame, ssa_base, &argf));
                 let result = apply(*builtin, &argf);
                 drop(argf);
                 frame.set(ssa_base + ip, guard!(result));
             }
             Stmt::CallGeneric(func, args) => {
                 let argf = Frame::new(args.len());
-                for (j, op) in args.iter().enumerate() {
-                    argf.set(j, read_op(*op, &frame, ssa_base));
-                }
+                guard!(read_args(args, &frame, ssa_base, &argf));
                 let vals: Vec<Value> = (0..args.len()).map(|j| argf.get(j)).collect();
                 let result = dispatch::invoke(*func, &vals);
                 drop(argf);
@@ -315,16 +362,14 @@ fn eval_core(
             }
             Stmt::New(ty, args) => {
                 let argf = Frame::new(args.len());
-                for (j, op) in args.iter().enumerate() {
-                    argf.set(j, read_op(*op, &frame, ssa_base));
-                }
+                guard!(read_args(args, &frame, ssa_base, &argf));
                 let vals: Vec<Value> = (0..args.len()).map(|j| argf.get(j)).collect();
                 let result = types::new_struct(*ty, &vals).map_err(crate::errors::wrap_msg);
                 drop(argf);
                 frame.set(ssa_base + ip, guard!(result));
             }
             Stmt::GetField(op, name_sym) => {
-                let v = read_op(*op, &frame, ssa_base);
+                let v = guard!(read_op(*op, &frame, ssa_base));
                 let t = object::type_of(v);
                 let i = guard!(types::field_index(t, *name_sym).ok_or_else(|| {
                     crate::errors::wrap_msg(format!(
@@ -337,8 +382,8 @@ fn eval_core(
                 frame.set(ssa_base + ip, r);
             }
             Stmt::SetField(obj, name_sym, rhs) => {
-                let v = read_op(*obj, &frame, ssa_base);
-                let r = read_op(*rhs, &frame, ssa_base);
+                let v = guard!(read_op(*obj, &frame, ssa_base));
+                let r = guard!(read_op(*rhs, &frame, ssa_base));
                 let t = object::type_of(v);
                 let i = guard!(types::field_index(t, *name_sym).ok_or_else(|| {
                     crate::errors::wrap_msg(format!(
@@ -359,7 +404,7 @@ fn eval_core(
                 }
             }
             Stmt::Throw(op) => {
-                let exc = read_op(*op, &frame, ssa_base);
+                let exc = guard!(read_op(*op, &frame, ssa_base));
                 if let Some(catch_ip) = handlers.pop() {
                     frame.set(exc_slot, exc); // rooted in the frame across the catch block
                     ip = catch_ip;
@@ -381,9 +426,7 @@ fn eval_core(
             }
             Stmt::ArrayLit(args) => {
                 let argf = Frame::new(args.len());
-                for (j, op) in args.iter().enumerate() {
-                    argf.set(j, read_op(*op, &frame, ssa_base));
-                }
+                guard!(read_args(args, &frame, ssa_base, &argf));
                 // Common concrete element type, or Any (Julia's typed literals
                 // come from base/'s promotion; this is the bootstrap subset).
                 let any = types::builtin(id::ANY);
@@ -405,25 +448,27 @@ fn eval_core(
                 frame.set(ssa_base + ip, a);
             }
             Stmt::ArrayRef(a, idx) => {
-                let (av, i) = (read_op(*a, &frame, ssa_base), read_op(*idx, &frame, ssa_base));
+                let av = guard!(read_op(*a, &frame, ssa_base));
+                let i = guard!(read_op(*idx, &frame, ssa_base));
                 let r = guard!(index_checked(av, i).and_then(|i0| crate::array::aref(av, i0)));
                 frame.set(ssa_base + ip, r);
             }
             Stmt::ArraySet(a, idx, rhs) => {
-                let (av, i) = (read_op(*a, &frame, ssa_base), read_op(*idx, &frame, ssa_base));
-                let r = read_op(*rhs, &frame, ssa_base);
+                let av = guard!(read_op(*a, &frame, ssa_base));
+                let i = guard!(read_op(*idx, &frame, ssa_base));
+                let r = guard!(read_op(*rhs, &frame, ssa_base));
                 guard!(index_checked(av, i).and_then(|i0| crate::array::aset(av, i0, r)));
                 frame.set(ssa_base + ip, r);
             }
             Stmt::Push(a, v) => {
-                let av = read_op(*a, &frame, ssa_base);
-                let vv = read_op(*v, &frame, ssa_base);
+                let av = guard!(read_op(*a, &frame, ssa_base));
+                let vv = guard!(read_op(*v, &frame, ssa_base));
                 guard!(expect_array(av));
                 guard!(crate::array::push(av, vv));
                 frame.set(ssa_base + ip, av);
             }
             Stmt::Len(a) => {
-                let av = read_op(*a, &frame, ssa_base);
+                let av = guard!(read_op(*a, &frame, ssa_base));
                 guard!(expect_array(av));
                 frame.set(ssa_base + ip, box_int(crate::array::len(av) as i64));
             }
