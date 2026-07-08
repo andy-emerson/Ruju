@@ -38,6 +38,7 @@ fn init_runtime() {
     region::init();
     gc::reset_heap();
     dispatch::reset();
+    errors::exc_reset();
     types::bootstrap();
     module::init_main();
     install_methods();
@@ -1438,6 +1439,63 @@ mod tests {
         );
         // An uncaught rethrow after finally propagates out.
         assert!(crate::frontend::eval_source("try\nthrow(1)\nfinally\nend").is_err());
+        assert_eq!(gc::root_count(), 0);
+    }
+
+    #[test]
+    fn source_nested_catch_in_finally_preserves_current_exception() {
+        let _g = serial();
+        rj_init();
+        let run = |s: &str| crate::value::unbox_int(crate::frontend::eval_source(s).unwrap());
+        // The M2 C-0 exception stack (pop_exception): the finally's cleanup
+        // contains its own try/catch, whose caught DivideError must be
+        // *retired* at its catch exit — the finally's rethrow then resumes
+        // the ORIGINAL exception (11), not the inner one. On the old
+        // single-cell model, the inner catch clobbered the outer exception
+        // (the recorded divergence this stage heals).
+        let src = "r = 0\n\
+                   try\n\
+                   try\n\
+                   throw(11)\n\
+                   finally\n\
+                   try\n\
+                   1 ÷ 0\n\
+                   catch\n\
+                   end\n\
+                   end\n\
+                   catch e\n\
+                   r = e\n\
+                   end\n\
+                   r";
+        assert_eq!(run(src), 11, "outer exception survives the nested catch");
+        assert_eq!(gc::root_count(), 0);
+    }
+
+    #[test]
+    fn interpreter_pop_exception_restores_stack_depth() {
+        use crate::interp::{eval, Body, Builtin, Op, Stmt};
+        let _g = serial();
+        rj_init();
+        // Hand-built IR replicating the shape without the front-end: outer
+        // try catches 111; its handler contains an inner try/catch (of a
+        // DivideError) that pops at exit; Rethrow must resume 111.
+        let b = Body {
+            nslots: 0,
+            code: vec![
+                Stmt::Enter(4),                                          // 0: outer
+                Stmt::Throw(Op::Int(111)),                               // 1
+                Stmt::Leave(1),                                          // 2 (skipped)
+                Stmt::Return(Op::Int(0)),                                // 3 (skipped)
+                Stmt::Enter(8),                                          // 4: inner, in outer catch
+                Stmt::Call(Builtin::IDiv, vec![Op::Int(1), Op::Int(0)]), // 5: DivideError
+                Stmt::Leave(1),                                          // 6 (skipped)
+                Stmt::Goto(9),                                           // 7 (skipped)
+                Stmt::PopException(Op::Ssa(4)),                          // 8: inner catch exit
+                Stmt::Rethrow,                                           // 9: must resume 111
+            ],
+        };
+        let err = eval(&b).expect_err("the outer exception propagates");
+        assert_eq!(crate::value::unbox_int(err), 111, "rethrow resumes the outer exception");
         assert_eq!(gc::root_count(), 0);
     }
 

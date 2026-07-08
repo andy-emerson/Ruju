@@ -13,6 +13,62 @@ use crate::gc::Rooted;
 use crate::object::{self, Value};
 use crate::types::{self, id};
 
+// --- the exception stack (`jl_excstack_t`) ----------------------------------
+//
+// Julia keeps a per-task stack of the exceptions currently being handled:
+// a throw landing in a handler pushes (`throw_internal`), `Expr(:enter)`
+// captures the depth (`jl_excstack_state`, `rtutils.c:365`), leaving a catch
+// scope truncates back to it (`jl_restore_excstack`, `:371`), and the
+// current exception is the top or `nothing` (`jl_current_exception`,
+// `jlapi.c:179–184`). Single-task, so one global stack is the task's.
+// The C stores (exception, backtrace) pairs; we have no backtraces yet
+// (recorded). Entries are GC roots (the collector walks them).
+
+struct ExcStack(core::cell::UnsafeCell<Vec<Value>>);
+// Sound only because the runtime is single-threaded under wasm32 for now.
+unsafe impl Sync for ExcStack {}
+static EXC_STACK: ExcStack = ExcStack(core::cell::UnsafeCell::new(Vec::new()));
+
+fn exc_stack() -> &'static mut Vec<Value> {
+    unsafe { &mut *EXC_STACK.0.get() }
+}
+
+/// Push a caught exception (the landing half of `throw_internal`).
+pub fn exc_push(v: Value) {
+    exc_stack().push(v);
+}
+
+/// The current exception: the stack top, or `nothing` outside any catch
+/// (`jl_current_exception`).
+pub fn exc_current() -> Value {
+    exc_stack().last().copied().unwrap_or(Value(types::nothing_instance()))
+}
+
+/// The current stack depth (`jl_excstack_state`) — captured by `Enter`.
+pub fn exc_state() -> usize {
+    exc_stack().len()
+}
+
+/// Truncate back to a captured depth (`jl_restore_excstack`) — the
+/// `:pop_exception` statement leaving a catch scope.
+pub fn exc_restore(state: usize) {
+    let s = exc_stack();
+    debug_assert!(s.len() >= state);
+    s.truncate(state);
+}
+
+/// Clear the stack (the region is being reset).
+pub fn exc_reset() {
+    exc_stack().clear();
+}
+
+/// Visit every in-flight exception; the collector roots them.
+pub fn each_exception(mut f: impl FnMut(Value)) {
+    for &v in exc_stack().iter() {
+        f(v);
+    }
+}
+
 /// The `DivideError()` singleton (`jl_diverror_exception`).
 pub fn divide_error() -> Value {
     Value(types::instance_of(types::builtin(id::DIVIDEERROR)))

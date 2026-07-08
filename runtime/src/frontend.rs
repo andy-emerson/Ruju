@@ -825,6 +825,11 @@ impl Lower {
                     self.emit(Stmt::Assign(slot, Op::Ssa(c)));
                 }
                 self.lower_block(handler)?;
+                // Leaving the catch scope retires its exception from the
+                // exception stack (`Expr(:pop_exception, enter-ssa)`, as
+                // real lowering emits) — without this, a nested catch would
+                // leave the outer scope's current exception clobbered.
+                self.emit(Stmt::PopException(Op::Ssa(enter)));
                 let end = self.code.len();
                 self.patch(gend, end);
                 None

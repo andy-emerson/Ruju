@@ -167,8 +167,16 @@ pub enum Stmt {
     /// (`Expr(:the_exception)` / `jl_current_exception`), for `catch e`.
     Caught,
     /// Re-throw the current exception (`jl_rethrow`) — the exception path of a
-    /// `finally` block resumes unwinding after the cleanup runs.
+    /// `finally` block resumes unwinding after the cleanup runs. Re-throws the
+    /// exception-stack top without pushing a duplicate (`throw_internal(ct,
+    /// NULL)`).
     Rethrow,
+    /// `Expr(:pop_exception, ssa)` (`interpreter.c:637–640` →
+    /// `jl_restore_excstack`): leaving a catch scope truncates the exception
+    /// stack back to the depth its `Enter` captured — the operand is that
+    /// `Enter`'s SSA result. This is what keeps a nested `catch` inside a
+    /// `finally` from clobbering the outer current exception.
+    PopException(Op),
 }
 
 /// A lowered method body: its statements and its number of local slots. For a
@@ -306,10 +314,7 @@ fn eval_core(
     flush: impl FnOnce(&Frame) -> Result<(), Value>,
 ) -> Result<Value, Value> {
     let ssa_base = body.nslots;
-    // One extra slot past the SSA values holds the current caught exception, so
-    // it stays rooted (in the frame) across allocations inside a catch block.
-    let exc_slot = body.nslots + body.code.len();
-    let frame = Frame::new(exc_slot + 1);
+    let frame = Frame::new(body.nslots + body.code.len());
     for &(i, v) in seed {
         frame.set(i, v);
     }
@@ -327,7 +332,10 @@ fn eval_core(
                 Ok(v) => v,
                 Err(e) => {
                     if let Some(catch_ip) = handlers.pop() {
-                        frame.set(exc_slot, e); // the caught exception, for `catch e`
+                        // The landing half of `throw_internal`: the caught
+                        // exception goes on the (GC-rooted) exception stack,
+                        // where `Caught` reads it and `PopException` retires it.
+                        crate::errors::exc_push(e);
                         ip = catch_ip;
                         continue;
                     }
@@ -442,6 +450,10 @@ fn eval_core(
             }
             Stmt::Enter(catch_ip) => {
                 handlers.push(*catch_ip);
+                // "store current top of exception stack for restore in
+                // pop_exception" (`interpreter.c:551–553`, boxed as the
+                // EnterNode's SSA result).
+                frame.set(ssa_base + ip, box_int(crate::errors::exc_state() as i64));
             }
             Stmt::Leave(n) => {
                 for _ in 0..*n {
@@ -451,7 +463,7 @@ fn eval_core(
             Stmt::Throw(op) => {
                 let exc = guard!(read_op(*op, &frame, ssa_base));
                 if let Some(catch_ip) = handlers.pop() {
-                    frame.set(exc_slot, exc); // rooted in the frame across the catch block
+                    crate::errors::exc_push(exc); // rooted on the exception stack
                     ip = catch_ip;
                     continue;
                 }
@@ -505,16 +517,20 @@ fn eval_core(
                 frame.set(ssa_base + ip, Value(types::nothing_instance()));
             }
             Stmt::Caught => {
-                frame.set(ssa_base + ip, frame.get(exc_slot));
+                frame.set(ssa_base + ip, crate::errors::exc_current());
             }
             Stmt::Rethrow => {
-                let exc = frame.get(exc_slot);
+                let exc = crate::errors::exc_current();
                 if let Some(catch_ip) = handlers.pop() {
-                    frame.set(exc_slot, exc);
+                    // The top already IS the current exception; no re-push.
                     ip = catch_ip;
                     continue;
                 }
                 return Err(exc);
+            }
+            Stmt::PopException(op) => {
+                let state = guard!(read_op(*op, &frame, ssa_base));
+                crate::errors::exc_restore(unbox_int(state) as usize);
             }
             Stmt::ArrayLit(args) => {
                 let argf = Frame::new(args.len());
