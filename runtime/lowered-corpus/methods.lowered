@@ -1,0 +1,21 @@
+RUJU_LOWERED 1 d99fded
+thunk 0 12
+method1 inc
+latestworld
+latestworld
+value global:inc
+call global:Typeof ssa:3
+call global:svec ssa:4 global:Any
+call global:svec
+call global:svec ssa:5 ssa:6 nothing
+method3 global:inc ssa:7 1 3
+value global:+
+call ssa:0 slot:0 int:1
+return ssa:1
+latestworld
+value global:inc
+return ssa:10
+thunk 0 3
+value global:inc
+call ssa:0 int:41
+return ssa:1

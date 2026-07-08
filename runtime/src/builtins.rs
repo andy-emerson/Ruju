@@ -158,3 +158,79 @@ fn egal_types(a: Offset, b: Offset, env: &mut Vec<(Offset, Offset)>, tvar_names:
 fn bits_equal(a: Offset, b: Offset, size: u32) -> bool {
     (0..size).all(|i| unsafe { *region::ptr_mut::<u8>(a + i) == *region::ptr_mut::<u8>(b + i) })
 }
+
+// --- callable Core builtins (`jl_f_*`, `builtins.c`) -------------------------
+//
+// Julia's `Core` functions are C builtins, not generic functions; these are
+// their analogs, registered as native function values (`dispatch::
+// make_native_function`) so pre-lowered code can call them through the
+// ordinary `:call` path. Arguments arrive rooted in the caller's argument
+// frame. Errors travel the reified-exception channel.
+
+fn arity(args: &[Value], n: usize, name: &str) -> Result<(), Value> {
+    if args.len() == n {
+        Ok(())
+    } else {
+        Err(crate::errors::error_exception(&format!("{}: expected {} arguments", name, n)))
+    }
+}
+
+/// `Core.svec` (`jl_f_svec`, any arity).
+pub fn f_svec(args: &[Value]) -> Result<Value, Value> {
+    let elems: Vec<Offset> = args.iter().map(|v| v.raw()).collect();
+    Ok(Value(types::svec_of(&elems)))
+}
+
+/// `Core.Typeof` / `typeof` (`jl_f_typeof`).
+pub fn f_typeof(args: &[Value]) -> Result<Value, Value> {
+    arity(args, 1, "typeof")?;
+    Ok(Value(object::type_of(args[0])))
+}
+
+/// `isa` (`jl_f_isa`).
+pub fn f_isa(args: &[Value]) -> Result<Value, Value> {
+    arity(args, 2, "isa")?;
+    Ok(crate::value::box_bool(types::is_a(args[0], args[1].raw())))
+}
+
+/// `throw` (`jl_f_throw`): the argument enters the exception channel.
+pub fn f_throw(args: &[Value]) -> Result<Value, Value> {
+    arity(args, 1, "throw")?;
+    Err(args[0])
+}
+
+/// A minimal `convert`: identity when the value already isa the target
+/// (the only case the toplevel typed-global dance reaches, since our
+/// binding types are all `Any`). Julia's real `convert` is generic `base/`
+/// code — recorded; this stands in until `base/` runs.
+pub fn f_convert(args: &[Value]) -> Result<Value, Value> {
+    arity(args, 2, "convert")?;
+    if types::is_a(args[1], args[0].raw()) {
+        return Ok(args[1]);
+    }
+    Err(crate::errors::error_exception("convert: no method (base/ convert not loaded)"))
+}
+
+/// `Core.declare_global`: our bindings are declared by first write and
+/// carry no constness or type restriction yet (module.rs's recorded scope),
+/// so the declaration itself is a no-op returning `nothing`.
+pub fn f_declare_global(args: &[Value]) -> Result<Value, Value> {
+    arity(args, 3, "declare_global")?;
+    Ok(Value(types::nothing_instance()))
+}
+
+/// `Core.get_binding_type`: every binding is `Any` until typed globals land
+/// (recorded with the module core).
+pub fn f_get_binding_type(args: &[Value]) -> Result<Value, Value> {
+    arity(args, 2, "get_binding_type")?;
+    Ok(Value(types::builtin(id::ANY)))
+}
+
+/// `Core.setglobal!` (`jl_f_setglobal`): the module argument collapses to
+/// `Main` until nested modules land (recorded). Returns the stored value.
+pub fn f_setglobal(args: &[Value]) -> Result<Value, Value> {
+    arity(args, 3, "setglobal!")?;
+    let main = Value(crate::module::main_offset());
+    crate::module::set_global(main, args[1].raw(), args[2])?;
+    Ok(args[2])
+}

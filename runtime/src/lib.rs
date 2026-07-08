@@ -13,6 +13,7 @@ mod dispatch;
 mod frontend;
 mod gc;
 mod interp;
+mod loader;
 mod object;
 mod region;
 mod array;
@@ -38,9 +39,11 @@ fn init_runtime() {
     region::init();
     gc::reset_heap();
     dispatch::reset();
+    errors::exc_reset();
     types::bootstrap();
     module::init_main();
     install_methods();
+    loader::install_prelude();
 }
 
 // Demo generic functions, installed at startup so the interpreter has something
@@ -175,6 +178,20 @@ pub extern "C" fn rj_eval_f64(len: u32) -> f64 {
     match core::str::from_utf8(bytes).ok().and_then(|s| frontend::eval_source(s).ok()) {
         Some(v) => value::unbox_float64(v),
         None => 0.0,
+    }
+}
+
+/// Parse and execute the source buffer as **pre-lowered** `CodeInfo` in the
+/// pin-versioned line format (`tools/prelower.jl` produces it; `loader.rs`
+/// consumes it), returning the `Int64` result (0 on a load/eval error) —
+/// M2's "load lowered code as data" entry point.
+#[no_mangle]
+pub extern "C" fn rj_load_lowered(len: u32) -> i64 {
+    ensure_init();
+    let bytes = unsafe { core::slice::from_raw_parts(SOURCE.0.get() as *const u8, len as usize) };
+    match core::str::from_utf8(bytes).ok().map(|s| loader::load_and_eval(s)) {
+        Some(Ok(v)) => unbox_int(v),
+        _ => 0,
     }
 }
 
@@ -974,6 +991,369 @@ mod tests {
     }
 
     #[test]
+    fn subtype_queries_survive_stress_collection() {
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+        let tup = |elems: &[Offset]| types::tuple_type(elems);
+        let uall = types::unionall_type;
+        let tv = |n: &str| types::make_typevar(n, types::builtin(id::BOTTOM), t(id::ANY));
+        let (int, int8, dt) = (t(id::INT64), t(id::INT8), t(id::DATATYPE));
+
+        // Build the queries first (the constructors root their own working
+        // sets), then run them with a collection forced at *every*
+        // allocation. Mid-query allocation sites — the kind rule's fresh
+        // `Type{T'} where T'` and `simple_join`'s fresh unions — must not
+        // let the query types, the env's narrowed bounds, or the saved
+        // snapshots be reclaimed (subtype.c roots exactly these:
+        // `jl_savedenv_t.roots`, the `JL_GC_PUSH` on `vb.lb`/`vb.ub`).
+        let s1 = tv("S");
+        let type_s = uall(s1, types::type_type(s1));
+        let t2 = tv("T");
+        let s2 = tv("S");
+        let diag_kind_body = tup(&[t2, t2, types::type_type(s2)]);
+        let diag_kind = uall(t2, uall(s2, diag_kind_body));
+        let lhs_kind = tup(&[int, int8, dt]);
+        let d3 = tv("T");
+        let diag = uall(d3, tup(&[d3, d3]));
+        let u4 = tv("S");
+        let exists_union = uall(u4, types::union_type(int8, u4));
+        let lhs_union = types::union_type(int, int8);
+
+        {
+            // The queries' own roots: the test stands in for the host, which
+            // holds offsets across allocating calls only under this contract.
+            // (Named locals drop in reverse declaration order — LIFO, as the
+            // shadow stack requires.)
+            let _r0 = gc::Rooted::new(Value(type_s));
+            let _r1 = gc::Rooted::new(Value(diag_kind));
+            let _r2 = gc::Rooted::new(Value(lhs_kind));
+            let _r3 = gc::Rooted::new(Value(diag));
+            let _r4 = gc::Rooted::new(Value(exists_union));
+            let _r5 = gc::Rooted::new(Value(lhs_union));
+            gc::set_stress(true);
+            // The kind rule allocates its fresh `Type{T'} where T'` mid-query.
+            assert!(types::issubtype(dt, type_s), "DataType <: (Type{{S}} where S)");
+            // Diagonal rejection must read T's freshly-allocated union lower
+            // bound *after* the kind rule's allocations freed-or-kept it.
+            assert!(
+                !types::issubtype(lhs_kind, diag_kind),
+                "diagonal T with a fresh union lb survives later allocations"
+            );
+            // Plain diagonal accept/reject under stress.
+            assert!(types::issubtype(tup(&[int, int]), diag));
+            assert!(!types::issubtype(tup(&[int, int8]), diag));
+            // Union backtracking with env narrowing under stress.
+            assert!(types::issubtype(lhs_union, exists_union));
+            gc::set_stress(false);
+        }
+        assert_eq!(gc::root_count(), 0, "roots released after stressed queries");
+    }
+
+    #[test]
+    fn union_decision_machine_distributivity() {
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+        let tup = |elems: &[Offset]| types::tuple_type(elems);
+        let uall = types::unionall_type;
+        let tv = || types::make_typevar("T", types::builtin(id::BOTTOM), types::builtin(id::ANY));
+        let (int, int8, int16) = (t(id::INT64), t(id::INT8), t(id::INT16));
+        let u = |a, b| types::union_type(a, b);
+        let sub = types::issubtype;
+
+        // test/subtype.jl:371 — the backtrack point (the right union arm) is an
+        // ancestor of the left union: each left arm must choose its own right
+        // arm, which only the global machine's ∀-outside-∃ enumeration can do.
+        let lhs = tup(&[u(int, int8), int16]);
+        let rhs = u(tup(&[int, int16]), tup(&[int8, int16]));
+        assert!(sub(lhs, rhs) && sub(rhs, lhs), "L371 heals under the machine");
+
+        // test/subtype.jl:410/:449 — a fresh ∃T binding per ∀ pass lets each
+        // union branch pick its own T.
+        let t1 = tv();
+        let y = uall(t1, tup(&[types::box_type(t1)]));
+        let x = tup(&[u(types::box_type(int), types::box_type(int8))]);
+        assert!(sub(x, y), "L410/L449 heals under the machine");
+
+        // test/subtype.jl:448/:450 — under an *invariant* constructor the same
+        // union stays false; the machine must not over-heal.
+        let t2 = tv();
+        let y_inv = uall(t2, types::box_type(types::box_type(t2)));
+        let x_inv = types::box_type(u(types::box_type(int), types::box_type(int8)));
+        assert!(!sub(x_inv, y_inv), "L448 stays false (invariant position)");
+        let y_u = u(
+            types::box_type(types::box_type(int)),
+            types::box_type(types::box_type(int8)),
+        );
+        assert!(!sub(x_inv, y_u), "L450 stays false (invariant position)");
+
+        // test/subtype.jl:445 — the convert(Type{T},T) pattern: matching the
+        // whole union against the variable is a recorded, revisitable choice.
+        let t3 = tv();
+        let y_cv = uall(t3, tup(&[types::box_type(t3), t3]));
+        let x_cv = tup(&[types::box_type(u(int8, int)), int]);
+        assert!(sub(x_cv, y_cv), "L445 convert-pattern");
+
+        assert_eq!(gc::root_count(), 0, "roots released after machine queries");
+    }
+
+    #[test]
+    fn consistency_scope_keeps_bound_occurrences_separate() {
+        // test/subtype.jl:127-138 with Float64 standing in for String (no
+        // String type yet; the property is type-agnostic). The diagonal
+        // counter is scoped per consistency check: occurrences of T inside
+        // S's *bound* do not combine with T's occurrence in the outer body,
+        // so `Tuple{S,T} where {T, S<:Tuple{T}}` is not diagonal in T — but
+        // `S<:Tuple{T,T}` still is, both occurrences sharing the bound's
+        // Tuple frame.
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+        let tup = |elems: &[Offset]| types::tuple_type(elems);
+        let uall = types::unionall_type;
+        let (int, f64) = (t(id::INT64), t(id::FLOAT64));
+        let sub = types::issubtype;
+
+        // y1 = Tuple{S, T} where {T, S <: Tuple{T}}
+        let t1 = types::make_typevar("T", t(id::BOTTOM), t(id::ANY));
+        let s1 = types::make_typevar("S", t(id::BOTTOM), tup(&[t1]));
+        let y1 = uall(t1, uall(s1, tup(&[s1, t1])));
+        assert!(sub(tup(&[tup(&[f64]), int]), y1), "L129: bound occurrence is scoped");
+        assert!(sub(tup(&[tup(&[int]), int]), y1), "L131: same, agreeing element");
+
+        // y2 = Tuple{S, T} where {T, S <: Tuple{T, T}} — diagonal inside the bound.
+        let t2 = types::make_typevar("T", t(id::BOTTOM), t(id::ANY));
+        let s2 = types::make_typevar("S", t(id::BOTTOM), tup(&[t2, t2]));
+        let y2 = uall(t2, uall(s2, tup(&[s2, t2])));
+        assert!(!sub(tup(&[tup(&[int, int]), f64]), y2), "L135: still diagonal in the bound frame");
+        assert!(sub(tup(&[tup(&[int, int]), int]), y2), "L137: diagonal satisfied concretely");
+    }
+
+    #[test]
+    fn interpreter_global_and_const_operands() {
+        use crate::interp::{eval, Body, Builtin, Op, Stmt};
+        let _g = serial();
+        rj_init();
+        let sym = |s: &str| crate::symbol::intern(types::builtin(id::SYMBOL), s);
+
+        // global x = 41; return x + 1 — the write goes through Main's
+        // bindings; the read resolves at evaluation time (GlobalRef).
+        let x = sym("x");
+        let b = Body {
+            nslots: 0,
+            code: vec![
+                Stmt::AssignGlobal(x, Op::Int(41)),
+                Stmt::Call(Builtin::Add, vec![Op::Global(x), Op::Int(1)]),
+                Stmt::Return(Op::Ssa(1)),
+            ],
+        };
+        assert_eq!(crate::value::unbox_int(eval(&b).expect("global round-trip")), 42);
+        // ...and the binding persists in Main after the frame is gone.
+        let main = object::Value(crate::module::main_offset());
+        assert_eq!(crate::value::unbox_int(crate::module::get_global(main, x).unwrap()), 41);
+
+        // Reading an unbound global is a catchable exception, not a crash.
+        let b = Body {
+            nslots: 0,
+            code: vec![
+                Stmt::Enter(3),
+                Stmt::Return(Op::Global(sym("surely_undefined"))),
+                Stmt::Leave(1),
+                Stmt::Return(Op::Int(-1)),
+            ],
+        };
+        assert_eq!(crate::value::unbox_int(eval(&b).expect("caught by the handler")), -1);
+
+        // A boxed constant operand (the QuoteNode analog), kept reachable by
+        // the test as the IR's owner — the documented Const contract.
+        let c = box_int(7);
+        let _rc = gc::Rooted::new(c);
+        let b = Body {
+            nslots: 0,
+            code: vec![
+                Stmt::Call(Builtin::Add, vec![Op::Const(c.raw()), Op::Int(1)]),
+                Stmt::Return(Op::Ssa(0)),
+            ],
+        };
+        assert_eq!(crate::value::unbox_int(eval(&b).expect("const operand")), 8);
+    }
+
+    #[test]
+    fn loader_executes_prelowered_fixtures() {
+        let _g = serial();
+        rj_init();
+        // The committed corpus fixtures are the pinned Julia's real lowering
+        // output (regenerated by tools/prelower.jl; verified against Julia's
+        // own execution by runtime/verify_julia_lowering.mjs). Embedding
+        // them keeps the loader covered without the build-time Julia.
+        let cases: &[(&str, i64)] = &[
+            (include_str!("../lowered-corpus/globals.lowered"), 3),
+            (include_str!("../lowered-corpus/methods.lowered"), 42),
+            (include_str!("../lowered-corpus/trycatch.lowered"), 42),
+            (include_str!("../lowered-corpus/control.lowered"), 55),
+        ];
+        for (fixture, expected) in cases {
+            let v = crate::loader::load_and_eval(fixture)
+                .unwrap_or_else(|e| panic!("fixture failed: {}", crate::errors::format(e)));
+            assert_eq!(crate::value::unbox_int(v), *expected);
+        }
+        assert_eq!(gc::root_count(), 0, "roots released after loading");
+
+        // Malformed input is a loud error, never a guess.
+        assert!(crate::loader::load_and_eval("BOGUS 9").is_err());
+        assert!(crate::loader::load_and_eval("RUJU_LOWERED 1 x\nthunk 0 1\nfrobnicate").is_err());
+    }
+
+    #[test]
+    fn interpreter_isdefined() {
+        use crate::interp::{eval, Body, Op, Stmt};
+        let _g = serial();
+        rj_init();
+        let sym = |s: &str| crate::symbol::intern(types::builtin(id::SYMBOL), s);
+
+        // An unassigned slot is undefined; after assignment it is defined.
+        // An unbound global is undefined *without throwing* (contrast with
+        // reading it, which throws).
+        let g = sym("isdefined_probe");
+        let run1 = |code: Vec<Stmt>, nslots: usize| {
+            crate::value::unbox_bool(eval(&Body { nslots, code }).expect("isdefined"))
+        };
+        assert!(!run1(
+            vec![Stmt::IsDefined(Op::Slot(0)), Stmt::Return(Op::Ssa(0))],
+            1
+        ));
+        assert!(!run1(
+            vec![Stmt::IsDefined(Op::Global(sym("never_bound"))), Stmt::Return(Op::Ssa(0))],
+            0
+        ));
+        assert!(run1(
+            vec![
+                Stmt::Assign(0, Op::Int(1)),
+                Stmt::IsDefined(Op::Slot(0)),
+                Stmt::Return(Op::Ssa(1)),
+            ],
+            1
+        ));
+        assert!(run1(
+            vec![
+                Stmt::AssignGlobal(g, Op::Int(2)),
+                Stmt::IsDefined(Op::Global(g)),
+                Stmt::Return(Op::Ssa(1)),
+            ],
+            0
+        ));
+    }
+
+    #[test]
+    fn interpreter_defines_methods_from_ir() {
+        use crate::interp::{eval, Body, Builtin, Op, Stmt};
+        let _g = serial();
+        rj_init();
+        let sym = |s: &str| crate::symbol::intern(types::builtin(id::SYMBOL), s);
+
+        // Expr(:method, :inc); Expr(:method, inc, Tuple{Int64}, body);
+        // then inc(41) through the Main binding — a function declared,
+        // defined, and called entirely from IR.
+        let inc = sym("inc");
+        let inner = Body {
+            nslots: 1,
+            code: vec![
+                Stmt::Call(Builtin::Add, vec![Op::Slot(0), Op::Int(1)]),
+                Stmt::Return(Op::Ssa(0)),
+            ],
+        };
+        let sig = types::tuple_type(&[types::builtin(id::INT64)]);
+        let b = Body {
+            nslots: 0,
+            code: vec![
+                Stmt::MethodFunc(inc),
+                Stmt::MethodDef(Op::Ssa(0), Op::Const(sig), inner),
+                Stmt::CallValue(vec![Op::Global(inc), Op::Int(41)]),
+                Stmt::Return(Op::Ssa(2)),
+            ],
+        };
+        assert_eq!(crate::value::unbox_int(eval(&b).expect("declare/define/call")), 42);
+
+        // Re-declaring the same name returns the same function value.
+        let b = Body {
+            nslots: 0,
+            code: vec![
+                Stmt::MethodFunc(inc),
+                Stmt::Call(Builtin::Egal, vec![Op::Ssa(0), Op::Global(inc)]),
+                Stmt::Return(Op::Ssa(1)),
+            ],
+        };
+        assert!(crate::value::unbox_bool(eval(&b).expect("redeclare")), "same value");
+
+        // Declaring over a non-function binding throws catchably.
+        let xsym = sym("not_a_function");
+        let b = Body {
+            nslots: 0,
+            code: vec![
+                Stmt::AssignGlobal(xsym, Op::Int(5)),
+                Stmt::Enter(5),
+                Stmt::MethodFunc(xsym),
+                Stmt::Leave(1),
+                Stmt::Return(Op::Int(0)), // not reached: the declare throws
+                Stmt::Return(Op::Int(-1)), // catch
+            ],
+        };
+        assert_eq!(crate::value::unbox_int(eval(&b).expect("caught")), -1);
+    }
+
+    #[test]
+    fn interpreter_calls_through_values() {
+        use crate::interp::{eval, Body, Builtin, Op, Stmt};
+        let _g = serial();
+        rj_init();
+        let sym = |s: &str| crate::symbol::intern(types::builtin(id::SYMBOL), s);
+
+        // double(x::Int64) = x + x, as a callable value bound to Main.double —
+        // then `double(21)` in Julia's lowered shape: the callee is a Global
+        // operand evaluated like any other, dispatch keys off typeof(callee).
+        const F_DOUBLE: u32 = 900;
+        dispatch::add_method(
+            F_DOUBLE,
+            types::tuple_type(&[types::builtin(id::INT64)]),
+            Body {
+                nslots: 1,
+                code: vec![
+                    Stmt::Call(Builtin::Add, vec![Op::Slot(0), Op::Slot(0)]),
+                    Stmt::Return(Op::Ssa(0)),
+                ],
+            },
+        );
+        let fval = dispatch::make_function("double", F_DOUBLE);
+        let dsym = sym("double");
+        let main = object::Value(crate::module::main_offset());
+        crate::module::set_global(main, dsym, fval).expect("bind Main.double");
+        assert!(types::issubtype(object::type_of(fval), types::builtin(id::FUNCTION)));
+
+        let b = Body {
+            nslots: 0,
+            code: vec![
+                Stmt::CallValue(vec![Op::Global(dsym), Op::Int(21)]),
+                Stmt::Return(Op::Ssa(0)),
+            ],
+        };
+        assert_eq!(crate::value::unbox_int(eval(&b).expect("call through value")), 42);
+
+        // A non-callable callee throws a catchable MethodError-shaped error.
+        let b = Body {
+            nslots: 0,
+            code: vec![
+                Stmt::Enter(3),
+                Stmt::CallValue(vec![Op::Int(3), Op::Int(4)]),
+                Stmt::Leave(1),
+                Stmt::Return(Op::Int(-1)),
+            ],
+        };
+        // ip 2 (Leave) is skipped on the throw; the catch lands at ip 3.
+        assert_eq!(crate::value::unbox_int(eval(&b).expect("caught")), -1);
+    }
+
+    #[test]
     fn interpreter_try_catch_transfers_control() {
         use crate::interp::{eval, Body, Builtin, Op, Stmt};
         let _g = serial();
@@ -1141,6 +1521,63 @@ mod tests {
         );
         // An uncaught rethrow after finally propagates out.
         assert!(crate::frontend::eval_source("try\nthrow(1)\nfinally\nend").is_err());
+        assert_eq!(gc::root_count(), 0);
+    }
+
+    #[test]
+    fn source_nested_catch_in_finally_preserves_current_exception() {
+        let _g = serial();
+        rj_init();
+        let run = |s: &str| crate::value::unbox_int(crate::frontend::eval_source(s).unwrap());
+        // The M2 C-0 exception stack (pop_exception): the finally's cleanup
+        // contains its own try/catch, whose caught DivideError must be
+        // *retired* at its catch exit — the finally's rethrow then resumes
+        // the ORIGINAL exception (11), not the inner one. On the old
+        // single-cell model, the inner catch clobbered the outer exception
+        // (the recorded divergence this stage heals).
+        let src = "r = 0\n\
+                   try\n\
+                   try\n\
+                   throw(11)\n\
+                   finally\n\
+                   try\n\
+                   1 ÷ 0\n\
+                   catch\n\
+                   end\n\
+                   end\n\
+                   catch e\n\
+                   r = e\n\
+                   end\n\
+                   r";
+        assert_eq!(run(src), 11, "outer exception survives the nested catch");
+        assert_eq!(gc::root_count(), 0);
+    }
+
+    #[test]
+    fn interpreter_pop_exception_restores_stack_depth() {
+        use crate::interp::{eval, Body, Builtin, Op, Stmt};
+        let _g = serial();
+        rj_init();
+        // Hand-built IR replicating the shape without the front-end: outer
+        // try catches 111; its handler contains an inner try/catch (of a
+        // DivideError) that pops at exit; Rethrow must resume 111.
+        let b = Body {
+            nslots: 0,
+            code: vec![
+                Stmt::Enter(4),                                          // 0: outer
+                Stmt::Throw(Op::Int(111)),                               // 1
+                Stmt::Leave(1),                                          // 2 (skipped)
+                Stmt::Return(Op::Int(0)),                                // 3 (skipped)
+                Stmt::Enter(8),                                          // 4: inner, in outer catch
+                Stmt::Call(Builtin::IDiv, vec![Op::Int(1), Op::Int(0)]), // 5: DivideError
+                Stmt::Leave(1),                                          // 6 (skipped)
+                Stmt::Goto(9),                                           // 7 (skipped)
+                Stmt::PopException(Op::Ssa(4)),                          // 8: inner catch exit
+                Stmt::Rethrow,                                           // 9: must resume 111
+            ],
+        };
+        let err = eval(&b).expect_err("the outer exception propagates");
+        assert_eq!(crate::value::unbox_int(err), 111, "rethrow resumes the outer exception");
         assert_eq!(gc::root_count(), 0);
     }
 

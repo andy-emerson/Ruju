@@ -61,6 +61,13 @@ which needs a lowerer), AOT-first (roadmap inversion), and a flisp port
 source becomes a separate post-M5 milestone; `frontend.rs` is retained as a
 dev convenience; Emscripten is used at no stage in any role; the build-time
 Julia dependency is temporary — self-hosting removes it post-M5.
+*Distribution (decided 2026-07-07):* the pinned Julia (`d99fded` — a DEV
+commit with no official binary) is built **once** and published as a
+checksummed release artifact; the dev environment fetches and verifies that
+single pinned URL at setup. Agent-autonomous regeneration with a minimal,
+auditable supply-chain surface and no per-session source build; the build
+recipe is committed for reproducibility, and rebuilding the artifact is part
+of any pin advance.
 
 **AOT architecture (M4, decided 2026-07).** Typed IR comes from the pinned
 `Compiler/` loaded as a package in the build-time Julia (`typeinf_ircode`) —
@@ -134,8 +141,8 @@ flowchart TD
     SUBXE["subtype expressibility [done: subset —<br/>typevar-N Vararg rides with the engine]"]
     EXC["exceptions [done: subset — reified values,<br/>finally; exception stack later]"]
 
-    ORACLE["oracle capacity [done: 106 cases, growing]"]
-    SUBXM("subtype engine: union decision machine,<br/>Intersect/Loffset, concrete propagation (frontier)")
+    ORACLE["oracle capacity [done: 120 cases, growing]"]
+    SUBXM("subtype engine: union decision machine [done],<br/>Intersect/Loffset, concrete propagation (frontier)")
     ISECT{"type intersection"}
     MORESPEC{"type_morespecific"}
     DISPX{"dispatch hardening: cache, ambiguity, MethodError"}
@@ -192,15 +199,15 @@ the frontier now, alongside depth work in the landed subsets.
 
 | Increment | What it is | What it unblocks |
 | - | - | - |
-| **subtype engine** | the global union-decision machine (`Lunions`/`Runions`), `Intersect`/`Loffset` from the pin, `concrete` propagation, typevar-count `Vararg{T,N}` — **research-grade**; measured by the 106-case oracle, which pre-maps 2 divergences it must heal | type intersection → `type_morespecific` → dispatch hardening (the M3 spine) |
-| **real `CodeInfo` (M2)** | build-time pre-lowering (decided 2026-07): the pinned native Julia lowers offline; Ruju loads serialized `CodeInfo` as data; grow `interp.rs` to the full lowered statement set (phi/phic/upsilon, `GlobalRef`, `QuoteNode`, `:method`, …); real toplevel scoping comes with it — plan in `design/research/research-real-lowering.md` | M2; `base/` code; method definitions from source |
+| **subtype engine** | ~~slices 1–2~~ **landed 2026-07**: the rooting fix (finding 24, stress-enforced), the global union-decision machine (`Lunions`/`Runions` bit-stacks, ∀/∃ drivers, dispatch-order fixes — finding 11 closed; both pre-mapped oracle divergences healed on first run), then the `forall_exists_equal` tail (greedy path, `equal_var`, tuple-length gate, `push_forall_bound_scope`/`occurs_inv`, freeze/`limit_slow`/`env_unchanged` explosion guards); oracle 106→**120**, 0 known divergences. Remaining slices per `design/research/research-subtype-engine.md` §6: (3) `Loffset` + typevar-count `Vararg{T,N}`, (4) `Intersect` + `concrete` propagation, (5) `envout` for dispatch | type intersection → `type_morespecific` → dispatch hardening (the M3 spine) |
+| **real `CodeInfo` (M2)** | build-time pre-lowering (decided 2026-07): the pinned native Julia lowers offline; Ruju loads serialized `CodeInfo` as data; grow `interp.rs` to the full lowered statement set — plan in `design/research/research-real-lowering.md`. **C-0 begun 2026-07**: ~~`QuoteNode`/`GlobalRef` operands + global assignment~~ (stage 1) ~~calls through values~~ (stage 2 — function values under the abstract `Function`, `typeof`-keyed dispatch), and ~~`:method` in both arities~~ (stage 3 — method definitions from IR), and ~~the exception stack + `:pop_exception`~~ (stage 4), and ~~`:isdefined`~~ (stage 5) landed — the statement vocabulary is now complete for the current value model (`:splatnew` waits on runtime tuple values, `:static_parameter` on the sparams environment); ~~**C-1**~~ landed 2026-07: `tools/prelower.jl` (the pinned Julia serializes its own lowering, pin-versioned format), `loader.rs` + `rj_load_lowered` (lowered `CodeInfo` loaded as data and executed), the operator/Core-builtin prelude, and the **lowering oracle** (`verify_julia_lowering.mjs` — same source, two executors, one answer; 4/4 corpus programs incl. method definitions, globals, try/catch, loops). **M2's definition is met for the represented subset** — the milestone call is the human's; remaining depth rides the corpus (strings, structs-from-source, closures, `:splatnew`/tuple values, heap-`CodeInfo` in-memory form). The pinned-Julia artifact (C-1's producer) is building via `.github/workflows/build-pinned-julia.yml` | M2; `base/` code; method definitions from source |
 | **build-time pipeline** | the offline harness both M2 and M4 share: run the pinned Julia, serialize compiler artifacts (`CodeInfo` now, typed `IRCode` later) | real `CodeInfo`; the AOT backend |
 | **AOT thin slice** | the go/no-go experiment (spec: `design/research/research-aot-backend.md`): hand-transcribed typed IR → ~500-line `wasm-encoder` backend → registered in dispatch → benchmarked (≥100× interpreter; ≤3× native-Rust-in-wasm). Stage 2 forces the linear-memory shadow stack + region-base export | probes the AOT semantic-gap risk before M3/M4 invest; validates two-module linking |
-| **depth in landed subsets** | N-D arrays, `popfirst!`/views, isbits-struct elements; the exception stack (`pop_exception`); nested modules/imports; `BFloat16`, permbox caches (findings 1, 9) | pulled in by demand from the two gates above |
+| **depth in landed subsets** | N-D arrays, `popfirst!`/views, isbits-struct elements; scoped `EnterNode`s and backtraces; nested modules/imports; `BFloat16`, permbox caches (findings 1, 9); the `AbstractArray` tower and exception field metadata (findings 22, 28, audit 2026-07) | pulled in by demand from the two gates above |
 | **arrays & GenericMemory** | landed 2026-07: ~~`GenericMemory` core~~ (the linear-memory buffer, get/set/length, GC element tracing + barrier), ~~1-D `Array` + growth~~ (`jl_array_grow_end`), ~~front-end syntax~~ (`[literals]`, `a[i]`, `push!`, `length`); remaining depth: N-D arrays, `popfirst!`/`deleteat!` (offset motion), shared views, isbits-struct/union elements | most real Julia programs; `base/` code |
 | **modules & bindings** | landed 2026-07: ~~`Main` + bindings~~ (`jl_module_t` core, get/set_global with barriers), ~~top-level globals persisting across evals~~ (REPL-style seed/flush); remaining depth: nested modules, imports/exports, `jl_binding_t` partitions/constness, real toplevel scoping (with real lowering) | `base/` code; method definitions from source |
 | **subtype expressibility** | landed 2026-07 (oracle 53→106): ~~unbounded varargs in tuples~~, ~~two-parameter `Pair` (multi-param invariant/diagonal)~~, ~~curated bounded/diagonal `test_3` expansion~~; ~~fixed-count `Vararg{T,N}` (expansion at construction)~~, ~~`Type{T}` kinds~~; remaining: typevar-count `Vararg{T,N}` (the `BOUND` kind — engine-adjacent: its length algebra lives in `jl_varbinding_t`) — bounded slices, each unlocking a tranche of `test/subtype.jl` for the oracle | grows the oracle toward the coverage the **engine slice** needs to be measurable; varargs also feeds dispatch |
-| **exceptions** | **complete as scoped** 2026-07: ~~`enter`/`leave`~~, ~~`throw`/`catch e` from source~~, ~~reified exception objects~~ (`rtutils.c` analog: `DivideError`/`BoundsError{a,i}`/`ErrorException` values in the error channel), ~~`finally`~~; remaining depth: the exception stack (`pop_exception`, nested-rethrow correctness), scoped `EnterNode`s | real lowering; `base/` code throws |
+| **exceptions** | **complete as scoped** 2026-07: ~~`enter`/`leave`~~, ~~`throw`/`catch e` from source~~, ~~reified exception objects~~ (`rtutils.c` analog: `DivideError`/`BoundsError{a,i}`/`ErrorException` values in the error channel), ~~`finally`~~, ~~the exception stack~~ (`pop_exception`, landed with M2 C-0 stage 4); remaining depth: scoped `EnterNode`s, backtraces | real lowering; `base/` code throws |
 
 ## Selection principles
 

@@ -67,8 +67,8 @@ A working runtime exists and runs via WebAssembly:
   shadow-stack rooting;
 - the type system — DataTypes, tuples (incl. varargs), unions, parametrics,
   `Type{T}` kinds, and the `where` machinery (`UnionAll`/`TypeVar`) — with a
-  subtype algorithm checked against 106 assertions from JuliaLang/julia's
-  `test/subtype.jl`;
+  subtype algorithm — including Julia's global union-decision machine —
+  checked against 120 assertions from JuliaLang/julia's `test/subtype.jl`;
 - multiple dispatch and a tree-walking interpreter over lowered IR, with
   exception handling (`try`/`catch`/`finally`, reified exception objects);
 - `GenericMemory`/`Array` buffers living in linear memory, with growth;

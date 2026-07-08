@@ -110,6 +110,22 @@ impl Frame {
     pub fn set(&self, i: usize, v: Value) {
         slots()[self.base + i] = v;
     }
+
+    /// Absolute shadow-stack index of slot `i`, for owners handing
+    /// write-through access to code that narrows rooted state after the
+    /// frame has left lexical reach (see [`set_slot`]).
+    pub fn slot_index(&self, i: usize) -> usize {
+        self.base + i
+    }
+}
+
+/// Overwrite an absolute shadow-stack slot obtained from
+/// [`Frame::slot_index`]. The subtype engine mirrors each binding's mutable
+/// `lb`/`ub` into a frame owned by `subtype_unionall` and writes narrowed
+/// bounds through here, so the *current* bounds are always rooted — the
+/// analog of the C rooting `vb.lb`/`vb.ub` with `JL_GC_PUSH` per frame.
+pub fn set_slot(index: usize, v: Value) {
+    slots()[index] = v;
 }
 
 impl Drop for Frame {
@@ -210,6 +226,10 @@ struct Heap {
     next_full: Cell<bool>,
     /// Pages walked by the most recent sweep (test introspection).
     pages_walked: Cell<usize>,
+    /// Stress mode (test support): collect on *every* allocation, so a heap
+    /// value held unrooted across an allocation is reclaimed at the first
+    /// opportunity instead of surviving by luck.
+    stress: Cell<bool>,
     /// Big objects (> the largest size class), young generation — walked by
     /// every sweep (`young_generation_of_bigvals`). (offset, total bytes).
     bigs_young: UnsafeCell<Vec<(Offset, u32)>>,
@@ -235,6 +255,7 @@ static HEAP: Heap = Heap {
     size_after_full: Cell::new(0),
     next_full: Cell::new(false),
     pages_walked: Cell::new(0),
+    stress: Cell::new(false),
     bigs_young: UnsafeCell::new(Vec::new()),
     bigs_old: UnsafeCell::new(Vec::new()),
     free_bigs: UnsafeCell::new(Vec::new()),
@@ -291,6 +312,16 @@ pub fn reset_heap() {
     HEAP.promoted.set(0);
     HEAP.size_after_full.set(0);
     HEAP.next_full.set(false);
+    HEAP.stress.set(false);
+}
+
+/// Enable or disable allocation stress mode (see `Heap::stress`). Test
+/// support: the auto-collect stress tests wrap rooting-sensitive paths in
+/// `set_stress(true)` so an unrooted-across-allocation bug fails
+/// deterministically rather than only under incidental heap pressure.
+#[allow(dead_code)] // test support, like the introspection accessors above
+pub fn set_stress(on: bool) {
+    HEAP.stress.set(on);
 }
 
 /// Live + freshly allocated bytes (introspection).
@@ -325,7 +356,9 @@ fn overallocation(old_val: u64, val: u64, max_val: u64) -> u64 {
 /// the heap target, full or quick per `next_sweep_full`. Called before each
 /// allocation once the core types exist.
 pub fn maybe_collect() {
-    if types::is_bootstrapped() && HEAP.heap_size.get() >= HEAP.heap_target.get() {
+    if types::is_bootstrapped()
+        && (HEAP.stress.get() || HEAP.heap_size.get() >= HEAP.heap_target.get())
+    {
         collect_inner(HEAP.next_full.get());
     }
 }
@@ -580,6 +613,8 @@ fn push_roots(work: &mut Vec<Value>) {
     }
     crate::symbol::each_interned(|s| work.push(Value(s))); // symbols are immortal
     crate::dispatch::each_sig(|s| work.push(Value(s))); // method signatures
+    crate::dispatch::each_function(|t| work.push(Value(t))); // function singleton types
+    crate::errors::each_exception(|v| work.push(v)); // in-flight caught exceptions
     crate::types::each_registered_struct(|t| work.push(Value(t))); // source-defined types
 }
 

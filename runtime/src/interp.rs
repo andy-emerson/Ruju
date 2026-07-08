@@ -56,24 +56,66 @@ pub enum Builtin {
     Egal,
 }
 
-/// A statement operand: an SSA result, a local slot, or an integer constant.
+/// A statement operand: an SSA result, a local slot, an inline literal, a
+/// boxed constant, or a global binding (the value forms of `eval_value`,
+/// `interpreter.c:201–226`, for the shapes Ruju represents).
 #[derive(Clone, Copy)]
 pub enum Op {
     Ssa(usize),
     Slot(usize),
+    /// Inline unboxed literal, boxed on read — a bootstrap-front-end
+    /// convenience; pre-lowered code carries [`Op::Const`] instead.
     Int(i64),
     Float(f64),
+    /// A boxed constant (`QuoteNode` / an already-evaluated literal,
+    /// `interpreter.c:217`). The referenced value must stay GC-reachable
+    /// independently of this Rust-side IR (immortal, a singleton, or rooted
+    /// by the IR's owner) — the same contract as [`Stmt::New`]'s type.
+    #[allow(dead_code)] // pre-lowered code (M2 C-1) constructs it; tests exercise it now
+    Const(crate::region::Offset),
+    /// `GlobalRef` (`interpreter.c:220–221` → `jl_eval_globalref`, `:174`):
+    /// resolve the interned symbol's binding in `Main` at evaluation time;
+    /// unbound throws (`jl_undefined_var_error` — an `ErrorException` here
+    /// until `UndefVarError`'s world-age field is representable, recorded).
+    /// The module is implicitly `Main` until nested modules land (recorded).
+    #[allow(dead_code)] // pre-lowered code (M2 C-1) constructs it; tests exercise it now
+    Global(crate::region::Offset),
 }
 
 /// A lowered statement. Its result becomes `SSAValue(index)`.
 #[derive(Clone)]
 pub enum Stmt {
+    /// `ssa[i] = op` — a bare value form as a statement (the `eval_body`
+    /// default arm: `locals[nslots + ip] = eval_value(stmt)`).
+    #[allow(dead_code)] // pre-lowered code (M2 C-1) constructs it; tests exercise it now
+    Value(Op),
     /// `ssa[i] = builtin(args...)`
     Call(Builtin, Vec<Op>),
     /// `ssa[i] = <dispatch generic function `id`>(args...)`
     CallGeneric(u32, Vec<Op>),
+    /// `ssa[i] = (args[0])(args[1..])` — the real `:call` shape
+    /// (`interpreter.c:242` → `jl_apply`): the callee is itself an evaluated
+    /// operand (typically an [`Op::Global`]), and dispatch keys off
+    /// `typeof(callee)` as `jl_apply_generic` does. A non-callable callee
+    /// throws (a `MethodError` in Julia; an `ErrorException` here until the
+    /// `MethodError` type lands with dispatch hardening — recorded).
+    #[allow(dead_code)] // pre-lowered code (M2 C-1) constructs it; tests exercise it now
+    CallValue(Vec<Op>),
     /// `slot[k] = op` (the assigned value is also `ssa[i]`)
     Assign(usize, Op),
+    /// `slot[k] = (args[0])(args[1..])` — an assignment whose right-hand
+    /// side is a call expression, as lowering emits (`Expr(:(=), slot,
+    /// Expr(:call, …))`; the C's `:(=)` arm evaluates the rhs through
+    /// `eval_value`, which handles `:call`). The call's value is stored to
+    /// the slot and is also `ssa[i]`.
+    #[allow(dead_code)] // pre-lowered code (M2 C-1) constructs it; tests exercise it now
+    AssignCall(usize, Vec<Op>),
+    /// `global name = op` — assign the interned symbol's `Main` binding (the
+    /// GlobalRef arm of `:=`, `interpreter.c:592–606`, via `jl_set_global` —
+    /// minus world age and constness, as `module.rs` records). The assigned
+    /// value is also `ssa[i]`.
+    #[allow(dead_code)] // pre-lowered code (M2 C-1) constructs it; tests exercise it now
+    AssignGlobal(crate::region::Offset, Op),
     /// `ip = target`
     Goto(usize),
     /// `if !cond { ip = target }`
@@ -112,12 +154,57 @@ pub enum Stmt {
     Push(Op, Op),
     /// `ssa[i] = length(a)`.
     Len(Op),
+    /// `Expr(:isdefined, op)` (`interpreter.c:251–260`): whether a slot has
+    /// been assigned (`locals[n] != NULL`) or a global is bound — without
+    /// evaluating it (an unbound global here is `false`, not a throw). SSA
+    /// results and constants are always defined. Boxed `Bool` result.
+    /// (`:splatnew` waits on runtime tuple values, `:static_parameter` on
+    /// the sparams environment — recorded in the ledger.)
+    #[allow(dead_code)] // pre-lowered code (M2 C-1) constructs it; tests exercise it now
+    IsDefined(Op),
+    /// `Expr(:method, name)` — declare (or fetch) the generic function bound
+    /// to the interned symbol in `Main` (`eval_methoddef`'s 1-arg arm,
+    /// `interpreter.c:80–97,366` → `jl_declare_const_gf`, minus constness as
+    /// `module.rs` records): unbound creates a fresh function value and binds
+    /// it; bound-to-a-function returns it; bound-to-anything-else throws.
+    /// The function value is this statement's SSA result.
+    #[allow(dead_code)] // pre-lowered code (M2 C-1) constructs it; tests exercise it now
+    MethodFunc(crate::region::Offset),
+    /// `Expr(:method, fname, atypes, meth)` — define a method
+    /// (`eval_methoddef`'s 3-arg arm, `interpreter.c:99–111,642` →
+    /// `jl_method_def`): the callee operand must evaluate to a function
+    /// value, the signature operand to a tuple type. The body rides inline
+    /// in the statement until the heap-`CodeInfo` reshape (the C evaluates
+    /// it as a `CodeInfo` value). Adaptations, recorded: our signatures are
+    /// `Tuple{argtypes...}` (Julia's argdata svec carries `typeof(f)` and
+    /// the sparam typevars), the result is `nothing` (no `jl_method_t`
+    /// objects yet), and the C confines the 3-arg form to toplevel frames
+    /// (`:641`) — we have no toplevel/method frame distinction yet.
+    #[allow(dead_code)] // pre-lowered code (M2 C-1) constructs it; tests exercise it now
+    MethodDef(Op, Op, Body),
     /// Bind the current caught exception as this statement's SSA value
     /// (`Expr(:the_exception)` / `jl_current_exception`), for `catch e`.
     Caught,
+    /// `slot[k] = Expr(:the_exception)` — the assignment form lowering emits
+    /// to bind `catch e` variables; value is also `ssa[i]`.
+    #[allow(dead_code)] // pre-lowered code (M2 C-1) constructs it; tests exercise it now
+    AssignCaught(usize),
     /// Re-throw the current exception (`jl_rethrow`) — the exception path of a
-    /// `finally` block resumes unwinding after the cleanup runs.
+    /// `finally` block resumes unwinding after the cleanup runs. Re-throws the
+    /// exception-stack top without pushing a duplicate (`throw_internal(ct,
+    /// NULL)`).
     Rethrow,
+    /// `Expr(:latestworld)`: advance the task's world age
+    /// (`interpreter.c:650–652`). A no-op here — single world until world
+    /// age lands with dispatch hardening (recorded).
+    #[allow(dead_code)] // pre-lowered code (M2 C-1) constructs it
+    LatestWorld,
+    /// `Expr(:pop_exception, ssa)` (`interpreter.c:637–640` →
+    /// `jl_restore_excstack`): leaving a catch scope truncates the exception
+    /// stack back to the depth its `Enter` captured — the operand is that
+    /// `Enter`'s SSA result. This is what keeps a nested `catch` inside a
+    /// `finally` from clobbering the outer current exception.
+    PopException(Op),
 }
 
 /// A lowered method body: its statements and its number of local slots. For a
@@ -128,13 +215,30 @@ pub struct Body {
     pub code: Vec<Stmt>,
 }
 
-fn read_op(op: Op, frame: &Frame, ssa_base: usize) -> Value {
+fn read_op(op: Op, frame: &Frame, ssa_base: usize) -> Result<Value, Value> {
     match op {
-        Op::Ssa(i) => frame.get(ssa_base + i),
-        Op::Slot(k) => frame.get(k),
-        Op::Int(c) => box_int(c),
-        Op::Float(c) => box_float64(c),
+        Op::Ssa(i) => Ok(frame.get(ssa_base + i)),
+        Op::Slot(k) => Ok(frame.get(k)),
+        Op::Int(c) => Ok(box_int(c)),
+        Op::Float(c) => Ok(box_float64(c)),
+        Op::Const(o) => Ok(Value(o)),
+        Op::Global(sym) => crate::module::get_global(Value(crate::module::main_offset()), sym)
+            .ok_or_else(|| {
+                crate::errors::error_exception(&format!(
+                    "UndefVarError: `{}` not defined in `Main`",
+                    crate::symbol::as_str(sym)
+                ))
+            }),
     }
+}
+
+/// Read every operand into the (rooted) argument frame; the first failure
+/// (an unbound global) aborts the statement.
+fn read_args(args: &[Op], frame: &Frame, ssa_base: usize, argf: &Frame) -> Result<(), Value> {
+    for (j, op) in args.iter().enumerate() {
+        argf.set(j, read_op(*op, frame, ssa_base)?);
+    }
+    Ok(())
 }
 
 /// Apply a numeric builtin, choosing the `Int64` or `Float64` intrinsic by the
@@ -238,10 +342,7 @@ fn eval_core(
     flush: impl FnOnce(&Frame) -> Result<(), Value>,
 ) -> Result<Value, Value> {
     let ssa_base = body.nslots;
-    // One extra slot past the SSA values holds the current caught exception, so
-    // it stays rooted (in the frame) across allocations inside a catch block.
-    let exc_slot = body.nslots + body.code.len();
-    let frame = Frame::new(exc_slot + 1);
+    let frame = Frame::new(body.nslots + body.code.len());
     for &(i, v) in seed {
         frame.set(i, v);
     }
@@ -259,7 +360,10 @@ fn eval_core(
                 Ok(v) => v,
                 Err(e) => {
                     if let Some(catch_ip) = handlers.pop() {
-                        frame.set(exc_slot, e); // the caught exception, for `catch e`
+                        // The landing half of `throw_internal`: the caught
+                        // exception goes on the (GC-rooted) exception stack,
+                        // where `Caught` reads it and `PopException` retires it.
+                        crate::errors::exc_push(e);
                         ip = catch_ip;
                         continue;
                     }
@@ -275,56 +379,86 @@ fn eval_core(
                 continue;
             }
             Stmt::GotoIfNot(cond, target) => {
-                let c = read_op(*cond, &frame, ssa_base);
+                let c = guard!(read_op(*cond, &frame, ssa_base));
                 if !unbox_bool(c) {
                     ip = *target;
                     continue;
                 }
             }
             Stmt::Return(op) => {
-                let v = read_op(*op, &frame, ssa_base);
+                let v = guard!(read_op(*op, &frame, ssa_base));
                 let root = crate::gc::Rooted::new(v); // survives flush allocations
                 flush(&frame)?;
                 let v = root.get();
                 drop(root);
                 return Ok(v);
             }
+            Stmt::Value(op) => {
+                let v = guard!(read_op(*op, &frame, ssa_base));
+                frame.set(ssa_base + ip, v);
+            }
             Stmt::Assign(slot, op) => {
-                let v = read_op(*op, &frame, ssa_base);
+                let v = guard!(read_op(*op, &frame, ssa_base));
                 frame.set(*slot, v);
                 frame.set(ssa_base + ip, v);
             }
+            Stmt::AssignCall(slot, args) => {
+                let argf = Frame::new(args.len());
+                guard!(read_args(args, &frame, ssa_base, &argf));
+                let callee = argf.get(0);
+                let vals: Vec<Value> = (1..args.len()).map(|j| argf.get(j)).collect();
+                let result = call_value(callee, &vals);
+                drop(argf);
+                let v = guard!(result);
+                frame.set(*slot, v);
+                frame.set(ssa_base + ip, v);
+            }
+            Stmt::LatestWorld => {}
+            Stmt::AssignGlobal(sym, op) => {
+                let v = guard!(read_op(*op, &frame, ssa_base));
+                // The frame slot roots the value across the binding store's
+                // possible table growth.
+                frame.set(ssa_base + ip, v);
+                guard!(crate::module::set_global(
+                    Value(crate::module::main_offset()),
+                    *sym,
+                    v
+                ));
+            }
             Stmt::Call(builtin, args) => {
                 let argf = Frame::new(args.len());
-                for (j, op) in args.iter().enumerate() {
-                    argf.set(j, read_op(*op, &frame, ssa_base));
-                }
+                guard!(read_args(args, &frame, ssa_base, &argf));
                 let result = apply(*builtin, &argf);
                 drop(argf);
                 frame.set(ssa_base + ip, guard!(result));
             }
             Stmt::CallGeneric(func, args) => {
                 let argf = Frame::new(args.len());
-                for (j, op) in args.iter().enumerate() {
-                    argf.set(j, read_op(*op, &frame, ssa_base));
-                }
+                guard!(read_args(args, &frame, ssa_base, &argf));
                 let vals: Vec<Value> = (0..args.len()).map(|j| argf.get(j)).collect();
                 let result = dispatch::invoke(*func, &vals);
                 drop(argf);
                 frame.set(ssa_base + ip, guard!(result));
             }
+            Stmt::CallValue(args) => {
+                let argf = Frame::new(args.len());
+                guard!(read_args(args, &frame, ssa_base, &argf));
+                let callee = argf.get(0);
+                let vals: Vec<Value> = (1..args.len()).map(|j| argf.get(j)).collect();
+                let result = call_value(callee, &vals);
+                drop(argf);
+                frame.set(ssa_base + ip, guard!(result));
+            }
             Stmt::New(ty, args) => {
                 let argf = Frame::new(args.len());
-                for (j, op) in args.iter().enumerate() {
-                    argf.set(j, read_op(*op, &frame, ssa_base));
-                }
+                guard!(read_args(args, &frame, ssa_base, &argf));
                 let vals: Vec<Value> = (0..args.len()).map(|j| argf.get(j)).collect();
                 let result = types::new_struct(*ty, &vals).map_err(crate::errors::wrap_msg);
                 drop(argf);
                 frame.set(ssa_base + ip, guard!(result));
             }
             Stmt::GetField(op, name_sym) => {
-                let v = read_op(*op, &frame, ssa_base);
+                let v = guard!(read_op(*op, &frame, ssa_base));
                 let t = object::type_of(v);
                 let i = guard!(types::field_index(t, *name_sym).ok_or_else(|| {
                     crate::errors::wrap_msg(format!(
@@ -337,8 +471,8 @@ fn eval_core(
                 frame.set(ssa_base + ip, r);
             }
             Stmt::SetField(obj, name_sym, rhs) => {
-                let v = read_op(*obj, &frame, ssa_base);
-                let r = read_op(*rhs, &frame, ssa_base);
+                let v = guard!(read_op(*obj, &frame, ssa_base));
+                let r = guard!(read_op(*rhs, &frame, ssa_base));
                 let t = object::type_of(v);
                 let i = guard!(types::field_index(t, *name_sym).ok_or_else(|| {
                     crate::errors::wrap_msg(format!(
@@ -352,6 +486,10 @@ fn eval_core(
             }
             Stmt::Enter(catch_ip) => {
                 handlers.push(*catch_ip);
+                // "store current top of exception stack for restore in
+                // pop_exception" (`interpreter.c:551–553`, boxed as the
+                // EnterNode's SSA result).
+                frame.set(ssa_base + ip, box_int(crate::errors::exc_state() as i64));
             }
             Stmt::Leave(n) => {
                 for _ in 0..*n {
@@ -359,31 +497,111 @@ fn eval_core(
                 }
             }
             Stmt::Throw(op) => {
-                let exc = read_op(*op, &frame, ssa_base);
+                let exc = guard!(read_op(*op, &frame, ssa_base));
                 if let Some(catch_ip) = handlers.pop() {
-                    frame.set(exc_slot, exc); // rooted in the frame across the catch block
+                    crate::errors::exc_push(exc); // rooted on the exception stack
                     ip = catch_ip;
                     continue;
                 }
                 return Err(exc);
+            }
+            Stmt::MethodFunc(sym) => {
+                let main = Value(crate::module::main_offset());
+                let v = match crate::module::get_global(main, *sym) {
+                    Some(v) => {
+                        let callable: Result<(), Value> = if dispatch::func_of(v).is_none() {
+                            Err(crate::errors::error_exception(&format!(
+                                "cannot define function {}; it already has a value",
+                                crate::symbol::as_str(*sym)
+                            )))
+                        } else {
+                            Ok(())
+                        };
+                        guard!(callable);
+                        v
+                    }
+                    None => {
+                        let f = dispatch::make_function(
+                            crate::symbol::as_str(*sym),
+                            dispatch::fresh_func_id(),
+                        );
+                        // The frame slot roots the fresh value across the
+                        // binding store's possible table growth.
+                        frame.set(ssa_base + ip, f);
+                        guard!(crate::module::set_global(main, *sym, f));
+                        f
+                    }
+                };
+                frame.set(ssa_base + ip, v);
+            }
+            Stmt::MethodDef(fop, sigop, body) => {
+                let f = guard!(read_op(*fop, &frame, ssa_base));
+                let sig = guard!(read_op(*sigop, &frame, ssa_base));
+                let func = guard!(dispatch::func_of(f).ok_or_else(|| {
+                    crate::errors::error_exception("method: not a generic function")
+                }));
+                // The signature operand is a Tuple type (hand-built IR), or
+                // the argdata svec real lowering constructs at run time:
+                // `svec(svec(typeof(f), argtypes...), svec(sparams...), loc)`
+                // (`jl_method_def`'s unpacking, `method.c:1265`). Our method
+                // signatures drop the leading `typeof(f)` (recorded — they
+                // align with it at dispatch hardening); static parameters
+                // are not representable yet.
+                let sig_tuple: Result<crate::region::Offset, Value> = if types::is_datatype(
+                    sig.raw(),
+                ) && types::is_tuple(sig.raw())
+                {
+                    Ok(sig.raw())
+                } else if types::is_svec_value(sig) && types::svec_len(sig.raw()) >= 2 {
+                    let sigv = types::svec_ref(sig.raw(), 0);
+                    let sparams = types::svec_ref(sig.raw(), 1);
+                    if !types::is_svec(object::type_of(Value(sigv)))
+                        || !types::is_svec(object::type_of(Value(sparams)))
+                    {
+                        Err(crate::errors::error_exception("method: malformed argdata"))
+                    } else if types::svec_len(sparams) != 0 {
+                        Err(crate::errors::error_exception(
+                            "method: static parameters not supported yet",
+                        ))
+                    } else {
+                        let _rs = crate::gc::Rooted::new(sig); // argtypes are its subterms
+                        let argtypes: Vec<crate::region::Offset> =
+                            (1..types::svec_len(sigv)).map(|i| types::svec_ref(sigv, i)).collect();
+                        Ok(types::tuple_type(&argtypes))
+                    }
+                } else {
+                    Err(crate::errors::error_exception(
+                        "method: signature must be a Tuple type or argdata svec",
+                    ))
+                };
+                let sig_tuple = guard!(sig_tuple);
+                dispatch::add_method(func, sig_tuple, body.clone());
+                frame.set(ssa_base + ip, Value(types::nothing_instance()));
             }
             Stmt::Caught => {
-                frame.set(ssa_base + ip, frame.get(exc_slot));
+                frame.set(ssa_base + ip, crate::errors::exc_current());
+            }
+            Stmt::AssignCaught(slot) => {
+                let v = crate::errors::exc_current();
+                frame.set(*slot, v);
+                frame.set(ssa_base + ip, v);
             }
             Stmt::Rethrow => {
-                let exc = frame.get(exc_slot);
+                let exc = crate::errors::exc_current();
                 if let Some(catch_ip) = handlers.pop() {
-                    frame.set(exc_slot, exc);
+                    // The top already IS the current exception; no re-push.
                     ip = catch_ip;
                     continue;
                 }
                 return Err(exc);
+            }
+            Stmt::PopException(op) => {
+                let state = guard!(read_op(*op, &frame, ssa_base));
+                crate::errors::exc_restore(unbox_int(state) as usize);
             }
             Stmt::ArrayLit(args) => {
                 let argf = Frame::new(args.len());
-                for (j, op) in args.iter().enumerate() {
-                    argf.set(j, read_op(*op, &frame, ssa_base));
-                }
+                guard!(read_args(args, &frame, ssa_base, &argf));
                 // Common concrete element type, or Any (Julia's typed literals
                 // come from base/'s promotion; this is the bootstrap subset).
                 let any = types::builtin(id::ANY);
@@ -405,30 +623,58 @@ fn eval_core(
                 frame.set(ssa_base + ip, a);
             }
             Stmt::ArrayRef(a, idx) => {
-                let (av, i) = (read_op(*a, &frame, ssa_base), read_op(*idx, &frame, ssa_base));
+                let av = guard!(read_op(*a, &frame, ssa_base));
+                let i = guard!(read_op(*idx, &frame, ssa_base));
                 let r = guard!(index_checked(av, i).and_then(|i0| crate::array::aref(av, i0)));
                 frame.set(ssa_base + ip, r);
             }
             Stmt::ArraySet(a, idx, rhs) => {
-                let (av, i) = (read_op(*a, &frame, ssa_base), read_op(*idx, &frame, ssa_base));
-                let r = read_op(*rhs, &frame, ssa_base);
+                let av = guard!(read_op(*a, &frame, ssa_base));
+                let i = guard!(read_op(*idx, &frame, ssa_base));
+                let r = guard!(read_op(*rhs, &frame, ssa_base));
                 guard!(index_checked(av, i).and_then(|i0| crate::array::aset(av, i0, r)));
                 frame.set(ssa_base + ip, r);
             }
             Stmt::Push(a, v) => {
-                let av = read_op(*a, &frame, ssa_base);
-                let vv = read_op(*v, &frame, ssa_base);
+                let av = guard!(read_op(*a, &frame, ssa_base));
+                let vv = guard!(read_op(*v, &frame, ssa_base));
                 guard!(expect_array(av));
                 guard!(crate::array::push(av, vv));
                 frame.set(ssa_base + ip, av);
             }
             Stmt::Len(a) => {
-                let av = read_op(*a, &frame, ssa_base);
+                let av = guard!(read_op(*a, &frame, ssa_base));
                 guard!(expect_array(av));
                 frame.set(ssa_base + ip, box_int(crate::array::len(av) as i64));
             }
+            Stmt::IsDefined(op) => {
+                let defined = match op {
+                    Op::Slot(k) => frame.get(*k) != Value::NULL,
+                    Op::Global(sym) => {
+                        crate::module::get_global(Value(crate::module::main_offset()), *sym)
+                            .is_some()
+                    }
+                    _ => true, // SSA results, literals, and constants
+                };
+                frame.set(ssa_base + ip, box_bool(defined));
+            }
         }
         ip += 1;
+    }
+}
+
+/// Resolve and call a callable value on already-rooted arguments: a generic
+/// function dispatches (`jl_apply_generic`), a native builtin runs directly
+/// (`jl_f_*`), anything else throws (a `MethodError` in Julia; an
+/// `ErrorException` until that type lands with dispatch hardening).
+fn call_value(callee: Value, args: &[Value]) -> Result<Value, Value> {
+    match dispatch::callable_of(callee) {
+        Some(dispatch::FnKind::Generic(func)) => dispatch::invoke(func, args),
+        Some(dispatch::FnKind::Native(f)) => f(args),
+        None => Err(crate::errors::error_exception(&format!(
+            "MethodError: objects of type {} are not callable",
+            crate::symbol::as_str(types::type_sym(object::type_of(callee)))
+        ))),
     }
 }
 

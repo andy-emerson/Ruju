@@ -37,9 +37,89 @@ fn table() -> &'static mut Vec<Entry> {
     unsafe { &mut *TABLE.0.get() }
 }
 
-/// Clear all methods (called when the runtime resets).
+/// What a callable value's type resolves to: a generic function's method
+/// table (by id), or a native builtin (`jl_f_*` — Julia's `Core` functions
+/// are C builtins, not generic functions; ours are Rust fns).
+#[derive(Clone, Copy)]
+pub enum FnKind {
+    Generic(u32),
+    Native(fn(&[Value]) -> Result<Value, Value>),
+}
+
+/// Function values: each function is a zero-size singleton whose *type*
+/// identifies it — `jl_apply_generic` dispatches on `typeof(f)`, and this
+/// registry is the (type → callable) half of what Julia hangs off the
+/// type's method table.
+struct Functions(UnsafeCell<Vec<(Offset, FnKind)>>);
+// Sound only because the runtime is single-threaded under wasm32 for now.
+unsafe impl Sync for Functions {}
+static FUNCTIONS: Functions = Functions(UnsafeCell::new(Vec::new()));
+
+fn functions() -> &'static mut Vec<(Offset, FnKind)> {
+    unsafe { &mut *FUNCTIONS.0.get() }
+}
+
+/// Runtime-allocated generic-function ids, kept far above the small ids
+/// hand-picked by tests and the bootstrap front-end.
+struct NextFunc(core::cell::Cell<u32>);
+unsafe impl Sync for NextFunc {}
+static NEXT_FUNC: NextFunc = NextFunc(core::cell::Cell::new(1 << 20));
+
+/// A fresh generic-function id (for `:method`-declared functions).
+pub fn fresh_func_id() -> u32 {
+    let id = NEXT_FUNC.0.get();
+    NEXT_FUNC.0.set(id + 1);
+    id
+}
+
+/// Clear all methods and function values (called when the runtime resets).
 pub fn reset() {
     table().clear();
+    functions().clear();
+    NEXT_FUNC.0.set(1 << 20);
+}
+
+/// Create the callable value for generic function `func` (the shape of
+/// `jl_new_generic_function`): a fresh zero-size immutable type under the
+/// abstract `Function`, whose eager singleton instance *is* the function
+/// value. Dispatch keys off that type.
+pub fn make_function(name: &str, func: u32) -> Value {
+    let t = types::define_struct(name, types::builtin(types::id::FUNCTION), &[], false);
+    functions().push((t, FnKind::Generic(func)));
+    Value(types::instance_of(t))
+}
+
+/// Create a native builtin function value (the `jl_f_*` registration shape:
+/// a singleton under `Function` whose calls run a Rust fn directly).
+pub fn make_native_function(name: &str, f: fn(&[Value]) -> Result<Value, Value>) -> Value {
+    let t = types::define_struct(name, types::builtin(types::id::FUNCTION), &[], false);
+    functions().push((t, FnKind::Native(f)));
+    Value(types::instance_of(t))
+}
+
+/// What a callable value resolves to, by its type (`typeof(f)`, as
+/// `jl_apply_generic` keys its method-table lookup), or `None` if the value
+/// is not a registered function.
+pub fn callable_of(v: Value) -> Option<FnKind> {
+    let t = object::type_of(v);
+    functions().iter().rev().find(|&&(ft, _)| ft == t).map(|&(_, k)| k)
+}
+
+/// The generic-function id of a callable value (`None` for natives and
+/// non-functions) — the `:method` definition path needs the method table.
+pub fn func_of(v: Value) -> Option<u32> {
+    match callable_of(v) {
+        Some(FnKind::Generic(f)) => Some(f),
+        _ => None,
+    }
+}
+
+/// Visit every function singleton type; the collector roots them (their
+/// instances are reachable through the types' `instance` fields).
+pub fn each_function(mut f: impl FnMut(Offset)) {
+    for &(t, _) in functions().iter() {
+        f(t);
+    }
 }
 
 /// Register a method: function `func`, signature tuple type `sig`, body `body`.

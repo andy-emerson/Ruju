@@ -99,7 +99,8 @@ pub mod id {
     pub const OUTOFMEMORYERROR: u32 = 38; // struct OutOfMemoryError <: Exception (singleton)
     pub const BOUNDSERROR: u32 = 39; // struct BoundsError <: Exception (a, i)
     pub const ERROREXCEPTION: u32 = 40; // struct ErrorException <: Exception (msg)
-    pub const COUNT: usize = 41;
+    pub const FUNCTION: u32 = 41; // abstract Function (jltypes.c:3503)
+    pub const COUNT: usize = 42;
 }
 
 /// Offsets of the bootstrapped core types and the immortal value permboxes.
@@ -344,6 +345,11 @@ pub fn bootstrap() {
     //    Symbol until a String type exists (recorded adaptation).
     types[id::EXCEPTION as usize] = new_type(datatype, tn("Exception"), any, 0, FLAG_ABSTRACT, &[]);
     let exc = types[id::EXCEPTION as usize];
+    // 6c. The abstract `Function` (`jl_function_type`, `jltypes.c:3503`):
+    //    every generic function's singleton type sits under it (dispatch.rs's
+    //    `make_function`), so dispatch can key off `typeof(f)` as
+    //    `jl_apply_generic` does.
+    types[id::FUNCTION as usize] = new_type(datatype, tn("Function"), any, 0, FLAG_ABSTRACT, &[]);
     types[id::DIVIDEERROR as usize] = new_type(datatype, tn("DivideError"), exc, 0, 0, &[]);
     types[id::UNDEFREFERROR as usize] = new_type(datatype, tn("UndefRefError"), exc, 0, 0, &[]);
     types[id::OUTOFMEMORYERROR as usize] = new_type(datatype, tn("OutOfMemoryError"), exc, 0, 0, &[]);
@@ -486,6 +492,18 @@ fn make_svec(elems: &[Offset]) -> Offset {
         write_ref(v, (4 + 4 * i) as u32, e);
     }
     v
+}
+
+/// Construct a `SimpleVector` of `elems` (`jl_svec`). The caller keeps the
+/// elements reachable across the allocation (they are typically rooted in an
+/// argument frame or are subterms of rooted values).
+pub fn svec_of(elems: &[Offset]) -> Offset {
+    make_svec(elems)
+}
+
+/// Whether `v` (a value) is a `SimpleVector` instance.
+pub fn is_svec_value(v: object::Value) -> bool {
+    is_svec(object::type_of(v))
 }
 
 /// Whether `t` is the `SimpleVector` type (the collector traces these specially).
