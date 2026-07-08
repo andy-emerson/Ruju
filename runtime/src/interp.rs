@@ -85,6 +85,10 @@ pub enum Op {
 /// A lowered statement. Its result becomes `SSAValue(index)`.
 #[derive(Clone)]
 pub enum Stmt {
+    /// `ssa[i] = op` — a bare value form as a statement (the `eval_body`
+    /// default arm: `locals[nslots + ip] = eval_value(stmt)`).
+    #[allow(dead_code)] // pre-lowered code (M2 C-1) constructs it; tests exercise it now
+    Value(Op),
     /// `ssa[i] = builtin(args...)`
     Call(Builtin, Vec<Op>),
     /// `ssa[i] = <dispatch generic function `id`>(args...)`
@@ -99,6 +103,13 @@ pub enum Stmt {
     CallValue(Vec<Op>),
     /// `slot[k] = op` (the assigned value is also `ssa[i]`)
     Assign(usize, Op),
+    /// `slot[k] = (args[0])(args[1..])` — an assignment whose right-hand
+    /// side is a call expression, as lowering emits (`Expr(:(=), slot,
+    /// Expr(:call, …))`; the C's `:(=)` arm evaluates the rhs through
+    /// `eval_value`, which handles `:call`). The call's value is stored to
+    /// the slot and is also `ssa[i]`.
+    #[allow(dead_code)] // pre-lowered code (M2 C-1) constructs it; tests exercise it now
+    AssignCall(usize, Vec<Op>),
     /// `global name = op` — assign the interned symbol's `Main` binding (the
     /// GlobalRef arm of `:=`, `interpreter.c:592–606`, via `jl_set_global` —
     /// minus world age and constness, as `module.rs` records). The assigned
@@ -174,11 +185,20 @@ pub enum Stmt {
     /// Bind the current caught exception as this statement's SSA value
     /// (`Expr(:the_exception)` / `jl_current_exception`), for `catch e`.
     Caught,
+    /// `slot[k] = Expr(:the_exception)` — the assignment form lowering emits
+    /// to bind `catch e` variables; value is also `ssa[i]`.
+    #[allow(dead_code)] // pre-lowered code (M2 C-1) constructs it; tests exercise it now
+    AssignCaught(usize),
     /// Re-throw the current exception (`jl_rethrow`) — the exception path of a
     /// `finally` block resumes unwinding after the cleanup runs. Re-throws the
     /// exception-stack top without pushing a duplicate (`throw_internal(ct,
     /// NULL)`).
     Rethrow,
+    /// `Expr(:latestworld)`: advance the task's world age
+    /// (`interpreter.c:650–652`). A no-op here — single world until world
+    /// age lands with dispatch hardening (recorded).
+    #[allow(dead_code)] // pre-lowered code (M2 C-1) constructs it
+    LatestWorld,
     /// `Expr(:pop_exception, ssa)` (`interpreter.c:637–640` →
     /// `jl_restore_excstack`): leaving a catch scope truncates the exception
     /// stack back to the depth its `Enter` captured — the operand is that
@@ -373,11 +393,27 @@ fn eval_core(
                 drop(root);
                 return Ok(v);
             }
+            Stmt::Value(op) => {
+                let v = guard!(read_op(*op, &frame, ssa_base));
+                frame.set(ssa_base + ip, v);
+            }
             Stmt::Assign(slot, op) => {
                 let v = guard!(read_op(*op, &frame, ssa_base));
                 frame.set(*slot, v);
                 frame.set(ssa_base + ip, v);
             }
+            Stmt::AssignCall(slot, args) => {
+                let argf = Frame::new(args.len());
+                guard!(read_args(args, &frame, ssa_base, &argf));
+                let callee = argf.get(0);
+                let vals: Vec<Value> = (1..args.len()).map(|j| argf.get(j)).collect();
+                let result = call_value(callee, &vals);
+                drop(argf);
+                let v = guard!(result);
+                frame.set(*slot, v);
+                frame.set(ssa_base + ip, v);
+            }
+            Stmt::LatestWorld => {}
             Stmt::AssignGlobal(sym, op) => {
                 let v = guard!(read_op(*op, &frame, ssa_base));
                 // The frame slot roots the value across the binding store's
@@ -408,16 +444,8 @@ fn eval_core(
                 let argf = Frame::new(args.len());
                 guard!(read_args(args, &frame, ssa_base, &argf));
                 let callee = argf.get(0);
-                let result = match dispatch::func_of(callee) {
-                    Some(func) => {
-                        let vals: Vec<Value> = (1..args.len()).map(|j| argf.get(j)).collect();
-                        dispatch::invoke(func, &vals)
-                    }
-                    None => Err(crate::errors::error_exception(&format!(
-                        "MethodError: objects of type {} are not callable",
-                        crate::symbol::as_str(types::type_sym(object::type_of(callee)))
-                    ))),
-                };
+                let vals: Vec<Value> = (1..args.len()).map(|j| argf.get(j)).collect();
+                let result = call_value(callee, &vals);
                 drop(argf);
                 frame.set(ssa_base + ip, guard!(result));
             }
@@ -512,20 +540,51 @@ fn eval_core(
                 let func = guard!(dispatch::func_of(f).ok_or_else(|| {
                     crate::errors::error_exception("method: not a generic function")
                 }));
-                let tuple_sig: Result<(), Value> =
-                    if types::is_datatype(sig.raw()) && types::is_tuple(sig.raw()) {
-                        Ok(())
-                    } else {
+                // The signature operand is a Tuple type (hand-built IR), or
+                // the argdata svec real lowering constructs at run time:
+                // `svec(svec(typeof(f), argtypes...), svec(sparams...), loc)`
+                // (`jl_method_def`'s unpacking, `method.c:1265`). Our method
+                // signatures drop the leading `typeof(f)` (recorded — they
+                // align with it at dispatch hardening); static parameters
+                // are not representable yet.
+                let sig_tuple: Result<crate::region::Offset, Value> = if types::is_datatype(
+                    sig.raw(),
+                ) && types::is_tuple(sig.raw())
+                {
+                    Ok(sig.raw())
+                } else if types::is_svec_value(sig) && types::svec_len(sig.raw()) >= 2 {
+                    let sigv = types::svec_ref(sig.raw(), 0);
+                    let sparams = types::svec_ref(sig.raw(), 1);
+                    if !types::is_svec(object::type_of(Value(sigv)))
+                        || !types::is_svec(object::type_of(Value(sparams)))
+                    {
+                        Err(crate::errors::error_exception("method: malformed argdata"))
+                    } else if types::svec_len(sparams) != 0 {
                         Err(crate::errors::error_exception(
-                            "method: signature must be a Tuple type",
+                            "method: static parameters not supported yet",
                         ))
-                    };
-                guard!(tuple_sig);
-                dispatch::add_method(func, sig.raw(), body.clone());
+                    } else {
+                        let _rs = crate::gc::Rooted::new(sig); // argtypes are its subterms
+                        let argtypes: Vec<crate::region::Offset> =
+                            (1..types::svec_len(sigv)).map(|i| types::svec_ref(sigv, i)).collect();
+                        Ok(types::tuple_type(&argtypes))
+                    }
+                } else {
+                    Err(crate::errors::error_exception(
+                        "method: signature must be a Tuple type or argdata svec",
+                    ))
+                };
+                let sig_tuple = guard!(sig_tuple);
+                dispatch::add_method(func, sig_tuple, body.clone());
                 frame.set(ssa_base + ip, Value(types::nothing_instance()));
             }
             Stmt::Caught => {
                 frame.set(ssa_base + ip, crate::errors::exc_current());
+            }
+            Stmt::AssignCaught(slot) => {
+                let v = crate::errors::exc_current();
+                frame.set(*slot, v);
+                frame.set(ssa_base + ip, v);
             }
             Stmt::Rethrow => {
                 let exc = crate::errors::exc_current();
@@ -601,6 +660,21 @@ fn eval_core(
             }
         }
         ip += 1;
+    }
+}
+
+/// Resolve and call a callable value on already-rooted arguments: a generic
+/// function dispatches (`jl_apply_generic`), a native builtin runs directly
+/// (`jl_f_*`), anything else throws (a `MethodError` in Julia; an
+/// `ErrorException` until that type lands with dispatch hardening).
+fn call_value(callee: Value, args: &[Value]) -> Result<Value, Value> {
+    match dispatch::callable_of(callee) {
+        Some(dispatch::FnKind::Generic(func)) => dispatch::invoke(func, args),
+        Some(dispatch::FnKind::Native(f)) => f(args),
+        None => Err(crate::errors::error_exception(&format!(
+            "MethodError: objects of type {} are not callable",
+            crate::symbol::as_str(types::type_sym(object::type_of(callee)))
+        ))),
     }
 }
 

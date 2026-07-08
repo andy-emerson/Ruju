@@ -494,6 +494,18 @@ fn make_svec(elems: &[Offset]) -> Offset {
     v
 }
 
+/// Construct a `SimpleVector` of `elems` (`jl_svec`). The caller keeps the
+/// elements reachable across the allocation (they are typically rooted in an
+/// argument frame or are subterms of rooted values).
+pub fn svec_of(elems: &[Offset]) -> Offset {
+    make_svec(elems)
+}
+
+/// Whether `v` (a value) is a `SimpleVector` instance.
+pub fn is_svec_value(v: object::Value) -> bool {
+    is_svec(object::type_of(v))
+}
+
 /// Whether `t` is the `SimpleVector` type (the collector traces these specially).
 pub fn is_svec(t: Offset) -> bool {
     t == builtins().types[id::SVEC as usize]

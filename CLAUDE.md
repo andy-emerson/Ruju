@@ -46,7 +46,8 @@ cargo test  -p ruju-runtime                                  # native unit tests
 cargo build -p ruju-runtime                                  # also surfaces warnings (keep it clean)
 cargo build -p ruju-runtime --target wasm32-unknown-unknown --release
 node runtime/harness.mjs                                          # wasm -> JS end-to-end checks
-node runtime/verify_julia_subtype.mjs                             # oracle vs JuliaLang/julia
+node runtime/verify_julia_subtype.mjs                             # subtype oracle vs JuliaLang/julia
+node runtime/verify_julia_lowering.mjs                            # lowering oracle (fetch tools/pinned-julia first to regenerate)
 ```
 
 Tests touch global runtime state and are serialized with a mutex; the default

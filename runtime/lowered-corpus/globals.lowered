@@ -1,0 +1,35 @@
+RUJU_LOWERED 1 d99fded
+thunk 1 13
+call global:declare_global module sym:x bool:1
+latestworld
+call global:get_binding_type module sym:x
+assign 0 int:1
+value slot:0
+call global:isa ssa:4 ssa:2
+gotoifnot ssa:5 8
+goto 10
+value slot:0
+assigncall 0 global:convert ssa:2 ssa:8
+value slot:0
+call global:setglobal! module sym:x ssa:10
+return int:1
+thunk 1 16
+call global:declare_global module sym:y bool:1
+latestworld
+value global:+
+value global:x
+call ssa:2 ssa:3 int:2
+call global:get_binding_type module sym:y
+assign 0 ssa:4
+value slot:0
+call global:isa ssa:7 ssa:5
+gotoifnot ssa:8 11
+goto 13
+value slot:0
+assigncall 0 global:convert ssa:5 ssa:11
+value slot:0
+call global:setglobal! module sym:y ssa:13
+return ssa:4
+thunk 0 2
+value global:y
+return ssa:0
