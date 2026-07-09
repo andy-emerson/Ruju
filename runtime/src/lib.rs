@@ -254,6 +254,70 @@ pub extern "C" fn rj_vararg_tv(elem: u32, n: u32) -> u32 {
     types::vararg_type_with(elem as Offset, n as Offset)
 }
 
+/// Env-matching subtype (`jl_subtype_env`/`jl_subtype_matching`, engine
+/// slice 5): decide `a <: b`, computing the value of each of `b`'s outer
+/// `where` variables. Results are stashed runtime-side (GC-rooted until the
+/// next query) and read back with [`rj_env_size`]/[`rj_env_get`].
+#[no_mangle]
+pub extern "C" fn rj_subtype_env(a: u32, b: u32) -> u32 {
+    ensure_init();
+    subtype::subtype_env_stashed(a as Offset, b as Offset) as u32
+}
+
+/// Env slots the last successful `rj_subtype_env` produced (0 after a miss).
+#[no_mangle]
+pub extern "C" fn rj_env_size() -> u32 {
+    subtype::env_stash_len() as u32
+}
+
+/// The `i`-th stashed env entry: a type/value offset, or a
+/// `svec(tvar, Bool)` wrapper for an indefinite variable.
+#[no_mangle]
+pub extern "C" fn rj_env_get(i: u32) -> u32 {
+    subtype::env_stash_get(i as usize)
+}
+
+/// `jl_subtype_env_size`: outer `UnionAll` count of `t`.
+#[no_mangle]
+pub extern "C" fn rj_subtype_env_size(t: u32) -> u32 {
+    subtype::subtype_env_size(t as Offset) as u32
+}
+
+/// Structural readbacks for env entries.
+#[no_mangle]
+pub extern "C" fn rj_is_svec(v: u32) -> u32 {
+    types::is_svec_value(Value(v as Offset)) as u32
+}
+
+#[no_mangle]
+pub extern "C" fn rj_svec_len(s: u32) -> u32 {
+    types::svec_len(s as Offset)
+}
+
+#[no_mangle]
+pub extern "C" fn rj_svec_ref(s: u32, i: u32) -> u32 {
+    types::svec_ref(s as Offset, i)
+}
+
+#[no_mangle]
+pub extern "C" fn rj_is_typevar(v: u32) -> u32 {
+    types::is_typevar(v as Offset) as u32
+}
+
+/// The `true`/`false` permbox offsets (env wrappers carry the constrained
+/// bit as a Bool instance).
+#[no_mangle]
+pub extern "C" fn rj_true_instance() -> u32 {
+    ensure_init();
+    types::builtins().true_instance
+}
+
+#[no_mangle]
+pub extern "C" fn rj_false_instance() -> u32 {
+    ensure_init();
+    types::builtins().false_instance
+}
+
 /// The runtime type the AOT boundary's `%new(Base.RefValue{Int64}, v)`
 /// allocates: a monomorphic mutable struct of the same name and layout (one
 /// inline `Int64` field). Parametric `RefValue` arrives with `base/`;
@@ -1204,6 +1268,97 @@ mod tests {
         assert!(diag(bot, int, Some(int)), "S<:Int against a ground Int");
         assert!(!diag(bot, real, Some(real)), "S<:Real against a ground Real");
         assert_eq!(gc::root_count(), 0, "roots released");
+    }
+
+    #[test]
+    fn subtype_env_matches_pinned_julia() {
+        // Engine slice 5: `jl_subtype_env`'s computed right-side variable
+        // values. Expected bindings verified against the pinned Julia binary
+        // via `ccall(:jl_subtype_env, ...)` (recorded — not test/subtype.jl
+        // verbatim). Box stands in for the parametric constructor.
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+        let (int, float64, real, any, bot) = (
+            t(types::id::INT64),
+            t(types::id::FLOAT64),
+            t(types::id::REAL),
+            t(types::id::ANY),
+            t(types::id::BOTTOM),
+        );
+        let tv = || types::make_typevar("T", bot, any);
+        let mut env: Vec<Offset> = Vec::new();
+        let mut senv = |a: Offset, b: Offset, env: &mut Vec<Offset>| -> bool {
+            subtype::subtype_env(a, b, env)
+        };
+
+        // Tuple{Int,Int} <: Tuple{T,T} where T  ->  [Int64]
+        let v = tv();
+        assert!(senv(types::tuple_type(&[int, int]), types::unionall_type(v, types::tuple_type(&[v, v])), &mut env));
+        assert_eq!(env.as_slice(), &[int]);
+
+        // Tuple{Int,Float64} <: Tuple{T,S} where {T,S}  ->  [Int64, Float64]
+        let vt = tv();
+        let vs = tv();
+        let b = types::unionall_type(vt, types::unionall_type(vs, types::tuple_type(&[vt, vs])));
+        assert!(senv(types::tuple_type(&[int, float64]), b, &mut env));
+        assert_eq!(env.as_slice(), &[int, float64]);
+
+        // Box{Int} <: Box{T} where T  ->  [Int64]  (invariant pin)
+        let v = tv();
+        assert!(senv(types::box_type(int), types::unionall_type(v, types::box_type(v)), &mut env));
+        assert_eq!(env.as_slice(), &[int]);
+
+        // Tuple{Int} <: Tuple{Union{T,Float64}} where T  ->  [Int64]
+        let v = tv();
+        let b = types::unionall_type(v, types::tuple_type(&[types::union_of(&[v, float64])]));
+        assert!(senv(types::tuple_type(&[int]), b, &mut env));
+        assert_eq!(env.as_slice(), &[int]);
+
+        // Tuple{} / Tuple{Int,Int} <: Tuple{Vararg{Int,N}} where N  ->  [0] / [2]
+        for (lhs, n) in [(types::tuple_type(&[]), 0i64), (types::tuple_type(&[int, int]), 2)] {
+            let vn = types::make_typevar("N", bot, any);
+            let b = types::unionall_type(vn, types::tuple_type(&[types::vararg_type_with(int, vn)]));
+            assert!(senv(lhs, b, &mut env));
+            assert_eq!(env.len(), 1);
+            assert!(types::is_boxed_long(env[0]));
+            assert_eq!(crate::value::unbox_int(Value(env[0])), n);
+        }
+
+        // Tuple{Int,Int} <: Tuple{Vararg{T,N}} where {T,N}  ->  [Int64, 2]
+        let vt = tv();
+        let vn = types::make_typevar("N", bot, any);
+        let b = types::unionall_type(
+            vt,
+            types::unionall_type(vn, types::tuple_type(&[types::vararg_type_with(vt, vn)])),
+        );
+        assert!(senv(types::tuple_type(&[int, int]), b, &mut env));
+        assert_eq!(env.len(), 2);
+        assert_eq!(env[0], int);
+        assert!(types::is_boxed_long(env[1]));
+        assert_eq!(crate::value::unbox_int(Value(env[1])), 2);
+
+        // Tuple{} <: Tuple{Vararg{T}} where T  ->  [svec(T, false)]
+        let v = tv();
+        let b = types::unionall_type(v, types::tuple_type(&[types::vararg_type(v)]));
+        assert!(senv(types::tuple_type(&[]), b, &mut env));
+        assert_eq!(env.len(), 1);
+        assert!(types::is_svec_value(Value(env[0])));
+        assert_eq!(types::svec_len(env[0]), 2);
+        assert_eq!(types::svec_ref(env[0], 0), v, "the declared variable, unpinned");
+        assert_eq!(types::svec_ref(env[0], 1), types::builtins().false_instance);
+
+        // Rejections leave the env empty, as jl_subtype_matching leaves *penv.
+        let v = tv();
+        let b = types::unionall_type(v, types::tuple_type(&[v, v]));
+        assert!(!senv(types::tuple_type(&[int, float64]), b, &mut env));
+        assert!(env.is_empty());
+        let v = tv();
+        let b = types::unionall_type(v, types::tuple_type(&[types::union_of(&[v, float64]), v]));
+        assert!(!senv(types::tuple_type(&[int, real]), b, &mut env));
+        assert!(env.is_empty());
+
+        assert_eq!(gc::root_count(), 0, "roots released after env queries");
     }
 
     #[test]

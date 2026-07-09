@@ -16,17 +16,27 @@ are meant to be worked from, not just read.
 
 ## Next session opens here
 
-**Engine slice 5** (issue #5, `research-subtype-engine.md` §6): `envout` —
-the computed bounds of right-side variables handed to callers, the doorway
-to `jl_type_intersection` and the M3 spine (intersection →
-`type_morespecific` → dispatch hardening). Verified via a new
-`rj_subtype_env` ABI + cases mirroring `jl_subtype_matching`; the subtype
-oracle must stay bit-identical. Carried-over interleaves: the
-**paper-and-polish batch** (still timeboxed, unstarted), the
-**exception-channel decision** (#14, the human's call), and **thin-slice
-stage 3** (#13, optional polish).
+**Type intersection** (`jl_type_intersection`) — the engine is complete as
+researched (all five slices), so the M3 spine's head is now the frontier:
+intersection → `type_morespecific` → dispatch hardening, the last gate on
+the AOT backend. `research-subtype-engine.md` maps its consumers; the
+`Intersect` node's intersection-mode arms (`constraintkind`, `intersected`,
+`limited`) and `merge_env`'s under-estimation mode (`simple_meet` mode 0,
+implemented but unconsumed) are where it picks up. Carried-over
+interleaves: the **paper-and-polish batch** (still timeboxed, unstarted),
+the **exception-channel decision** (#14, the human's call), and
+**thin-slice stage 3** (#13, optional polish).
 
-*(Executed 2026-07-09, second and third increments:)*
+*(Executed 2026-07-09, increments two through four:)*
+
+- ~~**Engine slice 5**~~ — `envout` (`jl_subtype_env`): the fill's full
+  value-selection cascade with the ∀-arm AND-merge, right-flip
+  preservation, restore clearing, and `widen_Type_if_concrete`
+  (`occurs_inv`'s first consumer). Verified against the pinned binary's
+  own `jl_subtype_env` — 10 native cases + the oracle's env section
+  through the new `rj_subtype_env` ABI; the 134-case oracle bit-identical.
+  Adaptation recorded: `tainted_inner`/`innervars` folded into the
+  `has_universal_typevar` guard.
 
 - ~~**Engine slice 3**~~ — the vararg length algebra: the `Loffset`
   channel, typevar-count `Vararg{T,N}` (the `BOUND` kind), the full

@@ -31,10 +31,17 @@
 //! `check_vararg_length`'s N-discharge, and `subtype_tuple_varargs`' length
 //! equation — so `Tuple{Vararg{T,N}}` with a typevar `N` (`NTuple`) works.
 //!
+//! Slice 4 (2026-07) added the **`Intersect` meet node** (#61917 — exact
+//! existential upper bounds) and the `concrete` cross-variable propagation;
+//! slice 5 added **`envout`** ([`subtype_env`], the `jl_subtype_env` shape):
+//! the computed values of right-side `where` variables, filled at
+//! `subtype_unionall` exit and AND-merged across ∀ arms — what
+//! `jl_type_intersection` and method matching consume.
+//!
 //! Deliberately omitted for now (tracked in `design/implementation.md`):
-//! type intersection and the `Intersect` meet node (slice 4), `envout`
-//! (slice 5), and the repeated-element/separable tuple fast paths (pure
-//! optimizations).
+//! type intersection itself, the `innervars`/`tainted_inner` bounds-leak
+//! bookkeeping (folded into the `has_universal_typevar` guard), and the
+//! repeated-element/separable tuple fast paths (pure optimizations).
 //!
 //! GC rooting (the C's discipline, engine slice 1 first commit): the entry
 //! roots the query types (the C leaves this to callers; our host boundary
@@ -196,6 +203,16 @@ struct Env {
     /// (`X = Y + Loffset`). Nonzero only inside `subtype_tuple_varargs`'
     /// N-equation; `flip_offset` negates it for the reverse direction.
     loffset: i32,
+    /// The computed values of right-side variables handed back to the caller
+    /// (`envout`/`envsz`/`envidx`, `subtype.c:125–133`) — what
+    /// `jl_type_intersection` and method matching consume. Empty for plain
+    /// subtype queries. Entries (0 = unassigned) are mirrored into a rooted
+    /// frame (the C's "N.B.: envout is gc-rooted").
+    envout: Vec<Offset>,
+    env_roots: Option<Frame>,
+    /// The env slot the innermost right-side `UnionAll` fills (`envidx`);
+    /// incremented around each existential body descent.
+    envidx: usize,
 }
 
 impl Env {
@@ -206,6 +223,17 @@ impl Env {
             lunions: UnionState::default(),
             runions: UnionState::default(),
             loffset: 0,
+            envout: Vec::new(),
+            env_roots: None,
+            envidx: 0,
+        }
+    }
+
+    /// Write an envout slot, keeping its rooted mirror current.
+    fn set_envout(&mut self, i: usize, v: Offset) {
+        self.envout[i] = v;
+        if let Some(f) = &self.env_roots {
+            f.set(i, Value(v));
         }
     }
 
@@ -339,6 +367,11 @@ fn restore_vars(e: &mut Env, saved: &SavedVars) {
         gc::set_slot(b.root_base + 1, Value(b.ub));
     }
     e.runions.depth = saved.rdepth;
+    // Clear envout entries the rolled-back search had assigned
+    // (`restore_env`, `subtype.c:477–478`).
+    for i in e.envidx..e.envout.len() {
+        e.set_envout(i, NULL);
+    }
 }
 
 /// Entry point: decide `a <: b` (`jl_subtype_env` → `forall_exists_subtype`).
@@ -351,6 +384,77 @@ pub fn subtype(a: Offset, b: Offset) -> bool {
     let _rb = Rooted::new(Value(b));
     let mut e = Env::new();
     forall_exists_subtype(a, b, &mut e, Param::None)
+}
+
+/// `jl_subtype_env_size`: the number of outer `UnionAll`s on `t` — the env
+/// slots a matching query against `t` yields.
+pub fn subtype_env_size(mut t: Offset) -> usize {
+    let mut n = 0;
+    while types::is_unionall(t) {
+        n += 1;
+        t = types::unionall_body(t);
+    }
+    n
+}
+
+/// `jl_subtype_env` (engine slice 5): decide `a <: b`, computing the value
+/// of each of `b`'s outer `where` variables into `env` — the query
+/// `jl_type_intersection` and method matching (`jl_subtype_matching`)
+/// consume. On success `env` holds one entry per outer variable, outermost
+/// first: a type or boxed value when the search pinned the variable, or the
+/// C's `svec(tvar, constrained::Bool)` wrapper when it stayed indefinite
+/// (`wrap_tvar_env`, `subtype.c:1224–1227`). `env` is left empty on failure,
+/// as `jl_subtype_matching` leaves `*penv` untouched.
+pub fn subtype_env(a: Offset, b: Offset, env: &mut Vec<Offset>) -> bool {
+    let _ra = Rooted::new(Value(a));
+    let _rb = Rooted::new(Value(b));
+    env.clear();
+    let sz = subtype_env_size(b);
+    let mut e = Env::new();
+    e.envout = vec![NULL; sz];
+    e.env_roots = Some(Frame::new(sz));
+    let ans = forall_exists_subtype(a, b, &mut e, Param::None);
+    if ans {
+        env.extend_from_slice(&e.envout);
+    }
+    ans
+}
+
+// The host-facing stash for `rj_subtype_env` results: JS reads entries back
+// by index, so they must stay rooted between the query and the reads (the
+// collector visits them via [`each_env_stash`]).
+struct EnvStash(core::cell::UnsafeCell<Vec<Offset>>);
+// Sound only because the runtime is single-threaded under wasm32 for now.
+unsafe impl Sync for EnvStash {}
+static ENV_STASH: EnvStash = EnvStash(core::cell::UnsafeCell::new(Vec::new()));
+
+fn env_stash() -> &'static mut Vec<Offset> {
+    unsafe { &mut *ENV_STASH.0.get() }
+}
+
+/// Env-matching query for the host: run [`subtype_env`] and stash the result
+/// runtime-side for `rj_env_size`/`rj_env_get` readback.
+pub fn subtype_env_stashed(a: Offset, b: Offset) -> bool {
+    let stash = env_stash();
+    stash.clear();
+    subtype_env(a, b, stash)
+}
+
+pub fn env_stash_len() -> usize {
+    env_stash().len()
+}
+
+pub fn env_stash_get(i: usize) -> Offset {
+    env_stash().get(i).copied().unwrap_or(NULL)
+}
+
+/// Visit the stashed env entries; the collector roots them.
+pub fn each_env_stash(mut f: impl FnMut(Value)) {
+    for &v in env_stash().iter() {
+        if v != NULL {
+            f(Value(v));
+        }
+    }
 }
 
 /// The ∀ driver (`forall_exists_subtype`, `subtype.c:2383–2404`): enumerate
@@ -391,8 +495,17 @@ fn exists_subtype(x: Offset, y: Offset, e: &mut Env, se: &SavedVars, param: Para
             return true;
         }
         let more = e.next_union_state(true);
-        restore_vars(e, se);
-        if !more {
+        if more {
+            // Preserve already-assigned envout slots across a right-flip
+            // (`subtype.c:2369–2375`): `subtype_unionall` needs previously
+            // assigned env values, and cross-arm disagreement is reconciled
+            // by the fill's AND-merge.
+            let oldidx = e.envidx;
+            e.envidx = e.envout.len();
+            restore_vars(e, se);
+            e.envidx = oldidx;
+        } else {
+            restore_vars(e, se);
             return false;
         }
     }
@@ -591,7 +704,18 @@ fn subtype_unionall(t: Offset, u: Offset, e: &mut Env, r: bool, param: Param) ->
         root_base: mirror.slot_index(0),
     });
     let mut ans = if r {
-        sub(t, body, e, param)
+        // Descending into an existential body claims the next env slot
+        // (`e->envidx++` around the body, `subtype.c:1388–1391`).
+        e.envidx += 1;
+        let ans = sub(t, body, e, param);
+        e.envidx -= 1;
+        // Widen `Type{x}` to `typeof(x)` in argument position
+        // (`:1394–1396`) — occurs_inv's first consumer.
+        if e.vars[idx].occurs_inv == 0 {
+            let w = widen_type_if_concrete(e.vars[idx].lb);
+            e.set_lb(idx, w);
+        }
+        ans
     } else {
         sub(body, t, e, param)
     };
@@ -626,16 +750,165 @@ fn subtype_unionall(t: Offset, u: Offset, e: &mut Env, r: bool, param: Param) ->
 
     // An internal `Intersect` meet node is exact for subtyping but must not
     // appear in a result type (`subtype.c:1428–1433`); it only ever occurs
-    // as the top layer of an existential `ub`. Nothing consumes the popped
-    // bound yet — the write-through keeps the placement (and the widened
-    // value's rooting) correct for the envout fill that lands with slice 5.
+    // as the top layer of an existential `ub`. The envout fill below is its
+    // consumer; the write-through keeps the widened value rooted.
     if ans && types::is_intersect(e.vars[idx].ub) {
         let widened = widen_intersect(e.vars[idx].ub);
         e.set_ub(idx, widened);
     }
 
+    // Resolved to a single value: use it directly (`subtype.c:1434–1437`).
+    let mut new_tvar = NULL;
+    if ans && e.vars[idx].lb == e.vars[idx].ub {
+        new_tvar = e.vars[idx].lb;
+    }
+
+    // Fill this variable's envout slot (`subtype.c:1489–1560`) when a
+    // matching query wants it. The C fills from its stack-allocated binding
+    // after unlinking it; we snapshot, pop, then fill — the
+    // `has_universal_typevar` consultation must see only the *outer*
+    // environment. The snapshot's bounds stay rooted through `mirror`.
+    let vbf = e.vars[idx];
     e.vars.pop();
+    if r && ans && e.envidx < e.envout.len() {
+        fill_envout(e, &vbf, var, t, new_tvar);
+    }
     ans
+}
+
+/// The envout value-selection cascade (`subtype.c:1489–1560`) plus the
+/// AND-merge across ∀ arms: assign the popped binding's computed value into
+/// the slot the enclosing query reserved. The `tainted_inner` arm is folded
+/// into the `has_universal_typevar` guard (innervars are absent — recorded);
+/// concreteness evidence for the pin-the-least-solution arm is
+/// `is_leaf_bound` (our recorded stand-in for `jl_is_concrete_type`, with
+/// dispatchtuples omitted).
+fn fill_envout(e: &mut Env, vbf: &VarBinding, var: Offset, t: Offset, new_tvar_in: Offset) {
+    let bottom = types::builtin(id::BOTTOM);
+    let any = types::builtin(id::ANY);
+    let declared_lb = types::tvar_lb(var);
+    let declared_ub = types::tvar_ub(var);
+    let mut new_tvar = new_tvar_in;
+    let eff_constrained = vbf.occurs_inv != 0 || (vbf.occurs_cov != 0 && declared_lb == bottom);
+    let val: Offset;
+    if vbf.intvalued && vbf.lb == any {
+        // The "N::Int, unconstrained" token — `jl_wrap_vararg(NULL,NULL,0,0)`.
+        val = types::vararg_type_with(NULL, NULL);
+    } else if vbf.occurs_inv == 0 && vbf.lb != bottom {
+        if is_leaf_bound(vbf.lb) {
+            val = vbf.lb;
+        } else if eff_constrained
+            && !has_free_typevars(t)
+            && !has_free_typevars(vbf.lb)
+            && is_leaf_bound(t)
+        {
+            // A concrete LHS pins the least solution.
+            val = vbf.lb;
+        } else if types::is_typevar(vbf.lb) {
+            // Introducing `T_new <: T` here would be redundant for bounds
+            // purposes and can blow up intersection — keep the var.
+            val = wrap_tvar_env(vbf.lb, eff_constrained);
+        } else {
+            let nv = types::make_typevar(
+                crate::symbol::as_str(types::tvar_name(var)),
+                bottom,
+                vbf.lb,
+            );
+            let _rnv = Rooted::new(Value(nv));
+            val = wrap_tvar_env(nv, eff_constrained);
+        }
+    } else if vbf.lb == vbf.ub || vbf.lb != bottom {
+        // The least solution, which is what method parameters expect —
+        // wrapped when exposing it directly would leak an in-scope
+        // universal variable (`:1525–1531`).
+        if has_universal_typevar(vbf.lb, e) {
+            val = wrap_tvar_env(vbf.lb, eff_constrained);
+        } else {
+            val = vbf.lb;
+        }
+    } else if vbf.lb == declared_lb && vbf.ub == declared_ub && new_tvar == NULL {
+        val = wrap_tvar_env(var, eff_constrained);
+    } else {
+        if new_tvar == NULL {
+            new_tvar = types::make_typevar(
+                crate::symbol::as_str(types::tvar_name(var)),
+                vbf.lb,
+                vbf.ub,
+            );
+        }
+        let _rnt = Rooted::new(Value(new_tvar));
+        val = wrap_tvar_env(new_tvar, eff_constrained);
+    }
+    // Assigning different values across LHS union branches makes the value
+    // unknown, with AND semantics on the constrained bit: the var is
+    // constrained only if *every* branch pinned it (`:1541–1559`).
+    let idx = e.envidx;
+    let old = e.envout[idx];
+    if old != NULL && !crate::builtins::egal(Value(old), Value(val)) {
+        let merged = wrap_tvar_env(var, wrapped_constrained(old) && wrapped_constrained(val));
+        e.set_envout(idx, merged);
+    } else {
+        e.set_envout(idx, val);
+    }
+}
+
+/// `wrap_tvar_env` (`subtype.c:1224–1227`): `svec(tvar, constrained)` — an
+/// env entry preserving TypeVar identity while carrying the "constrained by
+/// any concrete subtype" bit.
+fn wrap_tvar_env(tvar: Offset, constrained: bool) -> Offset {
+    let b = types::builtins();
+    types::svec_of(&[tvar, if constrained { b.true_instance } else { b.false_instance }])
+}
+
+/// The `constrained` bit of an envout entry: a `svec(tvar, Bool)` wrapper
+/// carries it explicitly; a direct value means that iteration pinned the
+/// variable (`subtype.c:1546–1553`).
+fn wrapped_constrained(v: Offset) -> bool {
+    if types::is_svec_value(Value(v)) && types::svec_len(v) == 2 {
+        return types::svec_ref(v, 1) == types::builtins().true_instance;
+    }
+    true
+}
+
+/// `has_universal_typevar` (`subtype.c:1346–1369`, minus the innervars
+/// walk): does `x` mention any in-scope ∀-bound variable? Guards envout
+/// entries against leaking sibling `where` variables.
+fn has_universal_typevar(x: Offset, e: &Env) -> bool {
+    has_free_var_where(x, &mut Vec::new(), &|v| {
+        e.lookup(v).map_or(false, |i| !e.vars[i].existential)
+    })
+}
+
+/// `widen_Type_if_concrete` (the pin phrases it on TypeEq; ours on
+/// `Type{T}`): `Type{x}` with a non-typevar `x` widens to `typeof(x)` in
+/// argument position; unions widen when both arms agree; a `UnionAll` whose
+/// widened body no longer mentions its variable sheds the wrapper.
+fn widen_type_if_concrete(t: Offset) -> Offset {
+    if types::is_type_type(t) {
+        let t0 = types::svec_ref(types::parameters_of(t), 0);
+        if !types::is_typevar(t0) {
+            return crate::object::type_of(Value(t0));
+        }
+    }
+    if types::is_union(t) {
+        let a = widen_type_if_concrete(types::union_a(t));
+        let b = widen_type_if_concrete(types::union_b(t));
+        if a == b {
+            return a;
+        }
+    }
+    if types::is_unionall(t) {
+        let body = widen_type_if_concrete(types::unionall_body(t));
+        if body != types::unionall_body(t) && !has_typevar(body, types::unionall_var(t)) {
+            return body;
+        }
+    }
+    t
+}
+
+/// `jl_has_typevar`: does `t` mention `var` as a free occurrence?
+fn has_typevar(t: Offset, var: Offset) -> bool {
+    has_free_var_where(t, &mut Vec::new(), &|v| v == var)
 }
 
 /// `subtype_var`: `b` is a type variable; relate it to the non-variable `a`.

@@ -544,4 +544,57 @@ for (const [src, kind, build] of knownDivergences) {
   else { console.log(`known divergence  ${src}`); }
 }
 console.log(`\n${pass}/${cases.length} match JuliaLang/julia (test/subtype.jl); ${fail} mismatch; ${knownDivergences.length - healed} known divergence(s)`);
-process.exitCode = fail ? 1 : 0;
+
+// --- env matching (engine slice 5): rj_subtype_env computes the values of
+// --- the right side's outer `where` variables, as jl_subtype_env does for
+// --- jl_subtype_matching. Expected bindings below were verified against
+// --- the pinned Julia binary via ccall(:jl_subtype_env, ...) — recorded as
+// --- pinned-binary evidence, not test/subtype.jl verbatim. ---
+const envCases = [
+  ["Tuple{Int,Int} <: Tuple{T,T} where T -> [Int64]", () => {
+    const T = tvar();
+    return [Tuple(Int, Int), where(T, Tuple(T, T)), [Int]];
+  }],
+  ["Tuple{Int,Float64} <: Tuple{T,S} where {T,S} -> [Int64, Float64]", () => {
+    const T = tvar(); const S = tvar();
+    return [Tuple(Int, Float64), where(T, where(S, Tuple(T, S))), [Int, Float64]];
+  }],
+  ["Tuple{Int,Int} <: Tuple{Vararg{Int,N}} where N -> [2]", () => {
+    const N = tvar();
+    return [Tuple(Int, Int), where(N, Tuple(VarargTV(Int, N))), ["long:2"]];
+  }],
+  ["Tuple{} <: Tuple{Vararg{T}} where T -> [svec(T, false)]", () => {
+    const T = tvar();
+    return [Tuple(), where(T, Tuple(Vararg(T))), [["wrapped", T, false]]];
+  }],
+  ["Tuple{Int,Float64} NOT <: Tuple{T,T} where T (diagonal)", () => {
+    const T = tvar();
+    return [Tuple(Int, Float64), where(T, Tuple(T, T)), null];
+  }],
+];
+let envPass = 0, envFail = 0;
+for (const [src, build] of envCases) {
+  const [a, b, expect] = build();
+  const ok = x.rj_subtype_env(a, b) === 1;
+  let good;
+  if (expect === null) {
+    good = !ok;
+  } else if (!ok || x.rj_env_size() !== expect.length) {
+    good = false;
+  } else {
+    good = expect.every((want, i) => {
+      const got = x.rj_env_get(i);
+      if (typeof want === "number") return got === want;
+      if (typeof want === "string" && want.startsWith("long:"))
+        return x.rj_typeof(got) === ty(ID.Int64) && x.rj_unbox_int(got) === BigInt(want.slice(5));
+      // ["wrapped", tvarOffset, constrainedBool]
+      return x.rj_is_svec(got) === 1 && x.rj_svec_len(got) === 2
+        && x.rj_svec_ref(got, 0) === want[1]
+        && x.rj_svec_ref(got, 1) === (want[2] ? x.rj_true_instance() : x.rj_false_instance());
+    });
+  }
+  if (good) { envPass++; } else { envFail++; console.log(`ENV MISMATCH  ${src}`); }
+}
+console.log(`${envPass}/${envCases.length} env matchings agree with the pinned Julia (jl_subtype_env)`);
+
+process.exitCode = (fail || envFail) ? 1 : 0;
