@@ -5,7 +5,7 @@
 # src/ are not part of this workspace; they are built by their own tooling.
 [workspace]
 resolver = "2"
-members = ["runtime", "intrinsics"]
+members = ["runtime", "intrinsics", "aotc"]
 
 [profile.release]
 # Small, predictable .wasm output.

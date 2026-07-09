@@ -1,0 +1,5 @@
+RUJU_LOWERED 1 d99fded
+thunk 0 3
+value global:g
+call ssa:0 int:10
+return ssa:1

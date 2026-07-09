@@ -16,16 +16,63 @@ are meant to be worked from, not just read.
 
 ## Next session opens here
 
-**The AOT thin slice** (issue #11; spec in `research-aot-backend.md` — its
-stage 2 forces the linear-memory shadow stack + region-base export) is the
-priority: the go/no-go experiment behind every D2 decision, and the top
-named risk while it stays unstarted. During its natural waits
-(builds, think time), interleave the **paper-and-polish batch**, timeboxed:
-a `design/` note on the language choice and threat model (why manual
-rooting; what the stress test buys; the branded-lifetime alternative),
-`linguist-vendored` on `reference/julia/` in `.gitattributes`, and the
-pinned-Julia release relocation decision. Engine slices 3–5
-(issues #3–#5, `research-subtype-engine.md` §6) are the M3 spine behind it.
+**Type intersection** (`jl_type_intersection`) — the engine is complete as
+researched (all five slices), so the M3 spine's head is now the frontier:
+intersection → `type_morespecific` → dispatch hardening, the last gate on
+the AOT backend. `research-subtype-engine.md` maps its consumers; the
+`Intersect` node's intersection-mode arms (`constraintkind`, `intersected`,
+`limited`) and `merge_env`'s under-estimation mode (`simple_meet` mode 0,
+implemented but unconsumed) are where it picks up. Carried-over
+interleaves: the **paper-and-polish batch** (still timeboxed, unstarted),
+the **exception-channel decision** (#14, the human's call), and
+**thin-slice stage 3** (#13, optional polish).
+
+*(Executed 2026-07-09, increments two through four:)*
+
+- ~~**Engine slice 5**~~ — `envout` (`jl_subtype_env`): the fill's full
+  value-selection cascade with the ∀-arm AND-merge, right-flip
+  preservation, restore clearing, and `widen_Type_if_concrete`
+  (`occurs_inv`'s first consumer). Verified against the pinned binary's
+  own `jl_subtype_env` — 10 native cases + the oracle's env section
+  through the new `rj_subtype_env` ABI; the 134-case oracle bit-identical.
+  Adaptation recorded: `tainted_inner`/`innervars` folded into the
+  `has_universal_typevar` guard.
+
+- ~~**Engine slice 3**~~ — the vararg length algebra: the `Loffset`
+  channel, typevar-count `Vararg{T,N}` (the `BOUND` kind), the full
+  four-kind tuple length classification, `check_vararg_length`, the
+  N-equation, the ∃-var-left unwrap guard, and finding 23's expansion
+  guard. Oracle 120→126 (the `NTuple` tranche, `test/subtype.jl:70,
+  79–80, 85–86, 632`), all on the first run after the port.
+- ~~**Engine slice 4**~~ — the `Intersect` meet node (#61917): exact
+  existential upper bounds through the three-mode `simple_meet`, the
+  `x <: a ∩ b` rule, `widen_intersect` at the escape point (its consumer
+  is slice 5's envout), and the `concrete` cross-variable propagation
+  (finding 15's tail). Oracle 126→**134/134** (the diagonal-through-union
+  family `:110–124`, the abstract-lower-bound guard `:141`, and `test_3`'s
+  cross-bounded existentials `:338–341`), plus pinned-Julia-verified
+  native cases for the propagation itself.
+
+*(Previous opener executed 2026-07-09:)*
+
+- ~~**The AOT thin slice**, stages 1–2 (issue #11)~~ — **GO** on every
+  threshold: exact correctness incl. Int64 wrap-around, both call paths
+  (specsig export + real dispatch driven by the pinned Julia's own lowering
+  of `f(10)`, under GC stress), 401.8× the interpreter, 0.95×
+  native-Rust-in-wasm, fptr1 3.8µs vs interpreted 47.2µs per call. Stage 2
+  landed D3's hardening — the **linear-memory shadow stack** (slot arena +
+  exported top cell; `Rooted`/`Frame` as veneers, one root set for both
+  fronts) and the **region-base export** — and a compiled allocating
+  function correct under a collection per allocation. The fixture pipeline
+  doubles as the D2a probe, and the named risk *materialized and was
+  caught*: a header-first layout assumption read garbage on first harness
+  contact (Ruju is tag-before-object) — evidence that the
+  whitelist-plus-harness regime does its job. Evidence: `implementation.md`
+  (AOT + GC sections). The **paper-and-polish batch** was *not* reached
+  in either stage: a `design/` note on the language choice and threat
+  model (why manual rooting; what the stress test buys; the
+  branded-lifetime alternative), `linguist-vendored` on `reference/julia/`
+  in `.gitattributes`, and the pinned-Julia release relocation decision.
 
 *(Previous opener executed 2026-07-07/08 — kept as the record of what this
 corpus fed:)*

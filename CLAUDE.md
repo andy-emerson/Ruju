@@ -28,7 +28,9 @@ current as you work.
 
 | Path | Owner | What it is |
 | - | - | - |
-| `runtime/`, `intrinsics/` | **ours** | the Rust runtime + a pure-intrinsics crate, plus `runtime/harness.mjs` (JS host) and `runtime/verify_julia_subtype.mjs` (the oracle) |
+| `runtime/`, `intrinsics/` | **ours** | the Rust runtime + a pure-intrinsics crate, plus `runtime/harness.mjs` (JS host), `runtime/verify_julia_subtype.mjs` (the oracle), and `runtime/harness_aot.mjs` (the AOT thin-slice checks) |
+| `aotc/` | **ours** | `ruju-aotc`, the build-time typed-IR → WASM backend (host-side, never wasm) |
+| `tools/` | **ours** | build-time tooling: `fetch-pinned-julia.sh` (the pinned binary), `prelower.jl` (M2's producer), `aot_fixture.jl` (typed-IR fixtures) |
 | `design/` | **ours** | `strategy.md`, `implementation.md`, `methodology.md` (see `design/README.md`) |
 | `reference/julia/` | **Julia (MIT)** | a pinned, verbatim subset of JuliaLang/julia (incl. `test/`, the oracle source) — see `reference/README.md`; licensing in `LICENSE.md` |
 
@@ -42,12 +44,15 @@ Conceptually, `runtime/` is the replacement for `reference/julia/src/`.
 ## Building and testing
 
 ```sh
-cargo test  -p ruju-runtime                                  # native unit tests
+cargo test  --workspace                                      # native unit tests (runtime + aotc)
 cargo build -p ruju-runtime                                  # also surfaces warnings (keep it clean)
 cargo build -p ruju-runtime --target wasm32-unknown-unknown --release
 node runtime/harness.mjs                                          # wasm -> JS end-to-end checks
-node runtime/verify_julia_subtype.mjs                             # subtype oracle vs JuliaLang/julia
+node runtime/verify_julia_subtype.mjs                             # subtype + env oracle vs JuliaLang/julia
 node runtime/verify_julia_lowering.mjs                            # lowering oracle (fetch tools/pinned-julia first to regenerate)
+cargo run -p ruju-aotc -- aotc/fixtures/f_sumsq.json target/aot/f_sumsq.wasm      # AOT thin slice:
+cargo run -p ruju-aotc -- aotc/fixtures/g_refloop.json target/aot/g_refloop.wasm  # emit both modules,
+node runtime/harness_aot.mjs                                                      # then check + benchmark
 ```
 
 Tests touch global runtime state and are serialized with a mutex; the default

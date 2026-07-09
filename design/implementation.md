@@ -148,8 +148,10 @@ replacement for `reference/julia/src/`.
 ```mermaid
 flowchart TD
     LIB["lib.rs — rj_ WASM ABI + init"]
-    LIB --> FE["frontend.rs — lex / parse / lower"]
-    FE --> INTERP["interp.rs — eval lowered IR"]
+    LIB --> FE["frontend.rs — lex / parse / lower (dev convenience)"]
+    LIB --> LOAD["loader.rs — pre-lowered CodeInfo + the prelude"]
+    LOAD --> INTERP["interp.rs — eval lowered IR"]
+    FE --> INTERP
     INTERP --> DISP["dispatch.rs — multiple dispatch"]
     INTERP --> VAL["value.rs — boxing"]
     INTERP --> INTR["intrinsics crate — arithmetic / comparison"]
@@ -172,7 +174,8 @@ flowchart TD
 | Module | Role |
 | - | - |
 | `lib.rs` | the `rj_`-prefixed WASM ABI and runtime initialization |
-| `frontend.rs` | hand-written bootstrap lexer / parser / lowering for a subset of Julia source |
+| `frontend.rs` | hand-written bootstrap lexer / parser / lowering for a subset of Julia source (a dev convenience since M2 — decision D1) |
+| `loader.rs` | the pre-lowered `CodeInfo` loader (`rj_load_lowered`, M2) and the operator/Core-builtin prelude |
 | `interp.rs` | tree-walking interpreter over lowered IR |
 | `dispatch.rs` | multiple dispatch — method table, applicability, specificity |
 | `subtype.rs` | subtyping, including the `where` machinery (`UnionAll` / `TypeVar`) |
@@ -291,13 +294,14 @@ normalization has the right overall algorithm.
     AbstractArray{T,N}` (`boot.jl:56–57,76`) and `GenericMemory` under
     `DenseVector` (`:62`). None of the three abstract types exist in the
     bootstrap. The hierarchy row is downgraded to Partial until they land.
-23. Fixed-count `Vararg{T,N}` expansion at construction is **unconditional**;
-    the C expands only when `nt == 0 || !jl_has_free_typevars(va0)`
-    (`jltypes.c:2361`), so `Tuple{Vararg{T,2}}` with a free `T` stays a
-    `Vararg` upstream but expands to `Tuple{T,T}` here. Deliberately kept —
-    it is what guarantees the engine never sees a ground fixed-N vararg —
-    and heals with the typevar-N slice (engine slice 3). Recorded, audit
-    2026-07.
+23. ~~Fixed-count `Vararg{T,N}` expansion at construction was
+    unconditional~~ — **fixed (engine slice 3, 2026-07-09)**: the C's guard
+    ported exactly (`nt == 0 || !jl_has_free_typevars(va0)`,
+    `jltypes.c:2361`), so `Tuple{Vararg{T,2}}` with a free `T` stays a
+    `Vararg` (the `INT` kind the engine's length classification now
+    handles), and instantiation rebuilds tuples through `tuple_type` so a
+    substitution that grounds `T` re-expands consistently with direct
+    construction. Pinned by a native test.
 
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
@@ -324,12 +328,12 @@ flowchart LR
         CV["var_lt / var_gt — ccheck at PARAM_NONE,<br/>simple_meet→Intersect (#61917)"]
         CF --> CE --> CSUB --> CV
     end
-    subgraph R["Ruju Rust (~1.1k lines)"]
+    subgraph R["Ruju Rust (~2.3k lines)"]
         direction TB
         RF["forall_exists_subtype — ∀ loop over<br/>Lunions states, re_save between (slice 1)"]
-        RE["exists_subtype — ∃ loop over Runions<br/>states, restore (incl. rdepth) between"]
-        RSUB["sub() — pick_union_element per machine bits;<br/>typevar/UnionAll priority over union split"]
-        RV["var_lt / var_gt — ccheck at Param::None,<br/>simple_meet over-estimates"]
+        RE["exists_subtype — ∃ loop over Runions<br/>states, restore (incl. rdepth, envout) between"]
+        RSUB["sub() — pick_union_element per machine bits;<br/>typevar/UnionAll priority; Loffset leaf compare"]
+        RV["var_lt / var_gt — ccheck at Param::None,<br/>simple_meet→Intersect (#61917), offset guards"]
         RF --> RE --> RSUB --> RV
     end
     C ~~~ R
@@ -357,14 +361,17 @@ mapping is real: per-var `lb`/`ub` narrowing through
 13. ~~`forall_exists_equal` reverse direction at Invariant~~ — **fixed**:
     reverse at `Param::None` + the same-name-datatype fast path; the
     two-union greedy path is still absent.
-14. **The pinned C has moved past the port (open).** The vendored
-    `subtype.c` carries the `Intersect` meet node (#61917),
-    `push_forall_bound_scope`, and `Loffset` — machinery absent from
-    `subtype.rs`.
+14. ~~The pinned C has moved past the port~~ — **closed (engine slices 2–4,
+    2026-07)**: all three pieces the 2026-06 audit found ahead of the port
+    landed — `push_forall_bound_scope` (slice 2), `Loffset` (slice 3), and
+    the `Intersect` meet node #61917 (slice 4).
 15. Oracle coverage: 24 → 53 assertions (post-audit expansion), which
     immediately caught a fourth bug — the diagonal rule rejected typevar
     lower bounds, breaking UnionAll alpha-equivalence (**fixed** per
-    `subtype.c:1404–1419`; `concrete`-flag propagation still absent).
+    `subtype.c:1404–1419`; the `concrete`-flag propagation tail **closed by
+    engine slice 4, 2026-07-09** — the full `:1400–1420` pop-check, incl.
+    the non-diagonal-concrete upper-bound bar, pinned by pinned-Julia-
+    verified native cases and the oracle's diagonal tranche).
 24. ~~The query path allocates with nothing rooted~~ (audit 2026-07;
     = `design/research/research-subtype-engine.md` §7 risk 5) — **fixed
     (engine slice 1, first commit, 2026-07)**. The exposure: `subtype.rs`
@@ -390,9 +397,14 @@ mapping is real: per-var `lb`/`ub` narrowing through
 
 Oracle: `runtime/verify_julia_subtype.mjs` runs assertions copied verbatim
 from JuliaLang/julia's own `test/subtype.jl` (mapping `Ref{T}`→`Box{T}`,
-`Int`→`Int64`) — currently **120/120, 0 known divergences** (engine slices
-1–2, 2026-07; slice 2 added `:452–458`, the invariant-position union family
-through `Ref`, incl. shared `S` across union arms). History: the unbounded-varargs slice added 19 cases
+`Int`→`Int64`) — currently **134/134, 0 known divergences** (engine slices
+1–4, 2026-07; slice 2 added `:452–458`, the invariant-position union family
+through `Ref`, incl. shared `S` across union arms; slice 3 added `:70,
+79–80, 85–86, 632` — the typevar-count vararg tranche, `NTuple` ≈
+`Tuple{Vararg{T,N}}`; slice 4 added `:110–124` — the diagonal family whose
+bounds cross a union arm — `:141`, and the `test_3` cross-bounded
+existentials `:338–341`, Box for Ptr with bare `Ptr` spelled
+`Box{X} where X`). History: the unbounded-varargs slice added 19 cases
 (`test/subtype.jl:43–59,587–594`), the two-parameter `Pair` constructor added
 8 invariant/`where`/diagonal cases (`:206–271`), a curated expansion added 7
 bounded-typevar and diagonal `test_3` cases plus 2 passing tuple-over-union
@@ -408,14 +420,15 @@ is retained empty.
 
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
-| `jl_subtype` structural core | Partial | Faithful | reflexive/`Any`/`Bottom`, Union forall–exists via the **global union-decision machine** (below), covariant tuples (incl. an unbounded-`Vararg` tail — `subtype_tuple`/`subtype_tuple_tail`/`subtype_tuple_varargs` length classification + tail walk, `subtype.c:1740–1899`, varargs slice 2026-07), nominal, invariant parametrics, `UnionAll`/`TypeVar` via the env, and the pin's dispatch order (typevar/UnionAll priority over union splits — finding 11, fixed). Slice 2 (2026-07) landed the `forall_exists_equal` tail: the definite/indefinite tuple-length gate (`subtype.c:2156–2177,2315–2317`), the two-union greedy path (`:2331–2339` — the componentwise attempt is itself a recorded machine decision), and `equal_var` (`:2270–2309`, minus the intersection/innervar arms). Remaining: the ∃-var-left guard on eager `UnionAll`-right unwrap (`subtype.c:2040–2052` — ours unwraps unconditionally, pre-existing shape) |
-| Existential env (`jl_stenv_t`) | Partial | Faithful | `var_lt`/`var_gt` narrow per-var `lb`/`ub`; ∀/∃ via the `existential` flag; `invdepth`/`depth0` order interacting existentials (`var_outside`, ∀∃-vs-∃∀). GC-rooted (engine slice 1, 2026-07): binding bounds mirrored in per-frame shadow-stack slots with write-through, snapshots root their saved bounds, the entry roots the query (`subtype.c:1378`, `:331–337`; finding 24). No `where`-var renaming or `innervars` leak handling |
-| Diagonal rule | Partial | Faithful | `occurs_cov` + `cov_diag` consistency-scope folding (`subtype_ccheck`), `is_leaf_bound`; `ccheck` enters at `PARAM_NONE` (fixed, audit 2026-06); typevar lower bounds accepted (fixed — Julia also propagates `concrete=1` to that var, `subtype.c:1411–1415`, which we still don't). Slice 2 (2026-07): `push_forall_bound_scope` (`:957–983`) scopes a ∀-variable's expanded-bound occurrences in `var_lt`/`var_gt` (`:1040–1043,1090–1093`, via `subtype_left_var`, `:875–891`); the full `record_var_occurrence` (`:894–904`) — `occurs_inv` counted below `depth0`, invariant-at-`depth0` counting as covariant (`occurs_inv` recorded now, consumed by envout/`Type{x}` widening in slices 4–5); `body_occurs_inv` cached at binding push as the pin does (`:1381`). Native tests pin `test/subtype.jl:127–138` (Float64 for String). Still absent: `Intersect` #61917 (slice 4), `Loffset` (slice 3) |
-| Union backtracking (the decision machine) | Done | Faithful | **engine slices 1–2 (2026-07), reference-verified against the pin**: `jl_unionstate_t` as a bit-stack binary counter ×2 (`Lunions`/`Runions`; `statestack_get/set`, `next_union_state`, `pick_union_decision`, `pick_union_element` — `subtype.c:203–271`); the ∀/∃ driver loops `forall_exists_subtype`/`exists_subtype` (`:2359–2404`) with the exact save-discipline asymmetry (`re_save_env` after each successful ∀ pass so cross-arm constraints on outer existentials accumulate; `restore_env` between ∃ attempts), `Runions.depth` riding in the snapshot (`:382,476`); `push`/`pop_unionstate` shields in `forall_exists_equal` (`:2347,2355`) and `subtype_ccheck` (`:862,871`); the full `local_forall_exists_subtype` (`:2189–2268`, slice 2): all five regimes, the freeze heuristic (`:2245–2251`), `limit_slow` saturating at 4 ∀ passes (lossy by design — the pin's explosion guard, `true`→`false` only), and `env_unchanged` (`:811–840`) incl. the became-diagonal check. Healed both tracked oracle divergences (`:371,:410`) on the machine's first run. Remaining beyond the machine itself: `Loffset` (slice 3) and `envout` (slice 5) touch these loops again |
-| `simple_meet` / `simple_join` | Partial | Faithful | join defers to the normalized `union_type` (keeps free vars, so `S>:T` survives); meet over-estimates to `b` for typevar operands (no `Intersect` node) |
-| `jl_type_intersection` | Planned | Faithful | — |
+| `jl_subtype` structural core | Partial | Faithful | reflexive/`Any`/`Bottom`, Union forall–exists via the **global union-decision machine** (below), covariant tuples (incl. an unbounded-`Vararg` tail — `subtype_tuple`/`subtype_tuple_tail`/`subtype_tuple_varargs` length classification + tail walk, `subtype.c:1740–1899`, varargs slice 2026-07), nominal, invariant parametrics, `UnionAll`/`TypeVar` via the env, and the pin's dispatch order (typevar/UnionAll priority over union splits — finding 11, fixed). Slice 2 (2026-07) landed the `forall_exists_equal` tail: the definite/indefinite tuple-length gate (`subtype.c:2156–2177,2315–2317` — kind-based over all four vararg kinds since slice 3), the two-union greedy path (`:2331–2339` — the componentwise attempt is itself a recorded machine decision), and `equal_var` (`:2270–2309`, minus the intersection/innervar arms; gated on `Loffset == 0` and `jl_is_type(x)` since slice 3, `:2341`). Slice 3 (2026-07-09) closed the ∃-var-left guard on eager `UnionAll`-right unwrap (`subtype.c:2036–2048` — an existential `x` now routes through `subtype_var` so the `UnionAll` lands in its narrowed bound), guarded the reflexive fast path on `Loffset == 0` (`N == N + k` must fail), and gave `sub()` the boxed-long leaf comparison modulo the offset (`:2151–2153`) |
+| Existential env (`jl_stenv_t`) | Partial | Faithful | `var_lt`/`var_gt` narrow per-var `lb`/`ub`; ∀/∃ via the `existential` flag; `invdepth`/`depth0` order interacting existentials (`var_outside`, ∀∃-vs-∃∀). GC-rooted (engine slice 1, 2026-07): binding bounds mirrored in per-frame shadow-stack slots with write-through, snapshots root their saved bounds, the entry roots the query (`subtype.c:1378`, `:331–337`; finding 24). Slice 3 (2026-07-09): the `Loffset` channel (`:138–140`) with `flip_offset` around `forall_exists_equal`'s reverse direction (`:481, 2351–2353`), `subtype_var`'s constant folding of a boxed length into the offset (`:1122–1131`), the `var_lt`/`var_gt` only-a-typevar-absorbs-an-offset guards (`:1032–1035, 1083–1086`), and the `intvalued`/`max_offset` binding fields (`:86–94`; `max_offset` poisoned to −1 on occurrence, `:905–908`, recovered around the length equation). No `where`-var renaming or `innervars` leak handling |
+| Diagonal rule | Partial | Faithful | `occurs_cov` + `cov_diag` consistency-scope folding (`subtype_ccheck`), `is_leaf_bound`; `ccheck` enters at `PARAM_NONE` (fixed, audit 2026-06); typevar lower bounds accepted (fixed — Julia also propagates `concrete=1` to that var, `subtype.c:1411–1415`, which we still don't). Slice 2 (2026-07): `push_forall_bound_scope` (`:957–983`) scopes a ∀-variable's expanded-bound occurrences in `var_lt`/`var_gt` (`:1040–1043,1090–1093`, via `subtype_left_var`, `:875–891`); the full `record_var_occurrence` (`:894–904`) — `occurs_inv` counted below `depth0`, invariant-at-`depth0` counting as covariant (`occurs_inv` consumed since slice 5: `widen_Type_if_concrete` + the envout fill); `body_occurs_inv` cached at binding push as the pin does (`:1381`). Native tests pin `test/subtype.jl:127–138` (Float64 for String). `is_leaf_bound` gained the pin's non-type-value arm (slice 3, `subtype.c:1152` — a boxed vararg length is a concrete leaf). Slice 4 (2026-07-09) landed the full pop-check (`:1400–1420`): the `concrete` binding flag (not in the C's saved-env record — restores preserve it, as they do `intvalued`), its propagation through a diagonal variable's typevar lower bound, and the non-diagonal-concrete upper-bound bar; oracle: the diagonal-through-union family (`test/subtype.jl:110–124`, Float64 for String) and the abstract-lower-bound guard (`:141`) |
+| Union backtracking (the decision machine) | Done | Faithful | **engine slices 1–2 (2026-07), reference-verified against the pin**: `jl_unionstate_t` as a bit-stack binary counter ×2 (`Lunions`/`Runions`; `statestack_get/set`, `next_union_state`, `pick_union_decision`, `pick_union_element` — `subtype.c:203–271`); the ∀/∃ driver loops `forall_exists_subtype`/`exists_subtype` (`:2359–2404`) with the exact save-discipline asymmetry (`re_save_env` after each successful ∀ pass so cross-arm constraints on outer existentials accumulate; `restore_env` between ∃ attempts), `Runions.depth` riding in the snapshot (`:382,476`); `push`/`pop_unionstate` shields in `forall_exists_equal` (`:2347,2355`) and `subtype_ccheck` (`:862,871`); the full `local_forall_exists_subtype` (`:2189–2268`, slice 2): all five regimes, the freeze heuristic (`:2245–2251`), `limit_slow` saturating at 4 ∀ passes (lossy by design — the pin's explosion guard, `true`→`false` only), and `env_unchanged` (`:811–840`) incl. the became-diagonal check. Healed both tracked oracle divergences (`:371,:410`) on the machine's first run. Slice 3 threaded `Loffset` through the loops' fast paths (`obviously_egal` equality holds only at offset 0, `:2313`; the `equal_var` gate, `:2341`). Remaining beyond the machine itself: `envout` (slice 5) touches these loops again |
+| `simple_meet` / `simple_join` | Partial | Faithful | join defers to the normalized `union_type` (keeps free vars, so `S>:T` survives). **Meet is exact since engine slice 4 (2026-07-09)**: the three-mode `simple_meet` contract (`subtype.c:759–780` — exact / over-approximate / under-estimate) over the **`Intersect{a,b}` meet node** (#61917; `julia.h:595–604`, a never-uniqued, never-user-visible bootstrap type recognized by identity, GC-traced like `Vararg`): `var_lt` keeps incomparable upper-bound constraints as a nested meet spine instead of forgetting one (`:1059–1066`); `x <: a ∩ b` splits dually to Union-left (`:1952–1961`, left-side asserted unreachable); `widen_intersect` (`:786–800`) over-approximates the spine at `subtype_unionall` exit before a bound could escape (the consumer is slice 5's envout — placement kept faithful now); `is_leaf_bound`/`obviously_egal`/the free-var walker gained their node arms (`:520, :1142`). `simple_intersect` (`jltypes.c:864–979`) is faithful-partial: disjointness evidence is a conservative `obviously_disjoint` subset (no full-intersection emptiness — weaker evidence only under-simplifies, never mis-answers), componentwise subsumption uses full `issubtype` for the C's `simple_subtype2` (finding 7's recorded substitution), and the final union rebuild goes through the normalized constructor |
+| `envout` (`jl_subtype_env`) | Partial | Faithful | engine slice 5 (2026-07-09): `envout`/`envsz`/`envidx` on the env (`subtype.c:125–133`, entries mirrored into a rooted frame — the C's "envout is gc-rooted"); `envidx` incremented around each existential body (`:1388–1391`); the fill's full value-selection cascade at `subtype_unionall` exit (`:1489–1560`) incl. `wrap_tvar_env`'s `svec(tvar, constrained)` wrapper (`:1224–1227`), the `N::Int` unconstrained-length token, and the AND-merge across ∀ arms; `exists_subtype` preserves assigned slots across right-flips (`:2369–2375`); `restore_env` clears from `envidx` (`:477–478`); `widen_Type_if_concrete` on the lb in argument position (`:1394–1396` — `occurs_inv`'s first consumer). Adaptations, recorded: the `tainted_inner`/`innervars` bounds-leak bookkeeping is folded into the `has_universal_typevar` guard (innervars absent since slice 1); concreteness evidence for the pin-the-least-solution arm is `is_leaf_bound` (no `isconcretetype` flag; dispatchtuples omitted). Verified: 10 env-binding cases whose expected values come from the pinned binary's own `jl_subtype_env` (native + the oracle's env section via the `rj_subtype_env`/`rj_env_*` ABI); the 134-case oracle is bit-identical |
+| `jl_type_intersection` | Planned | Faithful | **unblocked** — envout (slice 5) was its doorway; the head of the M3 spine |
 | `jl_type_morespecific` | Partial | Faithful | subtype-based approximation |
-| Varargs | Partial | Faithful | unbounded `Vararg{T}` in tuple tails (varargs slice 2026-07): its own `jl_vararg_t`-analog value kind (element `T@0`, count `N@4`), the `subtype_tuple` length classification (`JL_VARARG_UNBOUND` vs `NONE`) and `subtype_tuple_tail`/`subtype_tuple_varargs` walk (`subtype.c:1740–1899`), and a `Vararg` arm in `var_occurs_invariant`. Fixed-count `Vararg{T,N}` (the `INT` kind) landed 2026-07: a trailing one **expands at tuple construction** as `inst_datatype_inner` does, so `Tuple{Int,Vararg{Int,2}} === Tuple{Int,Int,Int}` through uniquing (oracle: `test/subtype.jl:61–68`) and the subtype engine never sees a ground fixed-N vararg — expansion is unconditional, unlike the C's free-typevar guard (finding 23). Omitted: typevar-valued `N` (the `BOUND` kind — the `N` length algebra and `check_vararg_length` land with it), vararg uniquing, and the repeated-element/separable tail fast paths |
+| Varargs | Partial | Faithful | unbounded `Vararg{T}` in tuple tails (varargs slice 2026-07): its own `jl_vararg_t`-analog value kind (element `T@0`, count `N@4`) and a `Vararg` arm in `var_occurs_invariant`. Fixed-count `Vararg{T,N}` (the `INT` kind) expands at tuple construction as `inst_datatype_inner` does — under the C's free-typevar guard since engine slice 3 (finding 23, fixed) — so `Tuple{Int,Vararg{Int,2}} === Tuple{Int,Int,Int}` through uniquing (oracle: `test/subtype.jl:61–68`). **The length algebra landed (engine slice 3, 2026-07-09)**: typevar-valued `N` (the `BOUND` kind), the **full** `subtype_tuple` length classification over all four kinds — incl. the pinned-lower-bound arithmetic (`subtype.c:1846–1894`) — `check_vararg_length`'s N-discharge at the tail's end (`:1828–1832`, `:1568–1583`), `subtype_tuple_varargs`' N-equation (`:1594–1738`: long-vs-long directly, long-vs-var by folding the count difference into the constant, var-vs-var through `forall_exists_equal` under `Loffset`), the `intvalued`/`max_offset` binding fields with the pin's snapshot-around-the-equation bookkeeping, and boxed `Int64` lengths as type parameters (leaves in `is_leaf_bound`, compared modulo the offset at every cited site). Oracle: `test/subtype.jl:70, 79–80, 85–86, 632` (`NTuple` ≈ `Tuple{Vararg{T,N}}`). Omitted: vararg uniquing and the repeated-element/separable tail fast paths (pure optimizations) |
 | Fast paths (`obviously_egal`) | Partial | Faithful | `obviously_egal` (`subtype.c:501–538`, minus the `isconcretetype` early-out — an optimization over uniquing — and the TypeEq/Intersect arms whose node kinds don't exist here) and `obviously_in_union` (`:621–641`) landed with slice 1 as the machine's guards; `jl_obvious_subtype` and the repeated-element/separable tuple fast paths remain Planned |
 
 ## Method dispatch — `gf.c`, `typemap.c` vs `dispatch.rs`
@@ -443,6 +456,7 @@ flowchart LR
 | Applicability | Partial | Faithful | `argtuple <: sig` — matches Julia's concrete-tuple dispatch (`jl_typemap_assoc_exact`, `gf.c:3259`; intersection serves match queries/guards, `gf.c:1149`); missing: typemap cache, world age |
 | Specificity | Partial | Faithful | subtype-based |
 | Function values | Partial | Faithful | generic functions and native builtins are singleton values under the abstract `Function`, resolved by `typeof(f)` (`dispatch::FnKind`); the operator prelude (`loader.rs`) binds `+ - * / ÷ % == < <= > >= ===` in `Main` as generic functions whose methods wrap the typed intrinsics — the faithful shape (Julia's operators are `base/` generic functions), Int64/Float64 coverage for now |
+| Compiled-method entries (`fptr1`) | Partial | Faithful | AOT thin slice 2026-07: `Entry` gains an optional `fptr1` funcref-table index (the `CodeInstance.invoke` analog); `invoke` prefers it over interpreting `body` — selection unchanged, one method table serves both execution fronts. The call is a `call_indirect` via transmute (a Rust fn pointer is a table index on wasm32 — verified by `harness_aot.mjs`). Compiled code cannot throw in this vocabulary; the shared exception channel is thin-slice stage 2's recorded decision |
 | Method cache (`typemap`) | Planned | Faithful | linear scan per call now |
 | World age | Planned | Faithful | — |
 | Ambiguity / `MethodError` | Planned | Faithful | first match; `NULL` on miss |
@@ -584,7 +598,7 @@ strategy's "GC exactness & tuning" frontier item).**
 | Write barrier + remembered set | Done | Faithful | exact `jl_gc_wb` (`gc-wb-stock.h:14`) + `jl_gc_queue_root` (`gc-stock.c:1493`): fires on parent `== GC_OLD_MARKED` with child unMARKED; re-tag 3→1 is the at-most-once guard; remset cleared at mark start with entries restored to 3 and traced (`gc_queue_remset`, `:2828`), then **rebuilt** during marking — any scanned old object with a young-at-scan-time reference is re-pushed (`gc_mark_push_remset`, `:1613`, the `nptr == 0x3` rule). After a quick sweep, entries are put back in the *queued* state, `GC_MARKED` (`:3405–3414`), so the barrier cannot refire on them — slice 2's note claimed duplicates were "tolerated, as in the pin"; the pin in fact *prevents* barrier-after-scan duplicates via this re-queue (corrected, slice A). Full sweeps clear the remset outright (`:3415`). Slices 1–2 + tail A, 2026-06 |
 | Collection trigger | Partial | Faithful | proactive at the heap target, checked at allocation (`heap_size >= heap_target`, `gc-stock.c:356`); the target is live size + `overallocation` growth (`:3032–3050`, ported) floored at `default_collect_interval` scaled to the region (`:33–35`). Julia's MemBalancer rate machinery behind `target_allocs` omitted (GC tail slice A, 2026-06); exhaustion collect-and-retry remains the backstop |
 | Full-vs-quick policy | Done | Faithful | the pin's predicates (`gc-stock.c:3377–3400`): full next when promoted bytes since the last full sweep exceed 0.15 of the heap, or the heap outgrew the post-full baseline by `overallocation`; `user_max`/`under_pressure` omitted — no CLI options (GC tail slice A, 2026-06) |
-| Shadow-stack rooting (`gcframe`) | Done | Faithful | plus an allocation-stress test mode (`gc::set_stress` — a collection per allocation) as the rooting-discipline enforcement vehicle (engine slice 1, 2026-07) |
+| Shadow-stack rooting (`gcframe`) | Done | Faithful | **moved to a linear-memory slot arena** (decision D3, thin-slice stage 2, 2026-07-09): a fixed arena of u32 region-offset slots + a top cell whose address `rj_gc_shadow_top_addr` exports — byte-for-byte specified, so compiled code emits gcframes directly (prologue bumps the top, write-through on ref sets, epilogue restores); `Rooted`/`Frame` are veneers over the same arena, one root set for both execution fronts (the `jl_pgcstack` analog, flattened — no machine stack to link). Adaptation recorded: the top is a memory cell, not a mutable wasm global (rustc cannot export one; a cell is equally reachable and closer to `jl_pgcstack`). Overflow is a loud panic (16384 slots, bss). Plus the allocation-stress mode (`gc::set_stress` — a collection per allocation) as the rooting-discipline enforcement vehicle (engine slice 1, 2026-07) |
 | Machine-stack scanning | n/a | **Divergence** | impossible in WASM; the shadow stack is *mandatory* instead |
 | Safepoints | Partial | Faithful | trivial (single-threaded); multithreaded protocol later |
 | Finalizers | Planned | Faithful | includes `mark_reset_age` (`gc-stock.c:3165–3172`): objects reachable only from `to_finalize` are reset as-if-new — finalizer-only machinery, lands here |
@@ -718,9 +732,79 @@ verify; the following simplifications were live but unrecorded.
 
 ## AOT backend (Phase 1) — replaces removed `codegen.cpp`/`jitlayers.cpp`
 
+**Thin slice (issue #11) stages 1–2 landed 2026-07-09 — GO.** The pin carries no JIT to
+port (no `codegen.cpp`/`jitlayers.cpp` in the vendored subset), so the backend
+is a recorded divergence whose faithfulness targets are *behavior* (Julia
+semantics at the IR level) and upstream's compilation architecture where it
+exists as data: the two-entry-point convention is `CodeInstance`'s
+`invoke`/`specptr` split (`julia.h:219–221,460–461,523–535`). The full chain
+was proven end to end: typed IR (data) → Rust backend → wasm function →
+registered in dispatch → called through both the specsig export and the
+dispatch path → benchmarked past every go/no-go threshold.
+
+- **Producer** (`tools/aot_fixture.jl`, runs under the fetched pinned Julia —
+  whose sysimage compiler *is* the pinned `Compiler/`, so inference and
+  optimization are never reimplemented, decision D2a): serializes
+  `Base.code_ircode` output — blocks, statements, per-statement types — into
+  the pin-versioned `ruju-aotc-fixture-1` JSON format
+  (`aotc/fixtures/f_sumsq.json`). D2a's stock-Julia + `Compiler/`-as-package
+  loading path remains unprobed (unneeded while the build-time Julia is the
+  pinned binary itself — recorded).
+- **Backend** (`aotc/`, the host-side `ruju-aotc` crate): a deliberately dumb
+  translator. "Beyond Relooper" structured control flow (reverse postorder +
+  Cooper–Harvey–Kennedy dominators + the dominator-tree walk; irreducible
+  CFGs rejected loudly), `wasm-encoder` emission of the **specsig** function
+  (isbits values unboxed in `i64`/`i32` locals; φs deconstructed to per-edge
+  moves, swap hazards rejected loudly) and the **boxed fptr1 wrapper**
+  (`(argv, nargs) → ret` over `rj_unbox_int`/`rj_box_int` imports; `nargs`
+  unchecked — arity is dispatch's signature check, recorded), `wasmparser`
+  validation on every emit. The intrinsic vocabulary is a 12-op i64 whitelist
+  (D2a mitigation 1); everything else fails loudly.
+- **Linking (decision D2c) proven**: the compiled module imports `env.memory`
+  + box/unbox and defines no memory/table/globals of its own; the harness
+  instantiates the runtime first, grows its exported
+  `__indirect_function_table` (`--export-table --growable-table`,
+  `.cargo/config.toml`), places the wrapper, and registers the index — the
+  first real exercise of the composable-memory commitment.
+- **Dispatch**: `Entry.fptr1` + `add_compiled_method` (see Method dispatch);
+  on wasm32 a Rust fn pointer *is* a table index, so `invoke`'s compiled path
+  is a plain `call_indirect` — verified end to end by the harness, retiring
+  research §6.5's low-risk assumption.
+- **Verified** (`runtime/harness_aot.mjs`): exact equality with the
+  interpreter on {0, 1, 10, 10⁶} and the Int64 wrap-around case at 10⁷; the
+  dispatch path executes the pinned Julia's own lowering of `f(10)`
+  (`aotc/fixtures/call_f_10.lowered`) through the compiled fptr1, including
+  under allocation stress (`rj_gc_stress`), roots balanced after; benchmarks
+  at n=10⁷ (5 reps, median): **401.8× the interpreter** (threshold ≥100×),
+  **0.95× native-Rust-in-wasm** (≤3×), fptr1 dispatch calls 3.8µs vs the
+  interpreted twin's 47.2µs (`g`, same body through the pre-lowering
+  pipeline).
+- **Stage 2 — the allocating compiled function** (2026-07-09):
+  `g(n) = (r = Ref(0); loop: r = Ref(r[] + i*i))` — the fully-optimized
+  pinned IR *keeps* the loop-carried allocation (SROA cannot scalarize it),
+  so the fixture is the production pipeline's own output, no
+  `optimize_until` needed. Vocabulary grew by `:new` (of the 1-field Int64
+  ref → the imported `rj_new_ref_int`) and `getfield` (→
+  `i64.load(region_base + ref)`, tag-before-object layout). **Gcframe
+  emission**: one shadow-stack slot per ref-typed statement local; prologue
+  claims/zeroes/bumps via the exported top cell, every ref-local set writes
+  through to its slot, every return restores the top. Verified: exact
+  through auto-GC churn (10⁵–10⁶ allocations), exact under a collection per
+  allocation, dispatch path exact under stress, shadow top balanced after.
+  Runtime type for the `%new`: a bootstrap **`RefValue{Int64}` stand-in**
+  (`define_struct_from_source`, same name/layout: one inline Int64 field) —
+  parametric `RefValue` arrives with `base/` (recorded divergence).
+  **The named D2a risk materialized and was caught here**: the first draft
+  read fields at `offset + 8`, assuming header-first layout — Ruju is
+  tag-before-object (`jl_taggedvalue_t`), data at +0 — and the harness
+  returned region offsets as "field values" on first contact. Layout facts
+  must come from the runtime's object model, never assumption; at scale this
+  resolution moves into the backend querying the type registry.
+
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
-| IR → code | Planned | **Divergence** | Julia JITs via LLVM; Ruju plans a build-time IR → WASM compiler |
+| IR → code (thin-slice vocabulary) | Partial | **Divergence** | Julia JITs via LLVM; Ruju compiles at build time to WASM. Landed: the fixture producer/parser, Beyond-Relooper, specsig + fptr1 emission, validation, the whitelisted intrinsic vocabulary; stage 2 added `:new`/`getfield` for the 1-field Int64 ref and **gcframe emission** against the linear-memory shadow stack. Remaining: stage 3 — compiled→dispatch fallback calls (abstract argtypes → `rj_dispatch`); the **exception channel** for compiled frames (an open design decision — must be one mechanism shared with the interpreter's `Err` channel; nothing in the current vocabulary throws); field-offset resolution from the type registry (hard-coded for the ref's single field now); the durable serialization producer; `wasm-merge` single-module packaging |
+| Calling convention (fptr1/specsig) | Partial | Faithful | the pin's `CodeInstance` two-entry-point design (`julia.h:460–461`): boxed jlcall wrapper + native-signature specsig; argv is a rooted slice of boxed-value offsets in linear memory (the Rust heap *is* linear memory; caller keeps args rooted) |
 
 ## Platform, profiling & support — `dlload.c`, `sys.c`, `timing.c`, `src/support/`
 

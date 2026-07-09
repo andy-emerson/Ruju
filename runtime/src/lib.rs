@@ -44,6 +44,7 @@ fn init_runtime() {
     module::init_main();
     install_methods();
     loader::install_prelude();
+    aot_bootstrap();
 }
 
 // Demo generic functions, installed at startup so the interpreter has something
@@ -193,6 +194,205 @@ pub extern "C" fn rj_load_lowered(len: u32) -> i64 {
         Some(Ok(v)) => unbox_int(v),
         _ => 0,
     }
+}
+
+// ---- the AOT boundary (thin slice, issue #11) ----
+
+/// Box an `Int64` — the jlcall boundary for compiled code (a boxed wrapper
+/// unboxes its argv, runs the specsig body, and boxes the result back).
+/// Allocates; the caller's argv entries must already be rooted.
+#[no_mangle]
+pub extern "C" fn rj_box_int(x: i64) -> u32 {
+    ensure_init();
+    box_int(x).0
+}
+
+/// Unbox an `Int64` value at region offset `v`.
+#[no_mangle]
+pub extern "C" fn rj_unbox_int(v: u32) -> i64 {
+    unbox_int(Value(v as Offset))
+}
+
+/// Declare a fresh generic function named by the first `len` bytes of the
+/// source buffer and bind it in `Main` (the `jl_declare_const_gf` shape the
+/// `:method` statement also uses). Returns the function id for method
+/// registration (0 on a bad name or binding failure).
+#[no_mangle]
+pub extern "C" fn rj_declare_generic(len: u32) -> u32 {
+    ensure_init();
+    let bytes = unsafe { core::slice::from_raw_parts(SOURCE.0.get() as *const u8, len as usize) };
+    let name = match core::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let func = dispatch::fresh_func_id();
+    let fnval = dispatch::make_function(name, func);
+    let main = Value(module::main_offset());
+    match module::set_global(main, symbol::intern(types::builtin(id::SYMBOL), name), fnval) {
+        Ok(()) => func,
+        Err(_) => 0,
+    }
+}
+
+/// Register a compiled method: function id `func`, signature tuple type at
+/// region offset `sig`, boxed entry point `fptr1` (the funcref-table index
+/// the loader placed the compiled wrapper at). Selection is unchanged — one
+/// method table serves interpreted and compiled methods alike.
+#[no_mangle]
+pub extern "C" fn rj_register_compiled(func: u32, sig: u32, fptr1: u32) {
+    ensure_init();
+    dispatch::add_compiled_method(func, sig as Offset, fptr1);
+}
+
+/// Allocate `Vararg{elem, N}` with a **typevar** count `n` — the C's
+/// `JL_VARARG_BOUND` kind (engine slice 3). Unlike a ground count, it stays
+/// unexpanded through tuple construction; the subtype engine's length
+/// algebra owns its `N`.
+#[no_mangle]
+pub extern "C" fn rj_vararg_tv(elem: u32, n: u32) -> u32 {
+    ensure_init();
+    types::vararg_type_with(elem as Offset, n as Offset)
+}
+
+/// Env-matching subtype (`jl_subtype_env`/`jl_subtype_matching`, engine
+/// slice 5): decide `a <: b`, computing the value of each of `b`'s outer
+/// `where` variables. Results are stashed runtime-side (GC-rooted until the
+/// next query) and read back with [`rj_env_size`]/[`rj_env_get`].
+#[no_mangle]
+pub extern "C" fn rj_subtype_env(a: u32, b: u32) -> u32 {
+    ensure_init();
+    subtype::subtype_env_stashed(a as Offset, b as Offset) as u32
+}
+
+/// Env slots the last successful `rj_subtype_env` produced (0 after a miss).
+#[no_mangle]
+pub extern "C" fn rj_env_size() -> u32 {
+    subtype::env_stash_len() as u32
+}
+
+/// The `i`-th stashed env entry: a type/value offset, or a
+/// `svec(tvar, Bool)` wrapper for an indefinite variable.
+#[no_mangle]
+pub extern "C" fn rj_env_get(i: u32) -> u32 {
+    subtype::env_stash_get(i as usize)
+}
+
+/// `jl_subtype_env_size`: outer `UnionAll` count of `t`.
+#[no_mangle]
+pub extern "C" fn rj_subtype_env_size(t: u32) -> u32 {
+    subtype::subtype_env_size(t as Offset) as u32
+}
+
+/// Structural readbacks for env entries.
+#[no_mangle]
+pub extern "C" fn rj_is_svec(v: u32) -> u32 {
+    types::is_svec_value(Value(v as Offset)) as u32
+}
+
+#[no_mangle]
+pub extern "C" fn rj_svec_len(s: u32) -> u32 {
+    types::svec_len(s as Offset)
+}
+
+#[no_mangle]
+pub extern "C" fn rj_svec_ref(s: u32, i: u32) -> u32 {
+    types::svec_ref(s as Offset, i)
+}
+
+#[no_mangle]
+pub extern "C" fn rj_is_typevar(v: u32) -> u32 {
+    types::is_typevar(v as Offset) as u32
+}
+
+/// The `true`/`false` permbox offsets (env wrappers carry the constrained
+/// bit as a Bool instance).
+#[no_mangle]
+pub extern "C" fn rj_true_instance() -> u32 {
+    ensure_init();
+    types::builtins().true_instance
+}
+
+#[no_mangle]
+pub extern "C" fn rj_false_instance() -> u32 {
+    ensure_init();
+    types::builtins().false_instance
+}
+
+/// The runtime type the AOT boundary's `%new(Base.RefValue{Int64}, v)`
+/// allocates: a monomorphic mutable struct of the same name and layout (one
+/// inline `Int64` field). Parametric `RefValue` arrives with `base/`;
+/// the stand-in is recorded in `design/implementation.md` (AOT section).
+struct AotRefType(core::cell::Cell<Offset>);
+unsafe impl Sync for AotRefType {}
+static AOT_REF_TYPE: AotRefType = AotRefType(core::cell::Cell::new(0));
+
+fn aot_bootstrap() {
+    let t = types::define_struct_from_source(
+        "RefValue{Int64}",
+        &[("x", types::builtin(id::INT64))],
+        true,
+    )
+    .expect("RefValue{Int64} bootstrap");
+    AOT_REF_TYPE.0.set(t);
+}
+
+/// Allocate a fresh `RefValue{Int64}`-shaped cell holding `v` — the
+/// allocation entry the thin slice's stage-2 compiled code calls for `%new`
+/// of the 1-field Int64 ref (the inline-bits store path of `jl_new_structv`,
+/// `datatype.c:1675`; no re-checks — inference already typed the `:new`, as
+/// with upstream codegen). Allocates, and can therefore collect: the
+/// caller's live refs must sit in shadow-stack slots — the gcframe contract
+/// stage 2 exists to prove.
+#[no_mangle]
+pub extern "C" fn rj_new_ref_int(v: i64) -> u32 {
+    ensure_init();
+    let obj = object::alloc(AOT_REF_TYPE.0.get(), 8);
+    unsafe {
+        *object::data_ptr::<i64>(obj) = v;
+    }
+    obj.0
+}
+
+/// The linear-memory address of the shadow-stack top cell (decision D3): the
+/// u32 at this address holds the address of the next free root slot. A
+/// compiled prologue claims `n` slots by bumping it; the epilogue restores
+/// it; slots hold u32 region offsets (0 = empty). One arena serves compiled
+/// and interpreted code — `Rooted`/`Frame` are veneers over it.
+#[no_mangle]
+pub extern "C" fn rj_gc_shadow_top_addr() -> u32 {
+    gc::shadow_top_addr()
+}
+
+/// The linear-memory address of region offset 0, so compiled code addresses
+/// heap objects as `base + offset` (the "region base kept cheaply reachable"
+/// carry-forward, `design/roadmap.md`). Constant after `rj_init`.
+#[no_mangle]
+pub extern "C" fn rj_region_base() -> u32 {
+    ensure_init();
+    region::base_addr()
+}
+
+/// Toggle allocation-stress mode (a collection per allocation) — the
+/// rooting-discipline enforcement vehicle (engine slice 1), exposed so the
+/// harness can drive the AOT boundary under stress.
+#[no_mangle]
+pub extern "C" fn rj_gc_stress(on: u32) {
+    ensure_init();
+    gc::set_stress(on != 0);
+}
+
+/// The thin slice's benchmark reference point: the fixture's loop
+/// hand-written in Rust inside the runtime module — the "what wasm can do"
+/// line the compiled function is measured against (within 3×, or no go).
+#[no_mangle]
+pub extern "C" fn rj_bench_native(n: i64) -> i64 {
+    let mut acc: i64 = 0;
+    let mut i: i64 = 1;
+    while i <= n {
+        acc = acc.wrapping_add(i.wrapping_mul(i));
+        i = i.wrapping_add(1);
+    }
+    acc
 }
 
 /// Ensure the runtime is initialized.
@@ -988,6 +1188,177 @@ mod tests {
         assert!(!sub(tup(&[integer, va(real)]), tup(&[integer, va(integer)])));
 
         assert_eq!(gc::root_count(), 0, "roots released after subtype queries");
+    }
+
+    #[test]
+    fn vararg_length_algebra_typevar_n() {
+        // Engine slice 3 (`test/subtype.jl:70,79-80,85-86,632` ride the
+        // oracle; these pin the machinery natively): the BOUND vararg kind,
+        // check_vararg_length's N-discharge, the N-equation under Loffset,
+        // and finding 23's expansion guard.
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+        let int = t(types::id::INT64);
+        let any = t(types::id::ANY);
+        let bot = t(types::id::BOTTOM);
+        let sub = |a, b| types::issubtype(a, b);
+
+        // Tuple{Int,Int} <: Tuple{Int,Int,Vararg{Int,N}} where N  (N = 0).
+        let n1 = types::make_typevar("N", bot, any);
+        let va = types::vararg_type_with(int, n1);
+        let rhs = types::unionall_type(n1, types::tuple_type(&[int, int, va]));
+        assert!(sub(types::tuple_type(&[int, int]), rhs));
+        assert!(!sub(rhs, types::tuple_type(&[int, int])), "strict");
+        // Tuple{Int} pins N = -1: impossible.
+        assert!(!sub(types::tuple_type(&[int]), rhs));
+
+        // NTuple{N,Int} used twice: the length propagates across elements.
+        let n2 = types::make_typevar("N", bot, any);
+        let nt = |n| types::tuple_type(&[types::vararg_type_with(int, n)]);
+        let pair_rhs = types::unionall_type(n2, types::tuple_type(&[nt(n2), nt(n2)]));
+        let t2 = types::tuple_type(&[int, int]);
+        let t1 = types::tuple_type(&[int]);
+        assert!(sub(types::tuple_type(&[t2, t2]), pair_rhs));
+        assert!(!sub(types::tuple_type(&[t2, t1]), pair_rhs), "mismatched lengths");
+
+        // Finding 23's guard: Vararg{T,2} with a free T does NOT expand at
+        // construction (`jltypes.c:2361`) — the engine's classification
+        // handles the INT kind instead.
+        let tv = types::make_typevar("T", bot, any);
+        let va2 = types::vararg_type_n(tv, 2);
+        let tup_free = types::tuple_type(&[va2]);
+        let p = types::parameters_of(tup_free);
+        assert_eq!(types::svec_len(p), 1, "free-element fixed-count vararg stays unexpanded");
+        assert!(types::is_vararg(types::svec_ref(p, 0)));
+        // ...and a ground element still expands.
+        let ground = types::tuple_type(&[types::vararg_type_n(int, 2)]);
+        assert_eq!(ground, types::tuple_type(&[int, int]), "ground fixed-count vararg expands");
+
+        assert_eq!(gc::root_count(), 0, "roots released after vararg queries");
+    }
+
+    #[test]
+    fn concrete_propagation_through_typevar_lower_bounds() {
+        // Engine slice 4's `concrete` flag (`subtype.c:1405–1420`): a
+        // diagonal variable whose lower bound is a typevar propagates the
+        // concreteness constraint to *that* variable's binding, which then
+        // faces the leaf-bound bar at its own pop. Expected answers verified
+        // against the pinned Julia binary (not test/subtype.jl — recorded):
+        //   (Tuple{S,S} where S<:Int)            <: (Tuple{T,T} where T)  — true
+        //   (Tuple{S,S} where Integer<:S<:Real)  <: (Tuple{T,T} where T)  — false
+        //   (Tuple{S,Int} where S<:Int)          <: (Tuple{T,T} where T)  — true
+        //   (Tuple{S,Real} where S<:Real)        <: (Tuple{T,T} where T)  — false
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+        let (int, integer, real, any, bot) =
+            (t(types::id::INT64), t(types::id::INTEGER), t(types::id::REAL), t(types::id::ANY), t(types::id::BOTTOM));
+        let sub = |a, b| types::issubtype(a, b);
+        let diag = |lb, ub, second: Option<Offset>| {
+            let s = types::make_typevar("S", lb, ub);
+            let body = types::tuple_type(&[s, second.unwrap_or(s)]);
+            let lhs = types::unionall_type(s, body);
+            let tv = types::make_typevar("T", bot, any);
+            let rhs = types::unionall_type(tv, types::tuple_type(&[tv, tv]));
+            sub(lhs, rhs)
+        };
+        assert!(diag(bot, int, None), "S<:Int is concrete-satisfiable");
+        assert!(!diag(integer, real, None), "abstract-lower-bounded S is not");
+        assert!(diag(bot, int, Some(int)), "S<:Int against a ground Int");
+        assert!(!diag(bot, real, Some(real)), "S<:Real against a ground Real");
+        assert_eq!(gc::root_count(), 0, "roots released");
+    }
+
+    #[test]
+    fn subtype_env_matches_pinned_julia() {
+        // Engine slice 5: `jl_subtype_env`'s computed right-side variable
+        // values. Expected bindings verified against the pinned Julia binary
+        // via `ccall(:jl_subtype_env, ...)` (recorded — not test/subtype.jl
+        // verbatim). Box stands in for the parametric constructor.
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+        let (int, float64, real, any, bot) = (
+            t(types::id::INT64),
+            t(types::id::FLOAT64),
+            t(types::id::REAL),
+            t(types::id::ANY),
+            t(types::id::BOTTOM),
+        );
+        let tv = || types::make_typevar("T", bot, any);
+        let mut env: Vec<Offset> = Vec::new();
+        let mut senv = |a: Offset, b: Offset, env: &mut Vec<Offset>| -> bool {
+            subtype::subtype_env(a, b, env)
+        };
+
+        // Tuple{Int,Int} <: Tuple{T,T} where T  ->  [Int64]
+        let v = tv();
+        assert!(senv(types::tuple_type(&[int, int]), types::unionall_type(v, types::tuple_type(&[v, v])), &mut env));
+        assert_eq!(env.as_slice(), &[int]);
+
+        // Tuple{Int,Float64} <: Tuple{T,S} where {T,S}  ->  [Int64, Float64]
+        let vt = tv();
+        let vs = tv();
+        let b = types::unionall_type(vt, types::unionall_type(vs, types::tuple_type(&[vt, vs])));
+        assert!(senv(types::tuple_type(&[int, float64]), b, &mut env));
+        assert_eq!(env.as_slice(), &[int, float64]);
+
+        // Box{Int} <: Box{T} where T  ->  [Int64]  (invariant pin)
+        let v = tv();
+        assert!(senv(types::box_type(int), types::unionall_type(v, types::box_type(v)), &mut env));
+        assert_eq!(env.as_slice(), &[int]);
+
+        // Tuple{Int} <: Tuple{Union{T,Float64}} where T  ->  [Int64]
+        let v = tv();
+        let b = types::unionall_type(v, types::tuple_type(&[types::union_of(&[v, float64])]));
+        assert!(senv(types::tuple_type(&[int]), b, &mut env));
+        assert_eq!(env.as_slice(), &[int]);
+
+        // Tuple{} / Tuple{Int,Int} <: Tuple{Vararg{Int,N}} where N  ->  [0] / [2]
+        for (lhs, n) in [(types::tuple_type(&[]), 0i64), (types::tuple_type(&[int, int]), 2)] {
+            let vn = types::make_typevar("N", bot, any);
+            let b = types::unionall_type(vn, types::tuple_type(&[types::vararg_type_with(int, vn)]));
+            assert!(senv(lhs, b, &mut env));
+            assert_eq!(env.len(), 1);
+            assert!(types::is_boxed_long(env[0]));
+            assert_eq!(crate::value::unbox_int(Value(env[0])), n);
+        }
+
+        // Tuple{Int,Int} <: Tuple{Vararg{T,N}} where {T,N}  ->  [Int64, 2]
+        let vt = tv();
+        let vn = types::make_typevar("N", bot, any);
+        let b = types::unionall_type(
+            vt,
+            types::unionall_type(vn, types::tuple_type(&[types::vararg_type_with(vt, vn)])),
+        );
+        assert!(senv(types::tuple_type(&[int, int]), b, &mut env));
+        assert_eq!(env.len(), 2);
+        assert_eq!(env[0], int);
+        assert!(types::is_boxed_long(env[1]));
+        assert_eq!(crate::value::unbox_int(Value(env[1])), 2);
+
+        // Tuple{} <: Tuple{Vararg{T}} where T  ->  [svec(T, false)]
+        let v = tv();
+        let b = types::unionall_type(v, types::tuple_type(&[types::vararg_type(v)]));
+        assert!(senv(types::tuple_type(&[]), b, &mut env));
+        assert_eq!(env.len(), 1);
+        assert!(types::is_svec_value(Value(env[0])));
+        assert_eq!(types::svec_len(env[0]), 2);
+        assert_eq!(types::svec_ref(env[0], 0), v, "the declared variable, unpinned");
+        assert_eq!(types::svec_ref(env[0], 1), types::builtins().false_instance);
+
+        // Rejections leave the env empty, as jl_subtype_matching leaves *penv.
+        let v = tv();
+        let b = types::unionall_type(v, types::tuple_type(&[v, v]));
+        assert!(!senv(types::tuple_type(&[int, float64]), b, &mut env));
+        assert!(env.is_empty());
+        let v = tv();
+        let b = types::unionall_type(v, types::tuple_type(&[types::union_of(&[v, float64]), v]));
+        assert!(!senv(types::tuple_type(&[int, real]), b, &mut env));
+        assert!(env.is_empty());
+
+        assert_eq!(gc::root_count(), 0, "roots released after env queries");
     }
 
     #[test]

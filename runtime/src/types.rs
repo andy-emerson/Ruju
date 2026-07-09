@@ -100,7 +100,8 @@ pub mod id {
     pub const BOUNDSERROR: u32 = 39; // struct BoundsError <: Exception (a, i)
     pub const ERROREXCEPTION: u32 = 40; // struct ErrorException <: Exception (msg)
     pub const FUNCTION: u32 = 41; // abstract Function (jltypes.c:3503)
-    pub const COUNT: usize = 42;
+    pub const INTERSECT: u32 = 42; // internal `Intersect{a,b}` meet node (#61917)
+    pub const COUNT: usize = 43;
 }
 
 /// Offsets of the bootstrapped core types and the immortal value permboxes.
@@ -310,10 +311,15 @@ pub fn bootstrap() {
     types[id::TVAR as usize] = new_type(datatype, tn("TypeVar"), any, 12, 0, &[0, 4, 8]);
     types[id::UNIONALL as usize] = new_type(datatype, tn("UnionAll"), any, 8, 0, &[0, 4]);
     // `Vararg` (jl_vararg_t) is the type of a `Vararg{T}` object — the covariant
-    // tail of a tuple type: element T@0, count N@4 (a boxed Int64, or NULL for
-    // the unbounded form). A typevar-valued N (the C's JL_VARARG_BOUND kind)
-    // is not yet modelled.
+    // tail of a tuple type: element T@0, count N@4 (a boxed Int64, a typevar —
+    // the C's JL_VARARG_BOUND kind — or NULL for the unbounded form).
     types[id::VARARG as usize] = new_type(datatype, tn("Vararg"), any, 8, 0, &[0, 4]);
+    // The internal-use-only `Intersect{a,b}` meet node, dual to Union
+    // (#61917; `julia.h:595–604`, created at `jltypes.c:3348–3354` with
+    // `mayinlinealloc = 0` and recognized by identity). It lives transiently
+    // inside the subtyping algorithm as an existential upper bound and never
+    // escapes into user-visible types.
+    types[id::INTERSECT as usize] = new_type(datatype, tn("Intersect"), any, 8, 0, &[0, 4]);
     // `Module` (jl_module_t subset): name Symbol, parent Module, bindings
     // Array — all references, so ordinary layout-driven GC tracing suffices.
     types[id::MODULE as usize] = new_type(datatype, tn("Module"), any, 12, 0, &[0, 4, 8]);
@@ -591,19 +597,25 @@ pub fn apply_type(typename: Offset, super_: Offset, params: &[Offset]) -> Offset
 }
 
 /// Construct the tuple type `Tuple{elems...}` (covariant), uniqued. A trailing
-/// `Vararg{T,N}` with a concrete `N` expands into `N` copies of `T`
-/// (`inst_datatype_inner`; hence `Tuple{Int,Vararg{Int,2}} === Tuple{Int,Int,Int}`,
-/// `test/subtype.jl:63-67`); unbounded varargs stay as the tuple's tail.
+/// `Vararg{T,N}` with a concrete `N` over a ground `T` expands into `N` copies
+/// of `T` (`inst_datatype_inner`, `jltypes.c:2358–2361`; hence
+/// `Tuple{Int,Vararg{Int,2}} === Tuple{Int,Int,Int}`, `test/subtype.jl:63-67`).
+/// The C's guard is ported exactly (heals audit finding 23): expansion happens
+/// only when `n == 0 || !jl_has_free_typevars(T)`, so `Tuple{Vararg{T,2}}`
+/// with a free `T` — and every typevar-`N` vararg — stays a `Vararg` for the
+/// engine's length algebra. Unbounded varargs stay as the tuple's tail.
 pub fn tuple_type(elems: &[Offset]) -> Offset {
     let b = builtins();
     if let Some(&last) = elems.last() {
-        if is_vararg(last) && vararg_num(last) != NULL {
+        if is_vararg(last) && is_boxed_long(vararg_num(last)) {
             let n = crate::value::unbox_int(object::Value(vararg_num(last)));
             assert!(n >= 0, "Vararg length must be non-negative");
             let elem = vararg_elem(last);
-            let mut expanded = elems[..elems.len() - 1].to_vec();
-            expanded.extend(core::iter::repeat(elem).take(n as usize));
-            return apply_type(b.tuple_typename, b.types[id::ANY as usize], &expanded);
+            if n == 0 || !crate::subtype::has_free_typevars(elem) {
+                let mut expanded = elems[..elems.len() - 1].to_vec();
+                expanded.extend(core::iter::repeat(elem).take(n as usize));
+                return apply_type(b.tuple_typename, b.types[id::ANY as usize], &expanded);
+            }
         }
     }
     apply_type(b.tuple_typename, b.types[id::ANY as usize], elems)
@@ -741,10 +753,13 @@ fn inst_type(t: Offset, env: Option<&SubstEnv>) -> Offset {
     if is_vararg(t) {
         let oe = vararg_elem(t);
         let ne = inst_type(oe, env);
-        if ne == oe {
+        let _rne = Rooted::new(object::Value(ne));
+        let on = vararg_num(t);
+        let nn = if on == NULL { NULL } else { inst_type(on, env) };
+        if ne == oe && nn == on {
             return t;
         }
-        return vararg_type(ne);
+        return vararg_type_with(ne, nn);
     }
     if is_datatype(t) {
         let p = parameters_of(t);
@@ -766,7 +781,14 @@ fn inst_type(t: Offset, env: Option<&SubstEnv>) -> Offset {
             }
         }
         let result = if changed {
-            apply_type(name_of(t), supertype(t), &params)
+            // Tuples re-enter through `tuple_type`, so a vararg whose `N`
+            // substitution turned ground re-expands (as `inst_datatype_inner`
+            // would) and uniquing stays consistent with direct construction.
+            if is_tuple(t) {
+                tuple_type(&params)
+            } else {
+                apply_type(name_of(t), supertype(t), &params)
+            }
         } else {
             t
         };
@@ -1070,17 +1092,60 @@ pub fn vararg_type(elem: Offset) -> Offset {
 
 /// Allocate `Vararg{elem, n}` with a concrete integer count (`jl_wrap_vararg`
 /// with a boxed `Long` N — the C's `JL_VARARG_INT` kind). A trailing fixed-N
-/// vararg never survives into a tuple type: [`tuple_type`] expands it, exactly
-/// as `inst_datatype_inner` does, which is why
-/// `Tuple{Int,Vararg{Int,2}} === Tuple{Int,Int,Int}` (`test/subtype.jl:63-67`).
+/// vararg over a **ground** element never survives into a tuple type:
+/// [`tuple_type`] expands it, exactly as `inst_datatype_inner` does, which is
+/// why `Tuple{Int,Vararg{Int,2}} === Tuple{Int,Int,Int}` (`test/subtype.jl:63-67`).
 pub fn vararg_type_n(elem: Offset, n: i64) -> Offset {
     let _r = Rooted::new(object::Value(elem));
     let boxed = crate::value::box_int(n).raw();
     let _rn = Rooted::new(object::Value(boxed));
+    vararg_type_with(elem, boxed)
+}
+
+/// Allocate `Vararg{elem, num}` with `num` an arbitrary count value: a boxed
+/// `Int64` (`JL_VARARG_INT`), a typevar (`JL_VARARG_BOUND` — engine slice 3's
+/// length algebra owns its `N`), or `NULL` (unbounded).
+pub fn vararg_type_with(elem: Offset, num: Offset) -> Offset {
+    let _r = Rooted::new(object::Value(elem));
+    let _rn = Rooted::new(object::Value(num));
     let v = object::alloc(builtin(id::VARARG), 8).raw();
     write_ref(v, 0, elem);
-    write_ref(v, 4, boxed);
+    write_ref(v, 4, num);
     v
+}
+
+/// Whether `v` is a boxed `Int64` **value** (`jl_is_long`). Boxed longs appear
+/// as type parameters in the vararg length algebra (a ground `Vararg{T,3}`'s
+/// `N`, and the boxed lengths the engine equates).
+pub fn is_boxed_long(v: Offset) -> bool {
+    v != NULL && object::type_of(object::Value(v)) == builtin(id::INT64)
+}
+
+/// Allocate an internal `Intersect{a, b}` meet node (#61917): `a ∩ b` as a
+/// transient value the subtype engine keeps exact where no single existing
+/// type is the greatest lower bound. Never uniqued, never user-visible; only
+/// ever the top layer of an existential upper bound.
+pub fn intersect_type(a: Offset, b: Offset) -> Offset {
+    let _ra = Rooted::new(object::Value(a));
+    let _rb = Rooted::new(object::Value(b));
+    let v = object::alloc(builtin(id::INTERSECT), 8).raw();
+    write_ref(v, 0, a);
+    write_ref(v, 4, b);
+    v
+}
+
+/// Whether `t` is an `Intersect` meet node (`jl_is_intersecttype`).
+pub fn is_intersect(t: Offset) -> bool {
+    t != NULL && object::type_of(object::Value(t)) == builtin(id::INTERSECT)
+}
+
+/// The left/right operands of an `Intersect{a, b}`.
+pub fn intersect_a(t: Offset) -> Offset {
+    read_ref(t, 0)
+}
+
+pub fn intersect_b(t: Offset) -> Offset {
+    read_ref(t, 4)
 }
 
 /// The count `N` of a `Vararg{T,N}` as a boxed value, or `NULL` when unbounded

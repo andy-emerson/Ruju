@@ -25,10 +25,23 @@
 //! recursion; the machine hoists the enumeration above the query, so each
 //! left arm gets a fresh right-side search and fresh existential bindings.
 //!
+//! Engine slice 3 (2026-07) added the vararg **length algebra**: the
+//! `Loffset` channel (`X = Y + Loffset` between two vararg lengths), the
+//! `INT`/`BOUND` vararg kinds in the tuple length classification,
+//! `check_vararg_length`'s N-discharge, and `subtype_tuple_varargs`' length
+//! equation — so `Tuple{Vararg{T,N}}` with a typevar `N` (`NTuple`) works.
+//!
+//! Slice 4 (2026-07) added the **`Intersect` meet node** (#61917 — exact
+//! existential upper bounds) and the `concrete` cross-variable propagation;
+//! slice 5 added **`envout`** ([`subtype_env`], the `jl_subtype_env` shape):
+//! the computed values of right-side `where` variables, filled at
+//! `subtype_unionall` exit and AND-merged across ∀ arms — what
+//! `jl_type_intersection` and method matching consume.
+//!
 //! Deliberately omitted for now (tracked in `design/implementation.md`):
-//! type intersection, the `Intersect`/`Loffset` machinery, and the
-//! freeze/`limit_slow` explosion guards of `local_forall_exists_subtype`
-//! (slice 2 — ours is the unlimited, correct-but-slower form).
+//! type intersection itself, the `innervars`/`tainted_inner` bounds-leak
+//! bookkeeping (folded into the `has_universal_typevar` guard), and the
+//! repeated-element/separable tuple fast paths (pure optimizations).
 //!
 //! GC rooting (the C's discipline, engine slice 1 first commit): the entry
 //! roots the query types (the C leaves this to callers; our host boundary
@@ -84,6 +97,20 @@ struct VarBinding {
     /// (`depth0`). Distinguishes `∀A ∃B` from `∃B ∀A` when an existential and a
     /// universal variable interact.
     depth0: i32,
+    /// The variable must be integer-valued — it occurs as `N` in `Vararg{_,N}`
+    /// (`intvalued`, `subtype.c:94`; set by `subtype_tuple_varargs`).
+    intvalued: bool,
+    /// Another variable's diagonal constraint forces this one concrete
+    /// (`concrete`, `subtype.c:85`; set through the binding of a diagonal
+    /// variable's typevar lower bound, `:1411–1415`, and consumed at this
+    /// binding's own pop). Like `intvalued`, not part of the C's saved-env
+    /// record — restores preserve it.
+    concrete: bool,
+    /// Maximum positive vararg-length offset seen (`max_offset`,
+    /// `subtype.c:86–87`); `-1` once the variable occurs outside a vararg-`N`
+    /// slot. Bookkeeping the pin's intersection consumes; carried in the env
+    /// snapshot (the C's saved-env slot 4) and kept faithful here.
+    max_offset: i8,
     /// Absolute shadow-stack index of this binding's rooted `{lb, ub}` mirror
     /// (a 2-slot [`Frame`] owned by `subtype_unionall`). Narrowing writes
     /// through it, so the current bounds are always GC roots.
@@ -170,6 +197,22 @@ struct Env {
     lunions: UnionState,
     /// Decisions for unions on the right of `<:` (`Runions`).
     runions: UnionState,
+    /// The vararg length-offset channel (`jl_stenv_t.Loffset`,
+    /// `subtype.c:138–140`): while comparing two vararg length expressions,
+    /// the left length equals the right length **plus** `loffset`
+    /// (`X = Y + Loffset`). Nonzero only inside `subtype_tuple_varargs`'
+    /// N-equation; `flip_offset` negates it for the reverse direction.
+    loffset: i32,
+    /// The computed values of right-side variables handed back to the caller
+    /// (`envout`/`envsz`/`envidx`, `subtype.c:125–133`) — what
+    /// `jl_type_intersection` and method matching consume. Empty for plain
+    /// subtype queries. Entries (0 = unassigned) are mirrored into a rooted
+    /// frame (the C's "N.B.: envout is gc-rooted").
+    envout: Vec<Offset>,
+    env_roots: Option<Frame>,
+    /// The env slot the innermost right-side `UnionAll` fills (`envidx`);
+    /// incremented around each existential body descent.
+    envidx: usize,
 }
 
 impl Env {
@@ -179,6 +222,18 @@ impl Env {
             invdepth: 0,
             lunions: UnionState::default(),
             runions: UnionState::default(),
+            loffset: 0,
+            envout: Vec::new(),
+            env_roots: None,
+            envidx: 0,
+        }
+    }
+
+    /// Write an envout slot, keeping its rooted mirror current.
+    fn set_envout(&mut self, i: usize, v: Offset) {
+        self.envout[i] = v;
+        if let Some(f) = &self.env_roots {
+            f.set(i, Value(v));
         }
     }
 
@@ -297,15 +352,26 @@ fn re_save_vars(e: &Env, saved: &mut SavedVars) {
 
 /// Restore the environment to a snapshot taken at the same binding depth
 /// (`restore_env`), re-syncing each binding's live bounds mirror and the
-/// right-union bit cursor.
+/// right-union bit cursor. `concrete` and `intvalued` are *not* part of the
+/// C's saved record (`jl_savedenv_t` carries bounds + the four counters,
+/// `subtype.c:319–320`) — they persist through restores, so the live values
+/// are kept.
 fn restore_vars(e: &mut Env, saved: &SavedVars) {
-    e.vars.clear();
-    e.vars.extend_from_slice(&saved.vars);
-    for b in &e.vars {
+    debug_assert_eq!(e.vars.len(), saved.vars.len());
+    for (b, s) in e.vars.iter_mut().zip(saved.vars.iter()) {
+        let (concrete, intvalued) = (b.concrete, b.intvalued);
+        *b = *s;
+        b.concrete = concrete;
+        b.intvalued = intvalued;
         gc::set_slot(b.root_base, Value(b.lb));
         gc::set_slot(b.root_base + 1, Value(b.ub));
     }
     e.runions.depth = saved.rdepth;
+    // Clear envout entries the rolled-back search had assigned
+    // (`restore_env`, `subtype.c:477–478`).
+    for i in e.envidx..e.envout.len() {
+        e.set_envout(i, NULL);
+    }
 }
 
 /// Entry point: decide `a <: b` (`jl_subtype_env` → `forall_exists_subtype`).
@@ -318,6 +384,77 @@ pub fn subtype(a: Offset, b: Offset) -> bool {
     let _rb = Rooted::new(Value(b));
     let mut e = Env::new();
     forall_exists_subtype(a, b, &mut e, Param::None)
+}
+
+/// `jl_subtype_env_size`: the number of outer `UnionAll`s on `t` — the env
+/// slots a matching query against `t` yields.
+pub fn subtype_env_size(mut t: Offset) -> usize {
+    let mut n = 0;
+    while types::is_unionall(t) {
+        n += 1;
+        t = types::unionall_body(t);
+    }
+    n
+}
+
+/// `jl_subtype_env` (engine slice 5): decide `a <: b`, computing the value
+/// of each of `b`'s outer `where` variables into `env` — the query
+/// `jl_type_intersection` and method matching (`jl_subtype_matching`)
+/// consume. On success `env` holds one entry per outer variable, outermost
+/// first: a type or boxed value when the search pinned the variable, or the
+/// C's `svec(tvar, constrained::Bool)` wrapper when it stayed indefinite
+/// (`wrap_tvar_env`, `subtype.c:1224–1227`). `env` is left empty on failure,
+/// as `jl_subtype_matching` leaves `*penv` untouched.
+pub fn subtype_env(a: Offset, b: Offset, env: &mut Vec<Offset>) -> bool {
+    let _ra = Rooted::new(Value(a));
+    let _rb = Rooted::new(Value(b));
+    env.clear();
+    let sz = subtype_env_size(b);
+    let mut e = Env::new();
+    e.envout = vec![NULL; sz];
+    e.env_roots = Some(Frame::new(sz));
+    let ans = forall_exists_subtype(a, b, &mut e, Param::None);
+    if ans {
+        env.extend_from_slice(&e.envout);
+    }
+    ans
+}
+
+// The host-facing stash for `rj_subtype_env` results: JS reads entries back
+// by index, so they must stay rooted between the query and the reads (the
+// collector visits them via [`each_env_stash`]).
+struct EnvStash(core::cell::UnsafeCell<Vec<Offset>>);
+// Sound only because the runtime is single-threaded under wasm32 for now.
+unsafe impl Sync for EnvStash {}
+static ENV_STASH: EnvStash = EnvStash(core::cell::UnsafeCell::new(Vec::new()));
+
+fn env_stash() -> &'static mut Vec<Offset> {
+    unsafe { &mut *ENV_STASH.0.get() }
+}
+
+/// Env-matching query for the host: run [`subtype_env`] and stash the result
+/// runtime-side for `rj_env_size`/`rj_env_get` readback.
+pub fn subtype_env_stashed(a: Offset, b: Offset) -> bool {
+    let stash = env_stash();
+    stash.clear();
+    subtype_env(a, b, stash)
+}
+
+pub fn env_stash_len() -> usize {
+    env_stash().len()
+}
+
+pub fn env_stash_get(i: usize) -> Offset {
+    env_stash().get(i).copied().unwrap_or(NULL)
+}
+
+/// Visit the stashed env entries; the collector roots them.
+pub fn each_env_stash(mut f: impl FnMut(Value)) {
+    for &v in env_stash().iter() {
+        if v != NULL {
+            f(Value(v));
+        }
+    }
 }
 
 /// The ∀ driver (`forall_exists_subtype`, `subtype.c:2383–2404`): enumerate
@@ -358,8 +495,17 @@ fn exists_subtype(x: Offset, y: Offset, e: &mut Env, se: &SavedVars, param: Para
             return true;
         }
         let more = e.next_union_state(true);
-        restore_vars(e, se);
-        if !more {
+        if more {
+            // Preserve already-assigned envout slots across a right-flip
+            // (`subtype.c:2369–2375`): `subtype_unionall` needs previously
+            // assigned env values, and cross-arm disagreement is reconciled
+            // by the fill's AND-merge.
+            let oldidx = e.envidx;
+            e.envidx = e.envout.len();
+            restore_vars(e, se);
+            e.envidx = oldidx;
+        } else {
+            restore_vars(e, se);
             return false;
         }
     }
@@ -367,8 +513,11 @@ fn exists_subtype(x: Offset, y: Offset, e: &mut Env, se: &SavedVars, param: Para
 
 /// The main algorithm (`subtype` in `subtype.c:1903`).
 fn sub(mut x: Offset, mut y: Offset, e: &mut Env, param: Param) -> bool {
-    if x == y {
-        return true; // reflexive / uniqued-identical fast path
+    if x == y && e.loffset == 0 {
+        // Reflexive / uniqued-identical fast path — except under a nonzero
+        // length offset, where the same typevar `N` on both sides must still
+        // discharge `N = N + Loffset` through the variable machinery.
+        return true;
     }
 
     // Union on the left (`subtype.c:1905–1932`): pick ONE arm per the current
@@ -422,14 +571,32 @@ fn sub(mut x: Offset, mut y: Offset, e: &mut Env, param: Param) -> bool {
         }
     }
 
+    // An internal `Intersect` meet node is only ever produced as an
+    // existential upper bound, so it can appear on the right (`x <: a ∩ b`)
+    // but never on the left (`subtype.c:1948–1961`).
+    debug_assert!(!types::is_intersect(x), "Intersect can only appear on the right");
+    if types::is_intersect(y) {
+        // `x <: a ∩ b`  iff  `x <: a` and `x <: b` (dual to Union-left).
+        return sub(x, types::intersect_a(y), e, param)
+            && sub(x, types::intersect_b(y), e, param);
+    }
+
     // Type variables, handled before the ground cases (as in subtype.c).
     if types::is_typevar(x) {
         if types::is_typevar(y) {
             return subtype_two_vars(x, y, e, param);
         }
         if types::is_unionall(y) {
-            // x is a variable, y a `where`: introduce y's variable (∃) first.
-            return subtype_unionall(x, y, e, true, param);
+            // Unwrap `y::UnionAll` eagerly only for a ∀-var `x` whose bound
+            // is not `y` itself (`subtype.c:2036–2048`): an ∃-var must go
+            // through `subtype_var` so the UnionAll lands in its narrowed
+            // upper bound instead of being opened against the variable.
+            let xb = e.lookup(x);
+            let unwrap = xb.map_or(true, |i| !e.vars[i].existential);
+            let xub = xb.map_or(x, |i| e.vars[i].ub);
+            if unwrap && xub != y {
+                return subtype_unionall(x, y, e, true, param);
+            }
         }
         return subtype_var(x, y, e, false, param);
     }
@@ -492,6 +659,17 @@ fn sub(mut x: Offset, mut y: Offset, e: &mut Env, param: Param) -> bool {
         return false;
     }
 
+    // Non-type leaves: boxed values as type parameters (the vararg length
+    // algebra's boxed longs). The C's tail (`subtype.c:2151–2153`): equal
+    // longs modulo the length offset; anything else compares by egal —
+    // for us, distinct kinds are simply unequal.
+    if types::is_boxed_long(x) || types::is_boxed_long(y) {
+        return types::is_boxed_long(x)
+            && types::is_boxed_long(y)
+            && crate::value::unbox_int(crate::object::Value(x))
+                == crate::value::unbox_int(crate::object::Value(y)) + e.loffset as i64;
+    }
+
     datatype_subtype(x, y, e, param)
 }
 
@@ -520,37 +698,237 @@ fn subtype_unionall(t: Offset, u: Offset, e: &mut Env, r: bool, param: Param) ->
         occurs_inv: 0,
         body_occurs_inv: var_occurs_invariant(body, var, false),
         depth0: e.invdepth,
+        intvalued: false,
+        concrete: false,
+        max_offset: 0,
         root_base: mirror.slot_index(0),
     });
     let mut ans = if r {
-        sub(t, body, e, param)
+        // Descending into an existential body claims the next env slot
+        // (`e->envidx++` around the body, `subtype.c:1388–1391`).
+        e.envidx += 1;
+        let ans = sub(t, body, e, param);
+        e.envidx -= 1;
+        // Widen `Type{x}` to `typeof(x)` in argument position
+        // (`:1394–1396`) — occurs_inv's first consumer.
+        if e.vars[idx].occurs_inv == 0 {
+            let w = widen_type_if_concrete(e.vars[idx].lb);
+            e.set_lb(idx, w);
+        }
+        ans
     } else {
         sub(body, t, e, param)
     };
 
-    // The diagonal rule: a variable occurring more than once and only in
-    // covariant position (never invariantly in the body) is constrained to
-    // concrete types, so its inferred lower bound must be a leaf type. E.g.
-    // `Tuple{Int,Int} <: Tuple{T,T} where T` but not `Tuple{Int,Float64} <: ...`.
+    // The diagonal rule (`subtype.c:1400–1420`): a variable occurring more
+    // than once and only in covariant position (never invariantly in the
+    // body) is constrained to concrete types, so its inferred lower bound
+    // must be a leaf type. E.g. `Tuple{Int,Int} <: Tuple{T,T} where T` but
+    // not `Tuple{Int,Float64} <: ...`. A variable another variable's
+    // diagonal constraint marked `concrete` faces the same bar at its own
+    // pop, even without being diagonal itself.
     let vb = e.vars[idx];
     let cov = vb.occurs_cov.max(vb.cov_diag); // cov_count
     let diagonal = cov > 1 && !vb.body_occurs_inv;
-    // A typevar lower bound does not reject: each value of the referenced
-    // (universal) variable is a single type, so the diagonal is satisfied.
-    // Julia additionally propagates `concrete = 1` to that variable's binding —
-    // the cross-var propagation `design/implementation.md` records as missing.
-    if ans && diagonal && is_leaf_typevar(var) && !types::is_typevar(vb.lb) && !is_leaf_bound(vb.lb) {
-        ans = false;
+    if ans && (vb.concrete || (diagonal && is_leaf_typevar(var))) {
+        if vb.concrete && !diagonal && !is_leaf_bound(vb.ub) {
+            // A non-diagonal var can only be a subtype of a diagonal var if
+            // its upper bound is concrete (`:1406–1410`).
+            ans = false;
+        } else if types::is_typevar(vb.lb) {
+            // A typevar lower bound does not reject — each value of the
+            // referenced (universal) variable is a single type — but the
+            // concreteness constraint propagates to that variable's binding
+            // (`:1411–1415`; closes the tail of audit finding 15).
+            if let Some(j) = e.lookup(vb.lb) {
+                e.vars[j].concrete = true;
+            }
+        } else if !is_leaf_bound(vb.lb) {
+            ans = false;
+        }
     }
 
+    // An internal `Intersect` meet node is exact for subtyping but must not
+    // appear in a result type (`subtype.c:1428–1433`); it only ever occurs
+    // as the top layer of an existential `ub`. The envout fill below is its
+    // consumer; the write-through keeps the widened value rooted.
+    if ans && types::is_intersect(e.vars[idx].ub) {
+        let widened = widen_intersect(e.vars[idx].ub);
+        e.set_ub(idx, widened);
+    }
+
+    // Resolved to a single value: use it directly (`subtype.c:1434–1437`).
+    let mut new_tvar = NULL;
+    if ans && e.vars[idx].lb == e.vars[idx].ub {
+        new_tvar = e.vars[idx].lb;
+    }
+
+    // Fill this variable's envout slot (`subtype.c:1489–1560`) when a
+    // matching query wants it. The C fills from its stack-allocated binding
+    // after unlinking it; we snapshot, pop, then fill — the
+    // `has_universal_typevar` consultation must see only the *outer*
+    // environment. The snapshot's bounds stay rooted through `mirror`.
+    let vbf = e.vars[idx];
     e.vars.pop();
+    if r && ans && e.envidx < e.envout.len() {
+        fill_envout(e, &vbf, var, t, new_tvar);
+    }
     ans
+}
+
+/// The envout value-selection cascade (`subtype.c:1489–1560`) plus the
+/// AND-merge across ∀ arms: assign the popped binding's computed value into
+/// the slot the enclosing query reserved. The `tainted_inner` arm is folded
+/// into the `has_universal_typevar` guard (innervars are absent — recorded);
+/// concreteness evidence for the pin-the-least-solution arm is
+/// `is_leaf_bound` (our recorded stand-in for `jl_is_concrete_type`, with
+/// dispatchtuples omitted).
+fn fill_envout(e: &mut Env, vbf: &VarBinding, var: Offset, t: Offset, new_tvar_in: Offset) {
+    let bottom = types::builtin(id::BOTTOM);
+    let any = types::builtin(id::ANY);
+    let declared_lb = types::tvar_lb(var);
+    let declared_ub = types::tvar_ub(var);
+    let mut new_tvar = new_tvar_in;
+    let eff_constrained = vbf.occurs_inv != 0 || (vbf.occurs_cov != 0 && declared_lb == bottom);
+    let val: Offset;
+    if vbf.intvalued && vbf.lb == any {
+        // The "N::Int, unconstrained" token — `jl_wrap_vararg(NULL,NULL,0,0)`.
+        val = types::vararg_type_with(NULL, NULL);
+    } else if vbf.occurs_inv == 0 && vbf.lb != bottom {
+        if is_leaf_bound(vbf.lb) {
+            val = vbf.lb;
+        } else if eff_constrained
+            && !has_free_typevars(t)
+            && !has_free_typevars(vbf.lb)
+            && is_leaf_bound(t)
+        {
+            // A concrete LHS pins the least solution.
+            val = vbf.lb;
+        } else if types::is_typevar(vbf.lb) {
+            // Introducing `T_new <: T` here would be redundant for bounds
+            // purposes and can blow up intersection — keep the var.
+            val = wrap_tvar_env(vbf.lb, eff_constrained);
+        } else {
+            let nv = types::make_typevar(
+                crate::symbol::as_str(types::tvar_name(var)),
+                bottom,
+                vbf.lb,
+            );
+            let _rnv = Rooted::new(Value(nv));
+            val = wrap_tvar_env(nv, eff_constrained);
+        }
+    } else if vbf.lb == vbf.ub || vbf.lb != bottom {
+        // The least solution, which is what method parameters expect —
+        // wrapped when exposing it directly would leak an in-scope
+        // universal variable (`:1525–1531`).
+        if has_universal_typevar(vbf.lb, e) {
+            val = wrap_tvar_env(vbf.lb, eff_constrained);
+        } else {
+            val = vbf.lb;
+        }
+    } else if vbf.lb == declared_lb && vbf.ub == declared_ub && new_tvar == NULL {
+        val = wrap_tvar_env(var, eff_constrained);
+    } else {
+        if new_tvar == NULL {
+            new_tvar = types::make_typevar(
+                crate::symbol::as_str(types::tvar_name(var)),
+                vbf.lb,
+                vbf.ub,
+            );
+        }
+        let _rnt = Rooted::new(Value(new_tvar));
+        val = wrap_tvar_env(new_tvar, eff_constrained);
+    }
+    // Assigning different values across LHS union branches makes the value
+    // unknown, with AND semantics on the constrained bit: the var is
+    // constrained only if *every* branch pinned it (`:1541–1559`).
+    let idx = e.envidx;
+    let old = e.envout[idx];
+    if old != NULL && !crate::builtins::egal(Value(old), Value(val)) {
+        let merged = wrap_tvar_env(var, wrapped_constrained(old) && wrapped_constrained(val));
+        e.set_envout(idx, merged);
+    } else {
+        e.set_envout(idx, val);
+    }
+}
+
+/// `wrap_tvar_env` (`subtype.c:1224–1227`): `svec(tvar, constrained)` — an
+/// env entry preserving TypeVar identity while carrying the "constrained by
+/// any concrete subtype" bit.
+fn wrap_tvar_env(tvar: Offset, constrained: bool) -> Offset {
+    let b = types::builtins();
+    types::svec_of(&[tvar, if constrained { b.true_instance } else { b.false_instance }])
+}
+
+/// The `constrained` bit of an envout entry: a `svec(tvar, Bool)` wrapper
+/// carries it explicitly; a direct value means that iteration pinned the
+/// variable (`subtype.c:1546–1553`).
+fn wrapped_constrained(v: Offset) -> bool {
+    if types::is_svec_value(Value(v)) && types::svec_len(v) == 2 {
+        return types::svec_ref(v, 1) == types::builtins().true_instance;
+    }
+    true
+}
+
+/// `has_universal_typevar` (`subtype.c:1346–1369`, minus the innervars
+/// walk): does `x` mention any in-scope ∀-bound variable? Guards envout
+/// entries against leaking sibling `where` variables.
+fn has_universal_typevar(x: Offset, e: &Env) -> bool {
+    has_free_var_where(x, &mut Vec::new(), &|v| {
+        e.lookup(v).map_or(false, |i| !e.vars[i].existential)
+    })
+}
+
+/// `widen_Type_if_concrete` (the pin phrases it on TypeEq; ours on
+/// `Type{T}`): `Type{x}` with a non-typevar `x` widens to `typeof(x)` in
+/// argument position; unions widen when both arms agree; a `UnionAll` whose
+/// widened body no longer mentions its variable sheds the wrapper.
+fn widen_type_if_concrete(t: Offset) -> Offset {
+    if types::is_type_type(t) {
+        let t0 = types::svec_ref(types::parameters_of(t), 0);
+        if !types::is_typevar(t0) {
+            return crate::object::type_of(Value(t0));
+        }
+    }
+    if types::is_union(t) {
+        let a = widen_type_if_concrete(types::union_a(t));
+        let b = widen_type_if_concrete(types::union_b(t));
+        if a == b {
+            return a;
+        }
+    }
+    if types::is_unionall(t) {
+        let body = widen_type_if_concrete(types::unionall_body(t));
+        if body != types::unionall_body(t) && !has_typevar(body, types::unionall_var(t)) {
+            return body;
+        }
+    }
+    t
+}
+
+/// `jl_has_typevar`: does `t` mention `var` as a free occurrence?
+fn has_typevar(t: Offset, var: Offset) -> bool {
+    has_free_var_where(t, &mut Vec::new(), &|v| v == var)
 }
 
 /// `subtype_var`: `b` is a type variable; relate it to the non-variable `a`.
 /// `r` follows Julia — `true` constrains `a <: b` (`var_gt`), `false`
 /// constrains `b <: a` (`var_lt`).
 fn subtype_var(b: Offset, a: Offset, e: &mut Env, r: bool, param: Param) -> bool {
+    // Constant folding under a length offset (`subtype.c:1122–1131`):
+    // `N (bound) vs 3` under `Loffset = k` becomes `N vs 3±k` at offset 0,
+    // so the boxed constraint the binding absorbs already carries the offset.
+    if e.loffset != 0 && types::is_boxed_long(a) {
+        let old = if r { -e.loffset } else { e.loffset };
+        let na = crate::value::box_int(
+            crate::value::unbox_int(crate::object::Value(a)) + old as i64,
+        );
+        let _rna = Rooted::new(na);
+        e.loffset = 0;
+        let ans = subtype_var(b, na.raw(), e, r, param);
+        e.loffset = if r { -old } else { old };
+        return ans;
+    }
     match e.lookup(b) {
         Some(idx) => {
             if r {
@@ -576,6 +954,12 @@ fn subtype_var(b: Offset, a: Offset, e: &mut Env, r: bool, param: Param) -> bool
 /// arm (slice 3). The union-egal arm uses [`obviously_egal`] — a sound subset
 /// of the C's `jl_egal`; misses fall through to the full algorithm.
 fn subtype_left_var(x: Offset, y: Offset, e: &mut Env, param: Param) -> bool {
+    // Boxed lengths compare through the offset channel *before* the identity
+    // fast path (`subtype.c:877–878` precedes `:879`).
+    if types::is_boxed_long(x) && types::is_boxed_long(y) {
+        return crate::value::unbox_int(crate::object::Value(x))
+            == crate::value::unbox_int(crate::object::Value(y)) + e.loffset as i64;
+    }
     if x == y && !types::is_unionall(y) {
         return true;
     }
@@ -623,6 +1007,16 @@ fn pop_forall_bound_scope(e: &mut Env, saved: &[i8]) {
 /// bound when it is existential.
 fn var_lt(a: Offset, e: &mut Env, idx: usize, param: Param) -> bool {
     record_occurrence(e, idx, param);
+    // Under a nonzero length offset only a typevar can absorb the relation
+    // (`subtype.c:1032–1035`); boxed longs were folded by `subtype_var`.
+    debug_assert!(!types::is_boxed_long(a) || e.loffset == 0);
+    if e.loffset != 0
+        && !types::is_typevar(a)
+        && a != types::builtin(id::BOTTOM)
+        && a != types::builtin(id::ANY)
+    {
+        return false;
+    }
     let bb = e.vars[idx];
     if !bb.existential {
         // ∀b . b <: a   ⟺   ub <: a (the variable's widest value). The
@@ -639,7 +1033,11 @@ fn var_lt(a: Offset, e: &mut Env, idx: usize, param: Param) -> bool {
     if !ccheck(bb.lb, a, e) {
         return false; // lower bound must already satisfy the constraint
     }
-    let m = simple_meet(e.vars[idx].ub, a);
+    // `simple_meet` in exact mode: when neither `ub` nor `a` subsumes the
+    // other, the bound becomes an `Intersect{ub, a}` node rather than
+    // over-approximating to one side, which would let `b` escape its
+    // declared range (`subtype.c:1059–1066`, #61917).
+    let m = simple_meet(e.vars[idx].ub, a, 1);
     e.set_ub(idx, m);
     true
 }
@@ -648,6 +1046,15 @@ fn var_lt(a: Offset, e: &mut Env, idx: usize, param: Param) -> bool {
 /// when it is existential.
 fn var_gt(a: Offset, e: &mut Env, idx: usize, param: Param) -> bool {
     record_occurrence(e, idx, param);
+    // Symmetric offset guard (`subtype.c:1083–1086`).
+    debug_assert!(!types::is_boxed_long(a) || e.loffset == 0);
+    if e.loffset != 0
+        && !types::is_typevar(a)
+        && a != types::builtin(id::BOTTOM)
+        && a != types::builtin(id::ANY)
+    {
+        return false;
+    }
     let bb = e.vars[idx];
     if !bb.existential {
         // ∀b . a <: b   ⟺   a <: lb (the variable's narrowest value), with
@@ -679,6 +1086,12 @@ fn var_gt(a: Offset, e: &mut Env, idx: usize, param: Param) -> bool {
 /// covariant occurrence. (The `Loffset` boxed-long arm waits for slice 3;
 /// the pin's `limit_slow = 1` explosion guard for slice 2.)
 fn ccheck(a: Offset, b: Offset, e: &mut Env) -> bool {
+    // As in `subtype_ccheck` (`subtype.c:848–849`), the boxed-long arm comes
+    // first: identical boxed lengths are *not* equal under a nonzero offset.
+    if types::is_boxed_long(a) && types::is_boxed_long(b) {
+        return crate::value::unbox_int(crate::object::Value(a))
+            == crate::value::unbox_int(crate::object::Value(b)) + e.loffset as i64;
+    }
     if a == b {
         return true;
     }
@@ -779,6 +1192,10 @@ fn record_occurrence(e: &mut Env, idx: usize, param: Param) {
     } else if vb.occurs_cov < 2 {
         vb.occurs_cov += 1;
     }
+    // Any counted occurrence poisons `max_offset` (`subtype.c:905–908`);
+    // `subtype_tuple_varargs` snapshots and recovers it around the length
+    // equation when the occurrence really was a vararg-`N` slot.
+    vb.max_offset = -1;
 }
 
 /// Whether `var`'s declared lower bound is a leaf (concrete) type
@@ -788,21 +1205,29 @@ fn is_leaf_typevar(var: Offset) -> bool {
     is_leaf_bound(types::tvar_lb(var))
 }
 
-/// Whether `v` is a concrete leaf type (`is_leaf_bound`): `Union{}`, or a
-/// non-abstract `DataType` all of whose parameters are themselves leaves.
-/// Unions, type variables, and `UnionAll`s are not leaves.
+/// Whether `v` is a concrete leaf (`is_leaf_bound`, `subtype.c:1138–1153`):
+/// `Union{}`, a non-abstract `DataType` all of whose parameters are leaves,
+/// or a non-type **value** (a boxed vararg length is a leaf — the C's
+/// `!jl_is_type(v) && !jl_is_typevar(v)` tail). Unions, type variables, and
+/// `UnionAll`s are not leaves.
 fn is_leaf_bound(v: Offset) -> bool {
     if v == types::builtin(id::BOTTOM) {
         return true;
     }
-    if !types::is_datatype(v) || types::is_abstract(v) {
-        return false;
+    if types::is_intersect(v) {
+        return false; // an internal meet node is never a concrete leaf (`:1142`)
     }
-    let p = types::parameters_of(v);
-    if p == NULL {
-        return true; // a concrete primitive/leaf with no parameters
+    if types::is_datatype(v) {
+        if types::is_abstract(v) {
+            return false;
+        }
+        let p = types::parameters_of(v);
+        if p == NULL {
+            return true; // a concrete primitive/leaf with no parameters
+        }
+        return (0..types::svec_len(p)).all(|i| is_leaf_bound(types::svec_ref(p, i)));
     }
-    (0..types::svec_len(p)).all(|i| is_leaf_bound(types::svec_ref(p, i)))
+    !types::is_union(v) && !types::is_unionall(v) && !types::is_typevar(v)
 }
 
 /// Static "occurs in invariant position" check (`var_occurs_invariant`): does
@@ -845,6 +1270,54 @@ fn var_occurs_invariant(v: Offset, var: Offset, inside: bool) -> bool {
     false
 }
 
+/// Unbox a boxed `Int64` type parameter (a vararg length).
+fn unbox_long(v: Offset) -> i64 {
+    crate::value::unbox_int(Value(v))
+}
+
+/// The C's `jl_vararg_kind_t`: how a tuple's last parameter binds its length.
+#[derive(Clone, Copy, PartialEq)]
+enum VarargKind {
+    /// Not a vararg.
+    None,
+    /// `Vararg{T}` — unbounded.
+    Unbound,
+    /// `Vararg{T,3}` — ground integer count.
+    Int,
+    /// `Vararg{T,N}` — typevar count; the length algebra owns `N`.
+    Bound,
+}
+
+fn vararg_kind(t: Offset) -> VarargKind {
+    if !types::is_vararg(t) {
+        return VarargKind::None;
+    }
+    let n = types::vararg_num(t);
+    if n == NULL {
+        VarargKind::Unbound
+    } else if types::is_boxed_long(n) {
+        VarargKind::Int
+    } else {
+        VarargKind::Bound
+    }
+}
+
+/// `check_vararg_length` (`subtype.c:1568–1583`): when a fixed-length tail
+/// meets `Vararg{T,N}`, discharge the equation `n == N` — the boxed length is
+/// equated with `N` invariantly (both directions, as the C does).
+fn check_vararg_length(v: Offset, n: i64, e: &mut Env) -> bool {
+    let num = types::vararg_num(v);
+    if num == NULL {
+        return true; // only check when N is present in the last parameter
+    }
+    let boxed = crate::value::box_int(n);
+    let _r = Rooted::new(boxed);
+    e.invdepth += 1;
+    let ans = sub(boxed.0, num, e, Param::Invariant) && sub(num, boxed.0, e, Param::None);
+    e.invdepth -= 1;
+    ans
+}
+
 /// Subtyping between two ground types: nominal walk to a common type
 /// constructor, then covariant tuple elements or invariant parameters.
 fn datatype_subtype(x: Offset, y: Offset, e: &mut Env, param: Param) -> bool {
@@ -862,7 +1335,11 @@ fn datatype_subtype(x: Offset, y: Offset, e: &mut Env, param: Param) -> bool {
         xd = s;
     }
     if types::is_tuple(xd) {
-        return tuple_subtype(xd, y, e);
+        // Tuples keep the caller's param (`subtype.c:1896–1897`: only
+        // `PARAM_NONE` promotes to covariant), so occurrence recording under
+        // invariant tuple equality stays faithful.
+        let p = if param == Param::None { Param::Covariant } else { param };
+        return tuple_subtype(xd, y, e, p);
     }
     // Same constructor: parameters are invariant, one level deeper.
     let px = types::parameters_of(xd);
@@ -882,16 +1359,15 @@ fn datatype_subtype(x: Offset, y: Offset, e: &mut Env, param: Param) -> bool {
         }
     }
     e.invdepth -= 1;
-    let _ = param;
     ans
 }
 
-/// Covariant tuple subtyping (`subtype_tuple`, `subtype.c:1837`): a length
-/// classification prefix, then the elementwise tail. Handles a trailing
-/// unbounded `Vararg` on either side; bounded `Vararg{T,N}` is not yet
-/// represented, so the `JL_VARARG_INT`/`JL_VARARG_BOUND` classifications and the
-/// length-equation branches are absent (a faithful partial).
-fn tuple_subtype(x: Offset, y: Offset, e: &mut Env) -> bool {
+/// Covariant tuple subtyping (`subtype_tuple`, `subtype.c:1839–1900`): the
+/// full length classification over all four vararg kinds — `NONE` (fixed),
+/// `UNBOUND` (`Vararg{T}`), `INT` (ground count, which survives construction
+/// only over an element with free typevars), and `BOUND` (typevar count,
+/// consulting the binding's pinned lower bound) — then the elementwise tail.
+fn tuple_subtype(x: Offset, y: Offset, e: &mut Env, param: Param) -> bool {
     let px = types::parameters_of(x);
     let py = types::parameters_of(y);
     let lx = if px == NULL { 0 } else { types::svec_len(px) };
@@ -899,49 +1375,83 @@ fn tuple_subtype(x: Offset, y: Offset, e: &mut Env) -> bool {
     if lx == 0 && ly == 0 {
         return true;
     }
-    // A trailing unbounded `Vararg` is Julia's `JL_VARARG_UNBOUND`; anything else
-    // last is `JL_VARARG_NONE`.
-    let vvx = lx > 0 && types::is_vararg(types::svec_ref(px, lx - 1));
-    let vvy = ly > 0 && types::is_vararg(types::svec_ref(py, ly - 1));
-    // Length classification (`subtype.c:1860-1894`, unbounded subset).
-    if vvx {
-        // Unbounded on the left includes `N == 0` (`subtype.c:1862-1867`).
-        if !vvy {
-            return false; // right side is fixed-length
-        }
-        if lx < ly {
-            return false; // both unbounded, but x's prefix is shorter
-        }
-    } else {
-        let nx = lx;
-        let ny = if vvy { ly - 1 } else { ly };
-        if !vvy {
-            if nx != ny {
-                return false; // both fixed: arities must match
-            }
-        } else if ny > nx {
-            return false; // x too short to cover y's fixed prefix
+    let mut vvx = VarargKind::None;
+    let mut vvy = VarargKind::None;
+    let mut xva = NULL;
+    let mut xbb: Option<usize> = None;
+    if lx > 0 {
+        xva = types::svec_ref(px, lx - 1);
+        vvx = vararg_kind(xva);
+        if vvx == VarargKind::Bound {
+            xbb = e.lookup(types::vararg_num(xva));
         }
     }
-    subtype_tuple_tail(px, py, lx, ly, e)
+    let yva = if ly > 0 { types::svec_ref(py, ly - 1) } else { NULL };
+    if ly > 0 {
+        vvy = vararg_kind(yva);
+    }
+    let xbb_long_lb = xbb.map_or(false, |i| types::is_boxed_long(e.vars[i].lb));
+    if vvx != VarargKind::None && vvx != VarargKind::Int && !xbb_long_lb {
+        // Left length is genuinely open (unbounded, or a bound var not yet
+        // pinned to an integer).
+        if vvx == VarargKind::Unbound || xbb.map_or(false, |i| !e.vars[i].existential) {
+            // Unbounded on the LHS (includes N == 0), bounded on the RHS.
+            if vvy == VarargKind::None || vvy == VarargKind::Int {
+                return false;
+            } else if lx < ly {
+                return false;
+            }
+        } else if vvy == VarargKind::None
+            && !check_vararg_length(xva, ly as i64 + 1 - lx as i64, e)
+        {
+            return false;
+        }
+    } else {
+        // Left length is known: count it out and compare.
+        let mut nx = lx as i64;
+        if vvx == VarargKind::Int {
+            nx += unbox_long(types::vararg_num(xva)) - 1;
+        } else if let Some(i) = xbb {
+            debug_assert!(types::is_boxed_long(e.vars[i].lb));
+            nx += unbox_long(e.vars[i].lb) - 1;
+        } else {
+            debug_assert!(vvx == VarargKind::None);
+        }
+        let mut ny = ly as i64;
+        if vvy == VarargKind::Int {
+            ny += unbox_long(types::vararg_num(yva)) - 1;
+        } else if vvy != VarargKind::None {
+            ny -= 1;
+        }
+        if vvy == VarargKind::None || vvy == VarargKind::Int {
+            if nx != ny {
+                return false;
+            }
+        } else if ny > nx {
+            return false;
+        }
+    }
+    subtype_tuple_tail(px, py, lx, ly, e, param)
 }
 
-/// The elementwise tail walk (`subtype_tuple_tail`, `subtype.c:1740`), for the
-/// unbounded-`Vararg` subset. `vx`/`vy` count how far into a trailing `Vararg`
-/// each side has advanced; once both are inside one, `subtype_tuple_varargs`
-/// finishes the comparison.
-fn subtype_tuple_tail(px: Offset, py: Offset, lx: u32, ly: u32, e: &mut Env) -> bool {
+/// The elementwise tail walk (`subtype_tuple_tail`, `subtype.c:1740–1837`).
+/// `vx`/`vy` count how far into a trailing `Vararg` each side has advanced;
+/// once both are inside one, [`subtype_tuple_varargs`] finishes the
+/// comparison (with the counts, which its length equation consumes). A
+/// fixed-length walk ending against a still-pending `Vararg{T,N}` discharges
+/// `(lx+1-ly) == N` through [`check_vararg_length`] (`:1828–1832`).
+fn subtype_tuple_tail(px: Offset, py: Offset, lx: u32, ly: u32, e: &mut Env, param: Param) -> bool {
     let (mut i, mut j) = (0u32, 0u32);
     let (mut vx, mut vy) = (0u32, 0u32);
+    let mut xi = NULL;
+    let mut yi = NULL;
     loop {
-        let mut xi = NULL;
         if i < lx {
             xi = types::svec_ref(px, i);
             if i == lx - 1 && (vx > 0 || types::is_vararg(xi)) {
                 vx += 1;
             }
         }
-        let mut yi = NULL;
         if j < ly {
             yi = types::svec_ref(py, j);
             if j == ly - 1 && (vy > 0 || types::is_vararg(yi)) {
@@ -954,26 +1464,29 @@ fn subtype_tuple_tail(px: Offset, py: Offset, lx: u32, ly: u32, e: &mut Env) -> 
 
         let mut all_varargs = vx > 0 && vy > 0;
         if !all_varargs && vy == 1 && types::vararg_elem(yi) == types::builtin(id::ANY) {
-            // `Tuple{...} <: Tuple{..., Vararg{Any}}`: the remaining left elements
-            // are all `<: Any`, so match the tails directly (`subtype.c:1767`).
+            // `Tuple{...} <: Tuple{..., Vararg{Any}}`: the remaining left
+            // elements are all `<: Any`, so match the tails directly
+            // (`subtype.c:1767–1781`) — counting the skipped elements into
+            // `vy`, which the length equation needs.
             let xlast = types::svec_ref(px, lx - 1);
             if types::is_vararg(xlast) {
                 all_varargs = true;
-                xi = xlast;
+                vy += lx - i - 1;
                 vx = 1;
+                xi = xlast;
             } else {
                 break;
             }
         }
         if all_varargs {
-            return subtype_tuple_varargs(xi, yi, e);
+            return subtype_tuple_varargs(xi, yi, vx as i64, vy as i64, e, param);
         }
         if j >= ly {
             return vx > 0;
         }
         let xii = if vx > 0 { types::vararg_elem(xi) } else { xi };
         let yii = if vy > 0 { types::vararg_elem(yi) } else { yi };
-        if !sub(xii, yii, e, Param::Covariant) {
+        if !sub(xii, yii, e, param) {
             return false;
         }
         if i < lx - 1 || vx == 0 {
@@ -983,20 +1496,158 @@ fn subtype_tuple_tail(px: Offset, py: Offset, lx: u32, ly: u32, e: &mut Env) -> 
             j += 1;
         }
     }
-    // With only unbounded varargs there is no `N` length equation to discharge
-    // (`subtype.c:1828-1832` handled the bounded case).
+    if vy > 0 && vx == 0 && lx as i64 + 1 >= ly as i64 {
+        // Tuple{...,tn} <: Tuple{...,Vararg{T,N}}: check (lx+1-ly) == N.
+        if !check_vararg_length(yi, lx as i64 + 1 - ly as i64, e) {
+            return false;
+        }
+    }
     true
 }
 
-/// `Tuple{..., Vararg{S}} <: Tuple{..., Vararg{T}}` for unbounded varargs
-/// (`subtype_tuple_varargs`, `subtype.c:1587`, `N`-absent path): reduce to
-/// `S <: T`, checked twice so a diagonal variable in `S` is constrained as it
-/// must be across ≥2 arguments (`subtype.c:1651-1656`). The repeated-element and
-/// separable fast paths are omitted as pure optimizations.
-fn subtype_tuple_varargs(vtx: Offset, vty: Offset, e: &mut Env) -> bool {
+/// `Tuple{..., Vararg{S,N}} <: Tuple{..., Vararg{T,M}}`
+/// (`subtype_tuple_varargs`, `subtype.c:1587–1738`): the element comparison
+/// (checked twice so a diagonal variable in `S` is constrained as it must be
+/// across ≥2 arguments), then the **length equation** `N − vx == M − vy` —
+/// ground long against ground long directly; a long against a variable by
+/// folding the count difference into the constant; variable against variable
+/// through [`forall_exists_equal`] under the `Loffset` channel. Bound `N`
+/// variables are marked `intvalued`, and their `max_offset` bookkeeping is
+/// snapshotted around the equation as the pin does. The repeated-element and
+/// separable fast paths are omitted as pure optimizations (recorded).
+fn subtype_tuple_varargs(
+    vtx: Offset,
+    vty: Offset,
+    mut vx: i64,
+    mut vy: i64,
+    e: &mut Env,
+    param: Param,
+) -> bool {
     let xp0 = types::vararg_elem(vtx);
+    let mut xp1 = types::vararg_num(vtx);
     let yp0 = types::vararg_elem(vty);
-    sub(xp0, yp0, e, Param::Covariant) && sub(xp0, yp0, e, Param::Covariant)
+    let mut yp1 = types::vararg_num(vty);
+
+    let xlv = if xp1 != NULL && types::is_typevar(xp1) { e.lookup(xp1) } else { None };
+    let ylv = if yp1 != NULL && types::is_typevar(yp1) { e.lookup(yp1) } else { None };
+    let max_offsetx = xlv.map_or(0, |i| e.vars[i].max_offset);
+    let max_offsety = ylv.map_or(0, |i| e.vars[i].max_offset);
+
+    let xl = xlv.map_or(xp1, |i| e.vars[i].lb);
+    let yl = ylv.map_or(yp1, |i| e.vars[i].lb);
+
+    let mut skip_elements = false;
+    if xp1 == NULL {
+        // Unconstrained length on the left, constrained on the right.
+        if yl != NULL && types::is_boxed_long(yl) {
+            return false;
+        }
+    } else if types::is_boxed_long(xl) && unbox_long(xl) + 1 == vx {
+        // The LHS is exhausted: the RHS must be exhausted too, or unbounded
+        // (in which case its length still gets constrained to 0 below).
+        if yl != NULL {
+            if types::is_boxed_long(yl) {
+                return unbox_long(yl) + 1 == vy;
+            }
+        } else {
+            skip_elements = true; // the C's `goto constrain_length`
+        }
+    }
+    if !skip_elements {
+        if !sub(xp0, yp0, e, param) {
+            return false;
+        }
+        if !sub(xp0, yp0, e, Param::Covariant) {
+            return false;
+        }
+    }
+
+    // constrain_length:
+    if yp1 == NULL {
+        return true;
+    }
+    if xp1 == NULL {
+        // x's length is unconstrained; y's must not have become fixed, and an
+        // untouched bound variable becomes the "N::Int, unconstrained" token:
+        // lb = Any with `intvalued` set (`subtype.c:1663–1691`).
+        let mut yl = yp1;
+        let mut ylv2: Option<usize> = None;
+        if types::is_typevar(yl) {
+            ylv2 = e.lookup(yl);
+            if let Some(i) = ylv2 {
+                yl = e.vars[i].lb;
+            }
+        }
+        if types::is_boxed_long(yl) {
+            return false;
+        }
+        if let Some(i) = ylv2 {
+            if e.vars[i].depth0 != e.invdepth
+                || e.vars[i].lb != types::builtin(id::BOTTOM)
+                || e.vars[i].ub != types::builtin(id::ANY)
+            {
+                return false;
+            }
+            e.vars[i].intvalued = true;
+        }
+        e.invdepth += 1;
+        let ans = sub(types::builtin(id::ANY), yp1, e, Param::Invariant);
+        if let Some(i) = ylv2 {
+            e.vars[i].max_offset = max_offsety;
+        }
+        e.invdepth -= 1;
+        return ans;
+    }
+
+    // Vararg{T,N} <: Vararg{T2,N2}: equate N and N2.
+    e.invdepth += 1;
+    let bxp1 = if types::is_typevar(xp1) { e.lookup(xp1) } else { None };
+    let byp1 = if types::is_typevar(yp1) { e.lookup(yp1) } else { None };
+    if let Some(i) = bxp1 {
+        e.vars[i].intvalued = true;
+        if types::is_boxed_long(e.vars[i].lb) {
+            xp1 = e.vars[i].lb;
+        }
+    }
+    if let Some(i) = byp1 {
+        e.vars[i].intvalued = true;
+        if types::is_boxed_long(e.vars[i].lb) {
+            yp1 = e.vars[i].lb;
+        }
+    }
+    let ans;
+    if types::is_boxed_long(xp1) && types::is_boxed_long(yp1) {
+        ans = unbox_long(xp1) - vx == unbox_long(yp1) - vy;
+    } else {
+        // At most one side is a ground long (a long on both sides took the
+        // direct comparison above); fold the count difference into it so the
+        // offset channel carries only the variable-vs-variable residue.
+        let mut _boxroot: Option<Rooted> = None;
+        if types::is_boxed_long(xp1) && vx != vy {
+            let b = crate::value::box_int(unbox_long(xp1) + vy - vx);
+            _boxroot = Some(Rooted::new(b));
+            xp1 = b.0;
+            vx = vy;
+        }
+        if types::is_boxed_long(yp1) && vy != vx {
+            let b = crate::value::box_int(unbox_long(yp1) + vx - vy);
+            _boxroot = Some(Rooted::new(b));
+            yp1 = b.0;
+            vy = vx;
+        }
+        debug_assert_eq!(e.loffset, 0);
+        e.loffset = (vx - vy) as i32;
+        ans = forall_exists_equal(xp1, yp1, e);
+        e.loffset = 0;
+    }
+    if let Some(i) = ylv {
+        e.vars[i].max_offset = max_offsety;
+    }
+    if let Some(i) = xlv {
+        e.vars[i].max_offset = max_offsetx;
+    }
+    e.invdepth -= 1;
+    ans
 }
 
 /// Invariant equality of two type parameters (`forall_exists_equal`,
@@ -1010,7 +1661,9 @@ fn subtype_tuple_varargs(vtx: Offset, vty: Offset, e: &mut Env) -> bool {
 /// revisitable by the outer ∃ loop).
 fn forall_exists_equal(x: Offset, y: Offset, e: &mut Env) -> bool {
     if obviously_egal(x, y) {
-        return true;
+        // Structurally identical sides are equal only at offset zero
+        // (`subtype.c:2313`): `N == N + k` fails for `k ≠ 0`.
+        return e.loffset == 0;
     }
 
     // A tuple of definite length can never invariant-equal one of indefinite
@@ -1043,16 +1696,26 @@ fn forall_exists_equal(x: Offset, y: Offset, e: &mut Env) -> bool {
             && forall_exists_equal(types::union_b(x), types::union_b(y), e);
     }
 
-    // `TypeVar == Type` fast path (`:2341–2345`, `Loffset == 0` implicit
-    // until slice 3): merged var_gt+var_lt without the duplicated `<:`.
-    if types::is_typevar(y) && !types::is_typevar(x) {
+    // `TypeVar == Type` fast path (`:2341–2345`), gated on a zero offset —
+    // `equal_var` pins bounds directly and cannot carry the length algebra —
+    // and on `x` being a *type* (`jl_is_type(x)`: a boxed length constrains
+    // through the variable machinery, not the merged path).
+    if e.loffset == 0
+        && types::is_typevar(y)
+        && !types::is_typevar(x)
+        && !types::is_boxed_long(x)
+    {
         return equal_var(y, x, e);
     }
 
     let old_l = push_unionstate(&e.lunions);
     let mut ans = local_forall_exists_subtype(x, y, e, Param::Invariant, -1);
     if ans {
+        // The reverse direction sees the negated offset (`flip_offset`,
+        // `subtype.c:2351–2353`): `X = Y + k  ⟺  Y = X − k`.
+        e.loffset = -e.loffset;
         ans = local_forall_exists_subtype(y, x, e, Param::None, 0);
+        e.loffset = -e.loffset;
     }
     pop_unionstate(&mut e.lunions, &old_l);
     ans
@@ -1100,7 +1763,8 @@ fn equal_var(v: Offset, x: Offset, e: &mut Env) -> bool {
 }
 
 /// `is_indefinite_length_tuple_type` (`subtype.c:2156–2163`): a tuple type
-/// whose last parameter is an unbounded `Vararg`.
+/// whose last parameter is an **unbounded** `Vararg` (a `BOUND` typevar-`N`
+/// vararg is neither definite nor indefinite).
 fn is_indefinite_length_tuple(x: Offset, _e: &Env) -> bool {
     let x = unwrap_unionall(x);
     if !types::is_datatype(x) || !types::is_tuple(x) {
@@ -1108,17 +1772,12 @@ fn is_indefinite_length_tuple(x: Offset, _e: &Env) -> bool {
     }
     let p = types::parameters_of(x);
     let n = if p == NULL { 0 } else { types::svec_len(p) };
-    if n == 0 {
-        return false;
-    }
-    let last = types::svec_ref(p, n - 1);
-    types::is_vararg(last) && types::vararg_num(last) == NULL
+    n > 0 && vararg_kind(types::svec_ref(p, n - 1)) == VarargKind::Unbound
 }
 
 /// `is_definite_length_tuple_type` (`subtype.c:2166–2177`): a tuple type of
-/// fixed arity (no trailing `Vararg`, or a ground-count one — which our
-/// construction expands, so `NONE` covers it). A typevar is judged by its
-/// declared upper bound.
+/// fixed arity — no trailing `Vararg` (`NONE`) or a ground-count one (`INT`).
+/// A typevar is judged by its declared upper bound.
 fn is_definite_length_tuple(x: Offset, _e: &Env) -> bool {
     let x = if types::is_typevar(x) { types::tvar_ub(x) } else { x };
     let x = unwrap_unionall(x);
@@ -1130,8 +1789,8 @@ fn is_definite_length_tuple(x: Offset, _e: &Env) -> bool {
     if n == 0 {
         return true;
     }
-    let last = types::svec_ref(p, n - 1);
-    !types::is_vararg(last) || types::vararg_num(last) != NULL
+    let k = vararg_kind(types::svec_ref(p, n - 1));
+    k == VarargKind::None || k == VarargKind::Int
 }
 
 /// `jl_unwrap_unionall`: strip `where` wrappers to the underlying body.
@@ -1302,24 +1961,210 @@ fn is_existential_typevar(x: Offset, e: &Env) -> bool {
 /// (subtype-path bias), since there is no `Intersect` node. Crucially, the
 /// ground check uses a *fresh* environment, so it never narrows the existential
 /// variables of the live query.
-fn simple_meet(a: Offset, b: Offset) -> Offset {
+fn simple_meet(a: Offset, b: Offset, overesi: u8) -> Offset {
     let any = types::builtin(id::ANY);
     let bottom = types::builtin(id::BOTTOM);
-    if a == any || b == bottom || a == b {
+    if a == any || b == bottom || obviously_egal(a, b) {
         return b;
     }
     if b == any || a == bottom {
         return a;
     }
-    if !types::is_typevar(a) && !types::is_typevar(b) {
-        if types::issubtype(a, b) {
+    if overesi == 1 && (types::is_intersect(a) || types::is_intersect(b)) {
+        // One operand is already an internal meet node: represent the
+        // combined meet exactly by nesting (`subtype.c:765–768`).
+        return types::intersect_type(a, b);
+    }
+    if !is_type_or_typevar(a) || !is_type_or_typevar(b) {
+        return bottom; // distinct non-type values (equal ones were egal above)
+    }
+    // The C's kind/TypeEq arms (`:771–774`), phrased on our `Type{T}`:
+    // `Kind ∩ Type{X}` where `typeof(X)` is that kind is `Type{X}`.
+    if types::is_kind(a)
+        && types::is_type_type(b)
+        && crate::object::type_of(Value(types::svec_ref(types::parameters_of(b), 0))) == a
+    {
+        return b;
+    }
+    if types::is_kind(b)
+        && types::is_type_type(a)
+        && crate::object::type_of(Value(types::svec_ref(types::parameters_of(a), 0))) == b
+    {
+        return a;
+    }
+    if types::is_typevar(a) && obviously_egal(b, types::tvar_ub(a)) {
+        return a;
+    }
+    if types::is_typevar(b) && obviously_egal(a, types::tvar_ub(b)) {
+        return b;
+    }
+    simple_intersect(a, b, overesi)
+}
+
+/// `jl_is_type(t) || jl_is_typevar(t)` — the operands `simple_meet` can
+/// analyze (everything else is a value, whose meet with anything unequal
+/// is empty).
+fn is_type_or_typevar(t: Offset) -> bool {
+    types::is_datatype(t) || types::is_union(t) || types::is_unionall(t) || types::is_typevar(t)
+}
+
+/// `simple_intersect` (`jltypes.c:864–979`), faithful-partial. Flatten both
+/// unions (UnionAlls deliberately not unwrapped); drop components disjoint
+/// from everything on the other side (our disjointness evidence is
+/// [`obviously_disjoint`] alone — the C additionally consults full
+/// intersection emptiness for ground pairs; weaker evidence only means less
+/// simplification, never a wrong answer, because the fallout is an exact
+/// `Intersect` node or a legal over-approximation); then decide by
+/// componentwise subtyping — full `issubtype` standing in for the C's
+/// typevar-aware `simple_subtype2`, the same recorded substitution as the
+/// union-normalization dedup (audit finding 7) — whether one side subsumes
+/// the other.
+fn simple_intersect(a: Offset, b: Offset, overesi: u8) -> Offset {
+    let bottom = types::builtin(id::BOTTOM);
+    let mut comps: Vec<Offset> = Vec::new();
+    flatten_union(a, &mut comps);
+    let nta = comps.len();
+    flatten_union(b, &mut comps);
+    let nt = comps.len();
+
+    // 1. A component disjoint from every component of the other side is dead.
+    let mut alive = vec![false; nt];
+    for i in 0..nta {
+        for j in nta..nt {
+            if (!alive[i] || !alive[j]) && !obviously_disjoint(comps[i], comps[j]) {
+                alive[i] = true;
+                alive[j] = true;
+            }
+        }
+    }
+    // 2. Componentwise subtyping: stemp[k] = -1 (strictly above some
+    // other-side component), 1 (equal to one), 2 (strictly below one).
+    let mut stemp = vec![0i8; nt];
+    let mut all_disjoint = true;
+    for i in 0..nta {
+        if !alive[i] {
+            continue;
+        }
+        all_disjoint = false;
+        for j in nta..nt {
+            if !alive[j] {
+                continue;
+            }
+            let subab = types::issubtype(comps[i], comps[j]);
+            let subba = types::issubtype(comps[j], comps[i]);
+            if subba && !subab {
+                stemp[i] = -1;
+                if stemp[j] >= 0 {
+                    stemp[j] = 2;
+                }
+            } else if subab && !subba {
+                stemp[j] = -1;
+                if stemp[i] >= 0 {
+                    stemp[i] = 2;
+                }
+            } else if subab && subba {
+                if stemp[i] == 0 {
+                    stemp[i] = 1;
+                }
+                if stemp[j] == 0 {
+                    stemp[j] = 1;
+                }
+            }
+        }
+    }
+    let mut subs = [true, true];
+    let mut rs = [true, true];
+    if !all_disjoint {
+        for k in 0..nt {
+            let side = (k >= nta) as usize;
+            subs[side] &= !alive[k] || stemp[k] > 0;
+            rs[side] &= alive[k] && stemp[k] > 0;
+        }
+        // Every component of one side sits at-or-below the other: that side
+        // *is* the meet.
+        if rs[0] {
             return a;
         }
-        if types::issubtype(b, a) {
+        if rs[1] {
             return b;
         }
     }
-    b
+    if all_disjoint || (overesi == 0 && !subs[0] && !subs[1]) {
+        return bottom;
+    }
+    if !subs[0] && !subs[1] && overesi == 1 {
+        // Neither side subsumes the other and they are not provably
+        // disjoint: the meet is not expressible as a single existing type.
+        // Keep it exact as `Intersect{a, b}` rather than over-approximating
+        // to one side, which would silently drop the other (#61917).
+        return types::intersect_type(a, b);
+    }
+    // One side's surviving components all sit below the other — union them —
+    // or over-approximate (mode 2): strictly-below `a` components plus all
+    // surviving `b` components (`jl_typeintersect` may over-approximate, so
+    // this is sound).
+    let keep: Vec<Offset> = if subs[0] {
+        (0..nta).filter(|&k| alive[k]).map(|k| comps[k]).collect()
+    } else if subs[1] {
+        (nta..nt).filter(|&k| alive[k]).map(|k| comps[k]).collect()
+    } else {
+        (0..nt)
+            .filter(|&k| alive[k] && stemp[k] >= if k < nta { 2 } else { 0 })
+            .map(|k| comps[k])
+            .collect()
+    };
+    if keep.is_empty() {
+        return bottom;
+    }
+    // The C isorts and right-nests without re-deduping; we rebuild through
+    // the normalized union constructor — consistent with our union model
+    // (recorded with finding 7's family).
+    types::union_of(&keep)
+}
+
+/// Flatten a union spine into its non-union components (`flatten_type_union`
+/// without the `UnionAll` unwrap, as `simple_intersect` requires).
+fn flatten_union(t: Offset, out: &mut Vec<Offset>) {
+    if types::is_union(t) {
+        flatten_union(types::union_a(t), out);
+        flatten_union(types::union_b(t), out);
+    } else {
+        out.push(t);
+    }
+}
+
+/// A conservative subset of the C's `obviously_disjoint`: `true` only when
+/// the two types provably share no instance. Nominal single inheritance
+/// makes incomparable ground non-tuple, non-`Type{}` datatypes disjoint —
+/// a common subtype's supertype chain would have to pass through both.
+/// Tuples (covariant), `Type{}`s, typevars, `UnionAll`s, and anything with
+/// free typevars conservatively report `false`.
+fn obviously_disjoint(x: Offset, y: Offset) -> bool {
+    if x == y || !types::is_datatype(x) || !types::is_datatype(y) {
+        return false;
+    }
+    if types::is_tuple(x) || types::is_tuple(y) || types::is_type_type(x) || types::is_type_type(y)
+    {
+        return false;
+    }
+    if has_free_typevars(x) || has_free_typevars(y) {
+        return false;
+    }
+    !types::issubtype(x, y) && !types::issubtype(y, x)
+}
+
+/// Over-approximate an internal `Intersect` spine by a real type
+/// (`widen_intersect`, `subtype.c:786–800`), so it cannot escape subtyping
+/// into a result type: peel recursively, re-meeting in mode 2.
+fn widen_intersect(t: Offset) -> Offset {
+    if !types::is_intersect(t) {
+        return t;
+    }
+    let a = widen_intersect(types::intersect_a(t));
+    let _ra = Rooted::new(Value(a));
+    let b = widen_intersect(types::intersect_b(t));
+    let _rb = Rooted::new(Value(b));
+    simple_meet(a, b, 2)
 }
 
 /// Least upper bound (`simple_join`, `simple_union`). Defers to the normalized
@@ -1368,6 +2213,11 @@ fn obviously_egal(a: Offset, b: Offset) -> bool {
         return obviously_egal(types::union_a(a), types::union_a(b))
             && obviously_egal(types::union_b(a), types::union_b(b));
     }
+    if types::is_intersect(a) && types::is_intersect(b) {
+        // The meet node shares the union pair's structural arm (`subtype.c:520`).
+        return obviously_egal(types::intersect_a(a), types::intersect_a(b))
+            && obviously_egal(types::intersect_b(a), types::intersect_b(b));
+    }
     if types::is_unionall(a) && types::is_unionall(b) {
         return types::unionall_var(a) == types::unionall_var(b)
             && obviously_egal(types::unionall_body(a), types::unionall_body(b));
@@ -1383,6 +2233,11 @@ fn obviously_egal(a: Offset, b: Offset) -> bool {
         return na != NULL
             && nb != NULL
             && crate::builtins::egal(crate::object::Value(na), crate::object::Value(nb));
+    }
+    // The C's tail (`subtype.c:538`): non-type values compare by egal — two
+    // equal boxed vararg lengths are obviously egal.
+    if types::is_boxed_long(a) && types::is_boxed_long(b) {
+        return unbox_long(a) == unbox_long(b);
     }
     false
 }
@@ -1426,6 +2281,12 @@ fn has_free_var_where(
         let n = types::vararg_num(t);
         return n != NULL && has_free_var_where(n, bound, pred);
     }
+    if types::is_intersect(t) {
+        // A meet node can carry typevars in either operand (it appears in
+        // existential upper bounds, which `has_existential_typevar` walks).
+        return has_free_var_where(types::intersect_a(t), bound, pred)
+            || has_free_var_where(types::intersect_b(t), bound, pred);
+    }
     if types::is_unionall(t) {
         let v = types::unionall_var(t);
         if has_free_var_where(types::tvar_lb(v), bound, pred)
@@ -1450,8 +2311,9 @@ fn has_free_var_where(
 }
 
 /// `jl_has_free_typevars`: does `t` contain any type variable not bound by a
-/// `UnionAll` within `t` itself?
-fn has_free_typevars(t: Offset) -> bool {
+/// `UnionAll` within `t` itself? (`pub(crate)`: `types::tuple_type`'s vararg
+/// expansion guard consults it, as `inst_datatype_inner` does the C's.)
+pub(crate) fn has_free_typevars(t: Offset) -> bool {
     has_free_var_where(t, &mut Vec::new(), &|_| true)
 }
 

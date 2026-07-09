@@ -138,19 +138,19 @@ flowchart TD
     STRUCTS["struct support [done: phase-0 subset]"]
     INTRIN["intrinsics & boxing breadth [done: phase-0 subset]"]
     GCX["GC exactness & tuning [done: phase-0 subset]"]
-    SUBXE["subtype expressibility [done: subset —<br/>typevar-N Vararg rides with the engine]"]
+    SUBXE["subtype expressibility [done:<br/>incl. typevar-N Vararg, engine slice 3]"]
     EXC["exceptions [done: subset — reified values,<br/>finally; exception stack later]"]
 
     ORACLE["oracle capacity [done: 120 cases, growing]"]
-    SUBXM("subtype engine: union decision machine [done],<br/>Intersect/Loffset, concrete propagation (frontier)")
-    ISECT{"type intersection"}
+    SUBXM["subtype engine [done: all five slices, 2026-07]"]
+    ISECT("type intersection (frontier)")
     MORESPEC{"type_morespecific"}
     DISPX{"dispatch hardening: cache, ambiguity, MethodError"}
     ARRAYS["arrays & GenericMemory [done: 1-D subset]"]
     MODULES["modules & bindings [done: subset —<br/>toplevel scoping rides with real lowering]"]
-    BOOTPIPE("build-time pipeline: pinned Julia offline →<br/>serialized compiler artifacts (frontier)")
-    THINSLICE("AOT thin slice: go/no-go experiment (frontier)")
-    LOWER("real CodeInfo: build-time pre-lowering +<br/>full interpreter statement set (frontier)")
+    BOOTPIPE["build-time pipeline [done: prelower + typed-IR<br/>fixtures; the durable producer rides M4]"]
+    THINSLICE["AOT thin slice: go/no-go experiment [done: GO 2026-07]"]
+    LOWER["real CodeInfo [done: M2 reached 2026-07-08;<br/>depth rides the corpus]"]
     EVAL{"in-browser eval: pre-lowered<br/>JuliaSyntax/JuliaLowering interpreted"}
     AOT{"phase-1 AOT backend"}
     BASE{"base/ & stdlib/ AOT-compiled"}
@@ -199,14 +199,14 @@ the frontier now, alongside depth work in the landed subsets.
 
 | Increment | What it is | What it unblocks |
 | - | - | - |
-| **subtype engine** | ~~slices 1–2~~ **landed 2026-07**: the rooting fix (finding 24, stress-enforced), the global union-decision machine (`Lunions`/`Runions` bit-stacks, ∀/∃ drivers, dispatch-order fixes — finding 11 closed; both pre-mapped oracle divergences healed on first run), then the `forall_exists_equal` tail (greedy path, `equal_var`, tuple-length gate, `push_forall_bound_scope`/`occurs_inv`, freeze/`limit_slow`/`env_unchanged` explosion guards); oracle 106→**120**, 0 known divergences. Remaining slices per `design/research/research-subtype-engine.md` §6: (3) `Loffset` + typevar-count `Vararg{T,N}`, (4) `Intersect` + `concrete` propagation, (5) `envout` for dispatch | type intersection → `type_morespecific` → dispatch hardening (the M3 spine) |
+| **subtype engine** | ~~slices 1–2~~ **landed 2026-07**: the rooting fix (finding 24, stress-enforced), the global union-decision machine (`Lunions`/`Runions` bit-stacks, ∀/∃ drivers, dispatch-order fixes — finding 11 closed; both pre-mapped oracle divergences healed on first run), then the `forall_exists_equal` tail (greedy path, `equal_var`, tuple-length gate, `push_forall_bound_scope`/`occurs_inv`, freeze/`limit_slow`/`env_unchanged` explosion guards); then ~~slice 3~~ **landed 2026-07-09**: the vararg length algebra — the `Loffset` channel, typevar-count `Vararg{T,N}` (the `BOUND` kind, `NTuple`), the full four-kind tuple length classification, `check_vararg_length`, the N-equation, and finding 23's expansion guard; then ~~slice 4~~ (the `Intersect` meet node #61917 + `concrete` propagation — finding 15 closed) and ~~slice 5~~ **landed 2026-07-09 — the engine is complete as researched**: `envout` (`jl_subtype_env`) hands callers the computed values of right-side `where` variables, verified against the pinned binary's own `jl_subtype_env` (10 cases native + the oracle's env section via the new `rj_subtype_env` ABI); oracle 106→120→126→**134**, 0 known divergences, bit-identical through slice 5 | **the M3 spine is open**: type intersection (now frontier) → `type_morespecific` → dispatch hardening |
 | **real `CodeInfo` (M2)** | build-time pre-lowering (decided 2026-07): the pinned native Julia lowers offline; Ruju loads serialized `CodeInfo` as data; grow `interp.rs` to the full lowered statement set — plan in `design/research/research-real-lowering.md`. **C-0 begun 2026-07**: ~~`QuoteNode`/`GlobalRef` operands + global assignment~~ (stage 1) ~~calls through values~~ (stage 2 — function values under the abstract `Function`, `typeof`-keyed dispatch), and ~~`:method` in both arities~~ (stage 3 — method definitions from IR), and ~~the exception stack + `:pop_exception`~~ (stage 4), and ~~`:isdefined`~~ (stage 5) landed — the statement vocabulary is now complete for the current value model (`:splatnew` waits on runtime tuple values, `:static_parameter` on the sparams environment); ~~**C-1**~~ landed 2026-07: `tools/prelower.jl` (the pinned Julia serializes its own lowering, pin-versioned format), `loader.rs` + `rj_load_lowered` (lowered `CodeInfo` loaded as data and executed), the operator/Core-builtin prelude, and the **lowering oracle** (`verify_julia_lowering.mjs` — same source, two executors, one answer; 4/4 corpus programs incl. method definitions, globals, try/catch, loops). **M2's definition is met for the represented subset** — the milestone call is the human's; remaining depth rides the corpus (strings, structs-from-source, closures, `:splatnew`/tuple values, heap-`CodeInfo` in-memory form). The pinned-Julia artifact (C-1's producer) is building via `.github/workflows/build-pinned-julia.yml` | M2; `base/` code; method definitions from source |
 | **build-time pipeline** | the offline harness both M2 and M4 share: run the pinned Julia, serialize compiler artifacts (`CodeInfo` now, typed `IRCode` later) | real `CodeInfo`; the AOT backend |
-| **AOT thin slice** | the go/no-go experiment (spec: `design/research/research-aot-backend.md`): hand-transcribed typed IR → ~500-line `wasm-encoder` backend → registered in dispatch → benchmarked (≥100× interpreter; ≤3× native-Rust-in-wasm). Stage 2 forces the linear-memory shadow stack + region-base export | probes the AOT semantic-gap risk before M3/M4 invest; validates two-module linking |
+| **AOT thin slice** | ~~stages 1–2~~ **landed 2026-07-09 — GO** (spec: `design/research/research-aot-backend.md` §7; evidence: `implementation.md`, AOT section): the pinned Julia's own `code_ircode` output serialized (`tools/aot_fixture.jl`) → `ruju-aotc` (`wasm-encoder` + Beyond-Relooper) → two-module linking over the exported memory + funcref table → registered via `dispatch::Entry.fptr1` → called through both the specsig export and real dispatch. Thresholds: **401.8×** interpreter (≥100×), **0.95×** native-Rust-in-wasm (≤3×), fptr1 3.8µs vs interpreted 47.2µs per call. Stage 2 (D3's hardening): the **linear-memory shadow stack** (slot arena + exported top cell; `Rooted`/`Frame` are veneers — one root set for both fronts), the **region-base export**, and a compiled allocating function (`:new`/`getfield`, gcframe emission) exact under a collection per allocation — and the fixture caught a real D2a layout miscompile (tag-before-object) on first contact, as designed. Remaining: **stage 3** — compiled→dispatch fallback calls; the **exception-channel decision** (design open, human's call — nothing in the vocabulary throws yet) | the AOT semantic-gap risk is probed (one instance caught live) and the architecture + gcframe ABI validated; the `AOT` node now waits only on dispatch hardening |
 | **depth in landed subsets** | N-D arrays, `popfirst!`/views, isbits-struct elements; scoped `EnterNode`s and backtraces; nested modules/imports; `BFloat16`, permbox caches (findings 1, 9); the `AbstractArray` tower and exception field metadata (findings 22, 28, audit 2026-07) | pulled in by demand from the two gates above |
 | **arrays & GenericMemory** | landed 2026-07: ~~`GenericMemory` core~~ (the linear-memory buffer, get/set/length, GC element tracing + barrier), ~~1-D `Array` + growth~~ (`jl_array_grow_end`), ~~front-end syntax~~ (`[literals]`, `a[i]`, `push!`, `length`); remaining depth: N-D arrays, `popfirst!`/`deleteat!` (offset motion), shared views, isbits-struct/union elements | most real Julia programs; `base/` code |
 | **modules & bindings** | landed 2026-07: ~~`Main` + bindings~~ (`jl_module_t` core, get/set_global with barriers), ~~top-level globals persisting across evals~~ (REPL-style seed/flush); remaining depth: nested modules, imports/exports, `jl_binding_t` partitions/constness, real toplevel scoping (with real lowering) | `base/` code; method definitions from source |
-| **subtype expressibility** | landed 2026-07 (oracle 53→106): ~~unbounded varargs in tuples~~, ~~two-parameter `Pair` (multi-param invariant/diagonal)~~, ~~curated bounded/diagonal `test_3` expansion~~; ~~fixed-count `Vararg{T,N}` (expansion at construction)~~, ~~`Type{T}` kinds~~; remaining: typevar-count `Vararg{T,N}` (the `BOUND` kind — engine-adjacent: its length algebra lives in `jl_varbinding_t`) — bounded slices, each unlocking a tranche of `test/subtype.jl` for the oracle | grows the oracle toward the coverage the **engine slice** needs to be measurable; varargs also feeds dispatch |
+| **subtype expressibility** | landed 2026-07 (oracle 53→106): ~~unbounded varargs in tuples~~, ~~two-parameter `Pair` (multi-param invariant/diagonal)~~, ~~curated bounded/diagonal `test_3` expansion~~; ~~fixed-count `Vararg{T,N}` (expansion at construction)~~, ~~`Type{T}` kinds~~; ~~typevar-count `Vararg{T,N}`~~ (the `BOUND` kind — landed with engine slice 3, 2026-07-09, oracle → 126) — **complete as scoped** | grew the oracle to the coverage the engine needed; varargs also feeds dispatch |
 | **exceptions** | **complete as scoped** 2026-07: ~~`enter`/`leave`~~, ~~`throw`/`catch e` from source~~, ~~reified exception objects~~ (`rtutils.c` analog: `DivideError`/`BoundsError{a,i}`/`ErrorException` values in the error channel), ~~`finally`~~, ~~the exception stack~~ (`pop_exception`, landed with M2 C-0 stage 4); remaining depth: scoped `EnterNode`s, backtraces | real lowering; `base/` code throws |
 
 ## Selection principles
@@ -227,21 +227,17 @@ When several frontier items are available:
 
 ## Later phases (blocked, in dependency order)
 
-**The subtype engine** (the global union-decision machine that heals the
-oracle's known divergence, `Intersect`/`Loffset` from the newer pin,
-cross-var `concrete` propagation) deliberately waits for the expressibility
-slices: an engine rewrite verified against today's 53 oracle cases would be
-unverified exactly where engines go wrong — the measuring instrument is
-built first. The working cadence interleaves hardening slices between other
-frontier items (GC exactness → varargs → arrays → `Type{T}`/`UnionAll`
-instantiation → engine), so the type vocabulary and the engine grow together
-and no retrofit cliff accumulates. Then: type intersection →
-`type_morespecific` → dispatch hardening (typemap cache,
-world age, ambiguity, `MethodError`). Arrays and modules behind structs. Real
-`CodeInfo` via build-time pre-lowering (see Key design decisions) now that
-structs, intrinsics breadth, and exceptions hold; a separate **in-browser
+**The subtype engine is complete as researched** (all five slices,
+2026-07): the strategy of building the measuring instrument first — growing
+the oracle through the expressibility slices before rewriting the engine
+against it — paid out as designed (every slice's tranche passed on its
+first run). What remains behind it is the M3 spine: type intersection (now
+frontier) → `type_morespecific` → dispatch hardening (typemap cache,
+world age, ambiguity, `MethodError`). A separate **in-browser
 eval** milestone (pre-lowering JuliaSyntax/JuliaLowering themselves and
-interpreting them) follows `base/`. The phase-1 AOT backend once dispatch and GC are hardened.
+interpreting them) follows `base/`. The phase-1 AOT backend once dispatch
+is hardened (its go/no-go thin slice passed 2026-07; GC exactness and the
+gcframe ABI already hold).
 Then `base`/`stdlib` AOT — at which point **BLAS/LAPACK Phase A** (Julia's
 generic fallbacks) arrives free, making linear algebra a performance problem,
 not a correctness one:

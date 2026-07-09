@@ -1,0 +1,15 @@
+# ruju-aotc — the build-time AOT backend (host-side only, never wasm).
+# Phase 1 thin slice (issue #11): consumes a serialized typed-IR fixture and
+# emits a wasm module against the runtime's rj_ ABI.
+[package]
+name = "ruju-aotc"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-encoder = "0.229"
+wasmparser = "0.229"
+wasmprinter = "0.229"

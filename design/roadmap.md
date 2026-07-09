@@ -42,14 +42,14 @@ row's remaining hatch is a named, early-probed risk; see
 | Exceptions (`enter`/`leave`) | breadth | M | W2–W3 | interpreter core | ~~done 2026-07~~ (reified values, `finally`; exception stack later) |
 | Subtype expressibility | type-depth | M | W1–W2 | subtyping core | ~~done 2026-07~~ (varargs, `Type{T}`, `UnionAll` inst.; typevar-`N` → engine) |
 | Oracle expansion | type-depth | S | W1–W3 | expressibility | 53 → 106 → **120** (2026-07), the 2 pre-mapped engine divergences healed and promoted; keeps growing |
-| **Subtype engine** | type-depth | XL | W3–W6 | oracle | ~~slices 1–2 done 2026-07~~ (rooting fix, the union-decision machine + drivers — both pre-mapped divergences healed on first run — and the `forall_exists_equal` tail with the explosion guards); remaining per `design/research/research-subtype-engine.md` §6: slice 3 (`Loffset`/typevar-`N`), 4 (`Intersect` — no oracle case needs it yet), 5 (`envout`) |
+| **Subtype engine** | type-depth | XL | W3–W6 | oracle | ~~slices 1–2 done 2026-07~~ (rooting fix, the union-decision machine + drivers — both pre-mapped divergences healed on first run — and the `forall_exists_equal` tail with the explosion guards); ~~slices 3–5 done 2026-07-09 — **complete as researched**~~ (the vararg length algebra, findings 23+15 closed; the `Intersect` meet node; `envout`/`jl_subtype_env` with the `rj_subtype_env` ABI; oracle → 134, bit-identical through slice 5). Type intersection is unblocked |
 | Type intersection | type-depth | L | W6–W7 | subtype engine | `jl_type_intersection` |
 | `type_morespecific` | type-depth | M | W7–W8 | intersection | dispatch specificity |
 | Dispatch hardening | type-depth | L | W8–W9 | `morespecific`, expressibility | typemap cache, world age, ambiguity, `MethodError` |
 | **Real `CodeInfo` (M2)** | front-end | L *(was XL)* | W3–W6 | build-time pipeline; interpreter completeness | decision D1: build-time pre-lowering; serialized-`CodeInfo` loader + full lowered statement set in `interp.rs`; `frontend.rs` kept as dev convenience. C-0 begun 2026-07 (operands, calls through values); the pinned-Julia artifact is building |
 | Build-time pipeline | shared infra | M | W3–W4 | — | the offline harness M2 and M4 share: pinned Julia → serialized `CodeInfo` (M2) / typed `IRCode` (M4) |
-| **AOT thin slice** | compilation | M | W3–W5 | build-time pipeline (fixture may be hand-transcribed) | the go/no-go: ~500-line `wasm-encoder` backend, two-module linking, benchmark thresholds per `research-aot-backend.md`. **Pulled forward from W9+** — probes the semantic-gap risk early |
-| Linear-memory shadow stack + region-base export | runtime hardening | M | W4–W5 | — | corrects the ledger's under-stated gcframe row: the shadow stack is a host `Vec` today; compiled code needs it in linear memory. Forced by thin-slice stage 2 |
+| **AOT thin slice** | compilation | M | W3–W5 | build-time pipeline (fixture may be hand-transcribed) | ~~stages 1–2 done 2026-07-09~~ — **GO**: 401.8× interpreter, 0.95× native, both call paths, two-module linking, gcframe emission stress-proven (`implementation.md`, AOT section). Stage 3 (compiled→dispatch fallback calls) + the exception-channel decision remain |
+| Linear-memory shadow stack + region-base export | runtime hardening | M | W4–W5 | — | ~~done 2026-07-09~~ (thin-slice stage 2): the slot arena + exported top cell, `Rooted`/`Frame` as veneers, one root set for both fronts; `rj_region_base` exported |
 | **AOT backend (Phase 1)** | compilation | XL | W9–W12 | dispatch hardening; thin slice passed | decision D2: typed IR from the pinned `Compiler/` at build time (inference never reimplemented); `wasm-encoder` emission; two-module linking (merge kept on the table). Hatching now means the **named semantic-gap risk** (whitelist → overlay → self-hosted base), probed early by the thin slice — no longer "possibly impossible" |
 | base/ + stdlib AOT-compiled | compilation | XL | W11–W13 | modules, arrays, lowering, AOT | real Julia programs run |
 | BLAS/LAPACK Phase A | performance | S | W13 | base/ | generic fallbacks — free with base/ |
@@ -94,7 +94,10 @@ Three increments carry nearly all the uncertainty. Every wave estimate past
   promises kept by a different runtime — layout folding vs 4-byte refs,
   method-table divergence, intrinsic-folding vs recorded divergences.
   Mitigation regime: whitelisted IR vocabulary → `AbstractInterpreter`
-  overlay → self-hosted `base/`; probed by the **early thin slice**.
+  overlay → self-hosted `base/`. **Probed — the thin slice passed (GO,
+  2026-07-09) and caught one live instance of exactly this class** (a
+  header-layout assumption), validating the regime; the risk stays named
+  for the backend at scale.
 - **The base/ bootstrap grind**: the long tail of runtime surface `base/`
   needs before it loads — large but enumerable, not research.
 - **Pin coupling**: serialized `CodeInfo`/`IRCode` formats tie to the pin;
@@ -127,9 +130,9 @@ instead, the compiler has nothing to emit.
 | Interpreter consumes the **same** `CodeInfo` shape the backend will (retiring `frontend.rs`'s ad-hoc IR) | Real lowering | already the plan | medium — otherwise two IRs and a permanent translation layer |
 | Method resolution is a pure, reusable `(f, argtypes) → method` query, plus a defined stable **world** to compile against, so the backend can devirtualize at build time and share the runtime fallback | Dispatch hardening | low–med | medium — no build-time devirtualization means most AOT speed is left on the table |
 | A defined **calling convention** for a method — gcframe threading, which args arrive boxed vs. unboxed, how the result returns — shared by interpreter and compiled methods | Dispatch hardening / AOT backend | low | medium — marshalling at every interpreter↔compiled fallback boundary otherwise |
-| The gcframe / shadow-stack layout frozen as an ABI contract — **corrected 2026-07: not freezable yet**; the shadow stack is a host Rust `Vec` (`gc.rs`), so this is an M-sized move-to-linear-memory increment (scheduled, see increments table), not a free freeze | thin-slice stage 2 | **M (was mis-stated ~none)** | high — compiled code cannot emit gcframes against a host `Vec` |
+| ~~The gcframe / shadow-stack layout frozen as an ABI contract~~ — **honored** (thin-slice stage 2, 2026-07-09): the slot arena + top cell in linear memory, byte-for-byte specified (`implementation.md`, GC section); compiled prologues/epilogues emit against it directly | thin-slice stage 2 | done | — |
 | Ruju's future `ccall` resolves an **internal symbol registry** before host/JS imports — the hook where the LBT shim registers `dgemm_64_` and friends (decision: faer, 2026-07) | FFI increment | ~none | medium — retrofitting symbol resolution after ccall ships means reworking every call site |
-| Region base kept cheaply reachable by compiled code (a known global), so `base + offset` is a two-instruction address | `rj_` ABI | ~none | low–med — otherwise a call per dereference |
+| ~~Region base kept cheaply reachable by compiled code~~ — **honored** (thin-slice stage 2, 2026-07-09): `rj_region_base` exported; compiled functions cache it in a local, `base + offset` addressing | `rj_` ABI | done | — |
 | Intrinsics stay pure and value-typed; nothing relies on **heap identity** for primitives (egal-by-bits already holds) so the backend is free to unbox into `i64`/`f64` locals | standing invariant | none (already true) | low — cheap to violate by accident, and a violation blocks unboxing wholesale |
 | Layout features the backend will need before it can compile those field cases: inline isbits unions (selector bytes), inline immutables containing pointers (`hasptr`/`first_ptr`), atomics | Structs layout tail | med | medium — the backend cannot compile those field accesses until the layout supports them |
 

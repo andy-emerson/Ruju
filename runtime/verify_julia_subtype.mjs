@@ -45,6 +45,7 @@ const Tuple = (...ts) => {
 };
 const Vararg = (t) => x.rj_vararg(t); // unbounded Vararg{t}
 const VarargN = (t, n) => x.rj_vararg_n(t, BigInt(n)); // Vararg{t, n}
+const VarargTV = (t, v) => x.rj_vararg_tv(t, v); // Vararg{t, N} with typevar N
 const Pair = (a, b) => x.rj_pair_type(a, b); // two-parameter invariant type
 const TypeT = (t) => x.rj_type_type(t); // Type{t}
 const Union = (a, b) => x.rj_union_type(a, b);
@@ -427,6 +428,97 @@ const cases = [
     return [where(T, Ref(Tuple(Union(Int, Int8), Int16, T))),
             where(S, Ref(Union(Tuple(Int, Int16, S), Tuple(Int8, Int16, S))))];
   }],
+
+  // --- the vararg length algebra (engine slice 3, 2026-07): typevar-count
+  // --- Vararg{T,N} (the BOUND kind), the Loffset channel, the N-equation,
+  // --- and check_vararg_length. NTuple{N,T} spells Tuple{Vararg{T,N}}. ---
+  ["L70 (@UnionAll N Tuple{Int,Vararg{Int,N}}) == (@UnionAll N Tuple{Int,Vararg{Int,N}})", "equal", () => {
+    const N1 = tvar();
+    const N2 = tvar();
+    return [where(N1, Tuple(Int, VarargTV(Int, N1))), where(N2, Tuple(Int, VarargTV(Int, N2)))];
+  }],
+  ["L79 issub_strict(Tuple{Tuple{Int,Int},Tuple{Int,Int}}, Tuple{NTuple{N,Int},NTuple{N,Int}} where N)", "strict", () => {
+    const N = tvar();
+    return [Tuple(Tuple(Int, Int), Tuple(Int, Int)),
+            where(N, Tuple(Tuple(VarargTV(Int, N)), Tuple(VarargTV(Int, N))))];
+  }],
+  ["L80 !issub(Tuple{Tuple{Int,Int},Tuple{Int}}, Tuple{NTuple{N,Int},NTuple{N,Int}} where N)", "notsub", () => {
+    const N = tvar();
+    return [Tuple(Tuple(Int, Int), Tuple(Int)),
+            where(N, Tuple(Tuple(VarargTV(Int, N)), Tuple(VarargTV(Int, N))))];
+  }],
+  ["L85 issub_strict(Tuple{Int,Int}, Tuple{Int,Int,Vararg{Int,N}} where N)", "strict", () => {
+    const N = tvar();
+    return [Tuple(Int, Int), where(N, Tuple(Int, Int, VarargTV(Int, N)))];
+  }],
+  ["L86 issub_strict(Tuple{Int,Int}, Tuple{E,E,Vararg{E,N}} where E where N)", "strict", () => {
+    const N = tvar();
+    const E = tvar();
+    return [Tuple(Int, Int), where(N, where(E, Tuple(E, E, VarargTV(E, N))))];
+  }],
+  ["L632 issub(Tuple{}, @UnionAll N NTuple{N})", "sub", () => {
+    const N = tvar();
+    return [Tuple(), where(N, Tuple(VarargTV(Any, N)))];
+  }],
+
+  // --- the Intersect meet node + concrete propagation (engine slice 4,
+  // --- 2026-07): the diagonal family whose bounds cross a union arm
+  // --- (Float64 for String), the cross-bounded existentials from test_3
+  // --- (Box for Ptr; bare Ptr spells `Box{X} where X`), and the
+  // --- abstract-lower-bound guard on diagonal concreteness. ---
+  ["L110 !issub(Tuple{Real,Real}, @UnionAll T<:Real Tuple{T,T})", "notsub", () => {
+    const T = tvar(0, Real);
+    return [Tuple(Real, Real), where(T, Tuple(T, T))];
+  }],
+  ["L115 issub_strict(Tuple{String,Real,Ref{Number}}, @UnionAll T Tuple{Union{T,String},T,Ref{T}})", "strict", () => {
+    const T = tvar();
+    return [Tuple(Float64, Real, Ref(Number)), where(T, Tuple(Union(T, Float64), T, Ref(T)))];
+  }],
+  ["L118 issub_strict(Tuple{String,Real}, @UnionAll T Tuple{Union{T,String},T})", "strict", () => {
+    const T = tvar();
+    return [Tuple(Float64, Real), where(T, Tuple(Union(T, Float64), T))];
+  }],
+  ["L121 !issub(Tuple{Real,Real}, @UnionAll T Tuple{Union{T,String},T})", "notsub", () => {
+    const T = tvar();
+    return [Tuple(Real, Real), where(T, Tuple(Union(T, Float64), T))];
+  }],
+  ["L124 issub_strict(Tuple{Int,Int}, @UnionAll T Tuple{Union{T,String},T})", "strict", () => {
+    const T = tvar();
+    return [Tuple(Int, Int), where(T, Tuple(Union(T, Float64), T))];
+  }],
+  ["L141 isequal_type(Tuple{Vararg{A}} where A>:Integer, Tuple{Vararg{A}} where A>:Integer)", "equal", () => {
+    const A1 = tvar(Integer, 0);
+    const A2 = tvar(Integer, 0);
+    return [where(A1, Tuple(Vararg(A1))), where(A2, Tuple(Vararg(A2)))];
+  }],
+  ["L338 issub_strict(@UnionAll T>:Ptr @UnionAll Ptr<:S<:Ptr Tuple{Ptr{T},Ptr{S}}, @UnionAll T>:Ptr @UnionAll S>:Ptr{T} Tuple{Ptr{T},Ptr{S}})", "strict", () => {
+    const ptrBare = () => {
+      const X = tvar();
+      return where(X, Ref(X));
+    };
+    const T1 = tvar(ptrBare(), 0);
+    const S1 = tvar(ptrBare(), ptrBare());
+    const T2 = tvar(ptrBare(), 0);
+    const S2 = tvar(Ref(T2), 0);
+    return [
+      where(T1, where(S1, Tuple(Ref(T1), Ref(S1)))),
+      where(T2, where(S2, Tuple(Ref(T2), Ref(S2)))),
+    ];
+  }],
+  ["L340 !issub(@UnionAll T>:Ptr @UnionAll S>:Ptr Tuple{Ptr{T},Ptr{S}}, @UnionAll T>:Ptr @UnionAll Ptr{T}<:S<:Ptr Tuple{Ptr{T},Ptr{S}})", "notsub", () => {
+    const ptrBare = () => {
+      const X = tvar();
+      return where(X, Ref(X));
+    };
+    const T1 = tvar(ptrBare(), 0);
+    const S1 = tvar(ptrBare(), 0);
+    const T2 = tvar(ptrBare(), 0);
+    const S2 = tvar(Ref(T2), ptrBare());
+    return [
+      where(T1, where(S1, Tuple(Ref(T1), Ref(S1)))),
+      where(T2, where(S2, Tuple(Ref(T2), Ref(S2)))),
+    ];
+  }],
 ];
 
 // Known divergences (currently none — the union-decision machine healed both
@@ -452,4 +544,57 @@ for (const [src, kind, build] of knownDivergences) {
   else { console.log(`known divergence  ${src}`); }
 }
 console.log(`\n${pass}/${cases.length} match JuliaLang/julia (test/subtype.jl); ${fail} mismatch; ${knownDivergences.length - healed} known divergence(s)`);
-process.exitCode = fail ? 1 : 0;
+
+// --- env matching (engine slice 5): rj_subtype_env computes the values of
+// --- the right side's outer `where` variables, as jl_subtype_env does for
+// --- jl_subtype_matching. Expected bindings below were verified against
+// --- the pinned Julia binary via ccall(:jl_subtype_env, ...) — recorded as
+// --- pinned-binary evidence, not test/subtype.jl verbatim. ---
+const envCases = [
+  ["Tuple{Int,Int} <: Tuple{T,T} where T -> [Int64]", () => {
+    const T = tvar();
+    return [Tuple(Int, Int), where(T, Tuple(T, T)), [Int]];
+  }],
+  ["Tuple{Int,Float64} <: Tuple{T,S} where {T,S} -> [Int64, Float64]", () => {
+    const T = tvar(); const S = tvar();
+    return [Tuple(Int, Float64), where(T, where(S, Tuple(T, S))), [Int, Float64]];
+  }],
+  ["Tuple{Int,Int} <: Tuple{Vararg{Int,N}} where N -> [2]", () => {
+    const N = tvar();
+    return [Tuple(Int, Int), where(N, Tuple(VarargTV(Int, N))), ["long:2"]];
+  }],
+  ["Tuple{} <: Tuple{Vararg{T}} where T -> [svec(T, false)]", () => {
+    const T = tvar();
+    return [Tuple(), where(T, Tuple(Vararg(T))), [["wrapped", T, false]]];
+  }],
+  ["Tuple{Int,Float64} NOT <: Tuple{T,T} where T (diagonal)", () => {
+    const T = tvar();
+    return [Tuple(Int, Float64), where(T, Tuple(T, T)), null];
+  }],
+];
+let envPass = 0, envFail = 0;
+for (const [src, build] of envCases) {
+  const [a, b, expect] = build();
+  const ok = x.rj_subtype_env(a, b) === 1;
+  let good;
+  if (expect === null) {
+    good = !ok;
+  } else if (!ok || x.rj_env_size() !== expect.length) {
+    good = false;
+  } else {
+    good = expect.every((want, i) => {
+      const got = x.rj_env_get(i);
+      if (typeof want === "number") return got === want;
+      if (typeof want === "string" && want.startsWith("long:"))
+        return x.rj_typeof(got) === ty(ID.Int64) && x.rj_unbox_int(got) === BigInt(want.slice(5));
+      // ["wrapped", tvarOffset, constrainedBool]
+      return x.rj_is_svec(got) === 1 && x.rj_svec_len(got) === 2
+        && x.rj_svec_ref(got, 0) === want[1]
+        && x.rj_svec_ref(got, 1) === (want[2] ? x.rj_true_instance() : x.rj_false_instance());
+    });
+  }
+  if (good) { envPass++; } else { envFail++; console.log(`ENV MISMATCH  ${src}`); }
+}
+console.log(`${envPass}/${envCases.length} env matchings agree with the pinned Julia (jl_subtype_env)`);
+
+process.exitCode = (fail || envFail) ? 1 : 0;

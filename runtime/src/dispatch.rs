@@ -26,6 +26,11 @@ struct Entry {
     func: u32,
     sig: Offset, // a tuple type
     body: Body,
+    /// A compiled method's boxed entry point (the pin's `CodeInstance.invoke`
+    /// analog): a funcref-table index with signature `(argv, nargs) -> ret`,
+    /// argv a rooted slice of boxed-value offsets in linear memory. When
+    /// present, dispatch calls it instead of interpreting `body`.
+    fptr1: Option<u32>,
 }
 
 struct Table(UnsafeCell<Vec<Entry>>);
@@ -124,7 +129,15 @@ pub fn each_function(mut f: impl FnMut(Offset)) {
 
 /// Register a method: function `func`, signature tuple type `sig`, body `body`.
 pub fn add_method(func: u32, sig: Offset, body: Body) {
-    table().push(Entry { func, sig, body });
+    table().push(Entry { func, sig, body, fptr1: None });
+}
+
+/// Register a **compiled** method: as [`add_method`], but the body is a
+/// funcref-table index (the boxed fptr1 entry emitted by `ruju-aotc`) instead
+/// of interpretable IR. Selection is unchanged — one method table serves both
+/// execution fronts.
+pub fn add_compiled_method(func: u32, sig: Offset, fptr1: u32) {
+    table().push(Entry { func, sig, body: Body { nslots: 0, code: Vec::new() }, fptr1: Some(fptr1) });
 }
 
 /// Visit every method signature (a tuple type); the collector roots them.
@@ -164,9 +177,33 @@ fn select(func: u32, arg_types: &[Offset]) -> Option<usize> {
 /// must keep `args` rooted across this call.
 pub fn invoke(func: u32, args: &[Value]) -> Result<Value, Value> {
     let arg_types: Vec<Offset> = args.iter().map(|&v| object::type_of(v)).collect();
-    let body = match select(func, &arg_types) {
-        Some(i) => table()[i].body.clone(),
+    let i = match select(func, &arg_types) {
+        Some(i) => i,
         None => return Ok(Value::NULL),
     };
+    if let Some(fptr1) = table()[i].fptr1 {
+        return call_compiled(fptr1, args);
+    }
+    let body = table()[i].body.clone();
     interp::eval_with_args(&body, args)
+}
+
+/// Call a compiled method through its boxed entry point. On
+/// wasm32-unknown-unknown a Rust `fn` pointer *is* an index into the module's
+/// (exported, shared) funcref table, so the transmute compiles to a plain
+/// `call_indirect` — the design of research-aot-backend.md §6.5, verified
+/// end-to-end by the harness. The argv slice lives in linear memory (the Rust
+/// heap is linear memory) and its entries stay live because the caller keeps
+/// `args` rooted. The thin slice's compiled vocabulary cannot throw; the
+/// shared exception channel is slice 2's recorded decision.
+#[cfg(target_arch = "wasm32")]
+fn call_compiled(fptr1: u32, args: &[Value]) -> Result<Value, Value> {
+    let argv: Vec<u32> = args.iter().map(|&v| v.0).collect();
+    let f: extern "C" fn(u32, u32) -> u32 = unsafe { core::mem::transmute(fptr1 as usize) };
+    Ok(Value(f(argv.as_ptr() as u32, argv.len() as u32) as Offset))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn call_compiled(_fptr1: u32, _args: &[Value]) -> Result<Value, Value> {
+    unreachable!("compiled methods exist only under wasm32 (no native fptr1 registration path)")
 }
