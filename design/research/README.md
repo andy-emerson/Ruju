@@ -16,27 +16,33 @@ are meant to be worked from, not just read.
 
 ## Next session opens here
 
-**Thin-slice stage 2** (the second half of issue #11): an allocating
-compiled function, which forces decision D3's hardening — the
-**linear-memory shadow stack** (slot arena + `rj_gc_shadow_top` global,
-`Rooted`/`Frame` as veneers; research §6.2), the **region-base export**,
-and the exception-channel decision (§6.3). **Engine slices 3–5**
-(issues #3–#5, `research-subtype-engine.md` §6) are the parallel track —
-the M3 spine. The **paper-and-polish batch** (below) carries over,
-still timeboxed and unstarted.
+**Engine slices 3–5** (issues #3–#5, `research-subtype-engine.md` §6) are
+now the front of the queue — the M3 spine (intersection →
+`type_morespecific` → dispatch hardening), which is also what the `AOT`
+node waits on. Two carried-over small items to interleave: the
+**paper-and-polish batch** (below, still timeboxed and unstarted) and the
+**exception-channel decision** for compiled frames (research-aot-backend §6.3
+— a design decision for the human; nothing in the compiled vocabulary
+throws yet). **Thin-slice stage 3** (compiled→dispatch fallback calls) is
+optional polish on a proven pipeline — it can wait for the backend proper.
 
 *(Previous opener executed 2026-07-09:)*
 
-- ~~**The AOT thin slice**, stage 1 (issue #11)~~ — **GO** on every
+- ~~**The AOT thin slice**, stages 1–2 (issue #11)~~ — **GO** on every
   threshold: exact correctness incl. Int64 wrap-around, both call paths
   (specsig export + real dispatch driven by the pinned Julia's own lowering
   of `f(10)`, under GC stress), 401.8× the interpreter, 0.95×
-  native-Rust-in-wasm, fptr1 3.8µs vs interpreted 47.2µs per call. Evidence:
-  `implementation.md` (AOT section); the fixture pipeline doubles as the
-  D2a probe (the fetched pinned binary produced its own `code_ircode`
-  fixture; the stock-Julia `Compiler/`-as-package path stays unprobed,
-  recorded). The **paper-and-polish batch** was *not* reached — no long
-  waits materialized: a `design/` note on the language choice and threat
+  native-Rust-in-wasm, fptr1 3.8µs vs interpreted 47.2µs per call. Stage 2
+  landed D3's hardening — the **linear-memory shadow stack** (slot arena +
+  exported top cell; `Rooted`/`Frame` as veneers, one root set for both
+  fronts) and the **region-base export** — and a compiled allocating
+  function correct under a collection per allocation. The fixture pipeline
+  doubles as the D2a probe, and the named risk *materialized and was
+  caught*: a header-first layout assumption read garbage on first harness
+  contact (Ruju is tag-before-object) — evidence that the
+  whitelist-plus-harness regime does its job. Evidence: `implementation.md`
+  (AOT + GC sections). The **paper-and-polish batch** was *not* reached
+  in either stage: a `design/` note on the language choice and threat
   model (why manual rooting; what the stress test buys; the
   branded-lifetime alternative), `linguist-vendored` on `reference/julia/`
   in `.gitattributes`, and the pinned-Julia release relocation decision.

@@ -50,4 +50,20 @@ mod tests {
         bad.rettype = "Float64".into();
         assert!(emit::emit_module(&bad).is_err());
     }
+
+    const ALLOC_FIXTURE: &str = include_str!("../fixtures/g_refloop.json");
+
+    #[test]
+    fn emits_gcframe_for_allocating_function() {
+        let fx = Fixture::parse(ALLOC_FIXTURE).unwrap();
+        let bytes = emit::emit_module(&fx).unwrap(); // includes validation
+        let wat = wasmprinter::print_bytes(&bytes).unwrap();
+        // Allocation goes through the runtime; refs are rooted via the
+        // shadow-stack ABI; field reads hit linear memory directly.
+        assert!(wat.contains("rj_new_ref_int"), "no allocation import:\n{wat}");
+        assert!(wat.contains("rj_gc_shadow_top_addr"), "no gcframe ABI:\n{wat}");
+        assert!(wat.contains("rj_region_base"), "no region base:\n{wat}");
+        assert!(wat.contains("i64.load"), "no direct field read:\n{wat}");
+        assert!(wat.contains("i32.store"), "no root write-through:\n{wat}");
+    }
 }

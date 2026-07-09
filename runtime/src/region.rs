@@ -80,3 +80,10 @@ pub fn used() -> usize {
 pub(crate) fn ptr_mut<T>(off: Offset) -> *mut T {
     unsafe { (HEAP.buf.get() as *mut u8).add(off as usize) as *mut T }
 }
+
+/// The linear-memory address of region offset 0 (`rj_region_base` exports it):
+/// compiled code and hosts sharing the memory address heap objects as
+/// `base + offset`. Constant for the life of the instance.
+pub fn base_addr() -> u32 {
+    HEAP.buf.get() as u32
+}

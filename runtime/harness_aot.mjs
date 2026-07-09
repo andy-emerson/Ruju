@@ -6,6 +6,7 @@
 //
 //   cargo build -p ruju-runtime --target wasm32-unknown-unknown --release
 //   cargo run -p ruju-aotc -- aotc/fixtures/f_sumsq.json target/aot/f_sumsq.wasm
+//   cargo run -p ruju-aotc -- aotc/fixtures/g_refloop.json target/aot/g_refloop.wasm
 //   node runtime/harness_aot.mjs
 //
 // Benchmark size/repetitions: RUJU_AOT_BENCH_N (default 10^7),
@@ -31,22 +32,29 @@ const x = instance.exports;
 x.rj_init();
 
 // --- two-module linking (decision D2c): the compiled module imports the ---
-// --- runtime's memory and boxing entry points; the host wires them.     ---
-let compiledBytes;
-try {
-  compiledBytes = readFileSync(compiledPath);
-} catch {
-  console.error(
-    `harness_aot: ${compiledPath} missing — build it first:\n` +
-      "  cargo run -p ruju-aotc -- aotc/fixtures/f_sumsq.json target/aot/f_sumsq.wasm",
-  );
-  process.exit(1);
+// --- runtime's memory and its rj_ boundary; the host wires them.        ---
+const env = {
+  memory: x.memory,
+  rj_box_int: x.rj_box_int,
+  rj_unbox_int: x.rj_unbox_int,
+  rj_new_ref_int: x.rj_new_ref_int,
+  rj_gc_shadow_top_addr: x.rj_gc_shadow_top_addr,
+  rj_region_base: x.rj_region_base,
+};
+function instantiateCompiled(path, fixture) {
+  let bytes;
+  try {
+    bytes = readFileSync(path);
+  } catch {
+    console.error(
+      `harness_aot: ${path} missing — build it first:\n` +
+        `  cargo run -p ruju-aotc -- ${fixture} ${path}`,
+    );
+    process.exit(1);
+  }
+  return WebAssembly.instantiate(bytes, { env });
 }
-const cf = (
-  await WebAssembly.instantiate(compiledBytes, {
-    env: { memory: x.memory, rj_box_int: x.rj_box_int, rj_unbox_int: x.rj_unbox_int },
-  })
-).instance.exports;
+const cf = (await instantiateCompiled(compiledPath, "aotc/fixtures/f_sumsq.json")).instance.exports;
 
 // Sum of squares 1..n with Int64 wrap-around, in closed form.
 const sumsq = (n) => BigInt.asIntN(64, (n * (n + 1n) * (2n * n + 1n)) / 6n);
@@ -102,6 +110,53 @@ x.rj_gc_stress(0);
 x.rj_gc_collect();
 check("rj_root_count() balanced after compiled calls", x.rj_root_count(), 0);
 check("dispatch still sound after stress", loadLowered(callF), 385n);
+
+// --- stage 2: the allocating compiled function (gcframe emission) ---
+// g(n) = Ref-carrying loop: a fresh allocation per iteration with the live
+// ref held across it — the shape that proves compiled code roots through the
+// linear-memory shadow stack (decision D3).
+const cg = (
+  await instantiateCompiled(
+    resolve(root, "target", "aot", "g_refloop.wasm"),
+    "aotc/fixtures/g_refloop.json",
+  )
+).instance.exports;
+
+check("alloc specsig g(0)", cg.g(0n), 0n);
+check("alloc specsig g(1)", cg.g(1n), 1n);
+check("alloc specsig g(10)", cg.g(10n), 385n);
+check("alloc specsig g(10^5) [auto-GC churn]", cg.g(100000n), sumsq(100000n));
+
+// Interpreter agreement: the same loop over a source-defined mutable struct.
+const refLoopSrc = (n) =>
+  `mutable struct RR\nx::Int64\nend\nn = ${n}\nr = RR(0)\ni = 1\n` +
+  `while i <= n\nr = RR(r.x + i * i)\ni = i + 1\nend\nr.x`;
+for (const n of [0n, 10n, 1000n]) {
+  check(`interpreter (struct loop) agrees at n=${n}`, evalJulia(refLoopSrc(n)), cg.g(n));
+}
+
+// The rooting proof: a collection on *every* allocation. If the compiled
+// gcframe write-through is wrong, the live ref's cell is freed mid-loop and
+// the field reads come back corrupted.
+x.rj_gc_stress(1);
+check("alloc specsig g(50) under GC stress", cg.g(50n), sumsq(50n));
+x.rj_gc_stress(0);
+x.rj_gc_collect();
+check("shadow top balanced after compiled frames", x.rj_root_count(), 0);
+
+// Dispatch path for the allocating function, driven by the pinned Julia's
+// own lowering of `gref(10)`.
+const gfunc = x.rj_declare_generic(writeSource("gref"));
+const gsig = x.rj_tuple_type1(x.rj_builtin_type(T_INT64));
+const gptr1 = table.grow(1);
+table.set(gptr1, cg.g_boxed);
+x.rj_register_compiled(gfunc, gsig, gptr1);
+const callGref = readFileSync(resolve(root, "aotc", "fixtures", "call_gref_10.lowered"), "utf8");
+check("dispatch path: pre-lowered gref(10) -> compiled fptr1", loadLowered(callGref), 385n);
+x.rj_gc_stress(1);
+check("dispatch path (allocating) under GC stress", loadLowered(callGref), 385n);
+x.rj_gc_stress(0);
+check("roots balanced after stressed dispatch", x.rj_root_count(), 0);
 
 // --- the interpreted twin `g` (same body, defined through the real ---
 // --- pre-lowering pipeline) for the per-call-overhead comparison.  ---
@@ -166,5 +221,22 @@ console.log(
     `interpreted ${((tCallG / CALLS) * 1000).toFixed(1)}us over ${CALLS} calls`,
 );
 check("go/no-go: fptr1 call path <= interpreted call path", tCallF <= tCallG, true);
+
+// Allocating-loop throughput (info only — no stage-2 threshold): one
+// rj_new_ref_int call per iteration, so this measures the allocation
+// boundary and GC churn, not codegen.
+{
+  const t0 = performance.now();
+  const got = cg.g(1000000n);
+  const dt = performance.now() - t0;
+  check("alloc benchmark result", got, sumsq(1000000n));
+  const t1 = performance.now();
+  evalJulia(refLoopSrc(100000n));
+  const dtInterp = (performance.now() - t1) * 10; // scaled to the same n
+  console.log(
+    `info allocating loop at n=10^6: compiled ${dt.toFixed(1)} ms, ` +
+      `interpreted ~${dtInterp.toFixed(0)} ms (scaled from n=10^5)`,
+  );
+}
 
 console.log(process.exitCode ? "aot thin slice: FAILED" : "aot thin slice: OK");

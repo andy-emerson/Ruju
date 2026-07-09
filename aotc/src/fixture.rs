@@ -52,6 +52,12 @@ pub enum Node {
     /// An intrinsic call (the only call kind in the thin slice's vocabulary).
     #[serde(rename = "call")]
     Call { f: String, args: Vec<Operand> },
+    /// `Expr(:new, T, args...)` — allocation of a struct with literal type.
+    #[serde(rename = "new")]
+    New { t: String, args: Vec<Operand> },
+    /// `Core.getfield(obj, :field)` — a field read.
+    #[serde(rename = "getfield")]
+    GetField { obj: Operand, field: String },
     /// `goto dest if not cond` — falls through to the next block otherwise.
     #[serde(rename = "gotoifnot")]
     GotoIfNot { cond: Operand, dest: u32 },

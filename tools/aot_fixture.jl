@@ -13,8 +13,12 @@
 # kinds fail loudly: the thin slice's vocabulary is deliberately closed.
 
 function f(n); acc = 0; i = 1; while i <= n; acc += i*i; i += 1; end; acc; end
+function g(n); r = Ref(0); i = 1; while i <= n; r = Ref(r[] + i*i); i += 1; end; r[]; end
 
-const SOURCE = "function f(n); acc = 0; i = 1; while i <= n; acc += i*i; i += 1; end; acc; end"
+const FUNCS = Dict(
+    "f" => (f, "function f(n); acc = 0; i = 1; while i <= n; acc += i*i; i += 1; end; acc; end"),
+    "g" => (g, "function g(n); r = Ref(0); i = 1; while i <= n; r = Ref(r[] + i*i); i += 1; end; r[]; end"),
+)
 
 jstr(s) = "\"" * escape_string(string(s)) * "\""
 
@@ -33,9 +37,16 @@ function operand(x)
     error("unsupported operand kind: $(typeof(x)) = $(repr(x))")
 end
 
+# Inference lattice element -> plain type (PartialStruct etc. carry `typ`).
+widen(t) = t isa Type ? t : widen(getproperty(t, :typ))
+
 function statement(s)
     if s === nothing
         return """{"k":"nothing"}"""
+    elseif s isa Expr && s.head === :new
+        s.args[1] isa DataType || error(":new with non-literal type: $(repr(s.args[1]))")
+        args = join((operand(a) for a in s.args[2:end]), ",")
+        return """{"k":"new","t":$(jstr(s.args[1])),"args":[$args]}"""
     elseif s isa Core.PhiNode
         edges = join(Int.(s.edges), ",")
         vals = join((operand(s.values[i]) for i in eachindex(s.values)), ",")
@@ -53,6 +64,9 @@ function statement(s)
         callee = s.args[1]
         callee isa GlobalRef || error("non-GlobalRef callee: $(repr(callee))")
         fval = getglobal(callee.mod, callee.name)
+        if fval === Core.getfield && length(s.args) == 3 && s.args[3] isa QuoteNode
+            return """{"k":"getfield","obj":$(operand(s.args[2])),"field":$(jstr(s.args[3].value))}"""
+        end
         fval isa Core.IntrinsicFunction ||
             error("non-intrinsic callee: $(repr(callee)) :: $(typeof(fval))")
         args = join((operand(a) for a in s.args[2:end]), ",")
@@ -61,26 +75,30 @@ function statement(s)
     error("unsupported statement kind: $(typeof(s)) = $(repr(s))")
 end
 
-function emit(io, func, argtypes)
+function emit(io, func, argtypes, source)
     (ir, rt) = Base.code_ircode(func, argtypes)[1]
     println(io, "{")
     println(io, """  "format": "ruju-aotc-fixture-1",""")
     println(io, """  "julia": $(jstr(Base.VERSION)),""")
     println(io, """  "producer": "Base.code_ircode under the pinned Julia (tools/fetch-pinned-julia.sh)",""")
     println(io, """  "name": $(jstr(nameof(func))),""")
-    println(io, """  "source": $(jstr(SOURCE)),""")
+    println(io, """  "source": $(jstr(source)),""")
     println(io, """  "argtypes": [$(join(map(jstr, argtypes), ","))],""")
-    println(io, """  "rettype": $(jstr(rt)),""")
+    println(io, """  "rettype": $(jstr(widen(rt))),""")
     blocks = map(ir.cfg.blocks) do b
         """{"first":$(first(b.stmts)),"last":$(last(b.stmts)),"preds":[$(join(Int.(b.preds), ","))],"succs":[$(join(Int.(b.succs), ","))]}"""
     end
     println(io, """  "blocks": [\n    $(join(blocks, ",\n    "))\n  ],""")
     stmts = map(1:length(ir.stmts)) do i
         inst = ir.stmts[i]
-        """{"type":$(jstr(inst[:type])),"stmt":$(statement(inst[:stmt]))}"""
+        """{"type":$(jstr(widen(inst[:type]))),"stmt":$(statement(inst[:stmt]))}"""
     end
     println(io, """  "stmts": [\n    $(join(stmts, ",\n    "))\n  ]""")
     println(io, "}")
 end
 
-emit(stdout, f, (Int64,))
+let which = isempty(ARGS) ? "f" : ARGS[1]
+    haskey(FUNCS, which) || (println(stderr, "usage: aot_fixture.jl [f|g]"); exit(1))
+    (func, source) = FUNCS[which]
+    emit(stdout, func, (Int64,), source)
+end

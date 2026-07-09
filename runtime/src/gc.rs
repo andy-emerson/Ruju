@@ -27,19 +27,90 @@ const BIT_MARKED: u32 = 1;
 const BIT_OLD: u32 = 2;
 
 // --- shadow stack (roots) ---------------------------------------------------
+//
+// The slot arena lives in **linear memory with a byte-for-byte specified
+// layout**, so AOT-compiled code emits gcframes against it directly (decision
+// D3; `design/research/research-aot-backend.md` §6.2): the u32 cell at
+// [`shadow_top_addr`] holds the linear-memory address of the next free slot,
+// and every live slot below it is a u32 region offset (0 = empty, skipped by
+// the mark). A compiled prologue claims `n` slots by loading and bumping the
+// top; the epilogue restores it; [`Rooted`]/[`Frame`] are veneers over the
+// same arena, so interpreted and compiled code share one root set — the
+// analog of Julia's `jl_pgcstack` gcframe chain, flattened (there is no
+// machine stack to link through). Adaptation from the research sketch,
+// recorded: the top is a linear-memory cell rather than a mutable wasm
+// global — rustc cannot export one, and a cell is equally reachable (and
+// closer to `jl_pgcstack`, which is itself a memory location).
+
+/// Arena capacity. Exhaustion panics loudly (like region exhaustion) — the
+/// arena is bss, so size costs memory, not binary bytes.
+const SHADOW_SLOTS: usize = 16384;
 
 struct Shadow {
-    slots: UnsafeCell<Vec<Value>>,
+    /// Linear-memory address of the next free slot; 0 until first use
+    /// (lazily set to the arena base — statics' addresses are not const).
+    top: Cell<u32>,
+    slots: UnsafeCell<[u32; SHADOW_SLOTS]>,
 }
 // Sound only because the runtime is single-threaded under wasm32 for now.
 unsafe impl Sync for Shadow {}
 static SHADOW: Shadow = Shadow {
-    slots: UnsafeCell::new(Vec::new()),
+    top: Cell::new(0),
+    slots: UnsafeCell::new([0; SHADOW_SLOTS]),
 };
 
 #[inline]
-fn slots() -> &'static mut Vec<Value> {
-    unsafe { &mut *SHADOW.slots.get() }
+fn shadow_base() -> u32 {
+    SHADOW.slots.get() as u32
+}
+
+/// The linear-memory address of the shadow-stack top cell — the AOT gcframe
+/// ABI (`rj_gc_shadow_top_addr` exports it).
+pub fn shadow_top_addr() -> u32 {
+    ensure_shadow_init();
+    &SHADOW.top as *const Cell<u32> as u32
+}
+
+#[inline]
+fn ensure_shadow_init() {
+    if SHADOW.top.get() == 0 {
+        SHADOW.top.set(shadow_base());
+    }
+}
+
+/// Live slot count (the top cursor as an index).
+#[inline]
+fn top_index() -> usize {
+    ensure_shadow_init();
+    ((SHADOW.top.get() - shadow_base()) / 4) as usize
+}
+
+#[inline]
+fn set_top_index(i: usize) {
+    SHADOW.top.set(shadow_base() + (i as u32) * 4);
+}
+
+#[inline]
+fn slot_read(i: usize) -> Value {
+    Value(unsafe { (*SHADOW.slots.get())[i] })
+}
+
+#[inline]
+fn slot_write(i: usize, v: Value) {
+    unsafe {
+        (*SHADOW.slots.get())[i] = v.0;
+    }
+}
+
+/// Claim `n` zeroed slots, returning the base index.
+fn claim_slots(n: usize) -> usize {
+    let base = top_index();
+    assert!(base + n <= SHADOW_SLOTS, "shadow-stack overflow ({SHADOW_SLOTS} slots)");
+    for i in 0..n {
+        slot_write(base + i, Value::NULL);
+    }
+    set_top_index(base + n);
+    base
 }
 
 /// A RAII GC root. While alive, its [`Value`] occupies a slot on the shadow
@@ -52,35 +123,33 @@ pub struct Rooted {
 impl Rooted {
     /// Root `v`, pushing a slot onto the shadow stack.
     pub fn new(v: Value) -> Rooted {
-        let s = slots();
-        let index = s.len();
-        s.push(v);
+        let index = claim_slots(1);
+        slot_write(index, v);
         Rooted { index }
     }
 
     /// The currently rooted value.
     pub fn get(&self) -> Value {
-        slots()[self.index]
+        slot_read(self.index)
     }
 
     /// Replace the rooted value, e.g. after an allocation produces a new object.
     #[allow(dead_code)] // needed once nested allocation updates roots
     pub fn set(&self, v: Value) {
-        slots()[self.index] = v;
+        slot_write(self.index, v);
     }
 }
 
 impl Drop for Rooted {
     fn drop(&mut self) {
-        let s = slots();
-        debug_assert_eq!(self.index + 1, s.len(), "GC roots must be released LIFO");
-        s.pop();
+        debug_assert_eq!(self.index + 1, top_index(), "GC roots must be released LIFO");
+        set_top_index(self.index);
     }
 }
 
 /// The number of live roots on the shadow stack.
 pub fn root_count() -> usize {
-    slots().len()
+    top_index()
 }
 
 /// A contiguous block of GC roots — the analog of a Julia gcframe with several
@@ -95,20 +164,18 @@ pub struct Frame {
 impl Frame {
     /// Push a frame of `n` null-initialized root slots.
     pub fn new(n: usize) -> Frame {
-        let s = slots();
-        let base = s.len();
-        s.resize(base + n, Value::NULL);
+        let base = claim_slots(n);
         Frame { base, len: n }
     }
 
     /// Read slot `i` of the frame.
     pub fn get(&self, i: usize) -> Value {
-        slots()[self.base + i]
+        slot_read(self.base + i)
     }
 
     /// Write slot `i` of the frame.
     pub fn set(&self, i: usize, v: Value) {
-        slots()[self.base + i] = v;
+        slot_write(self.base + i, v);
     }
 
     /// Absolute shadow-stack index of slot `i`, for owners handing
@@ -125,14 +192,13 @@ impl Frame {
 /// bounds through here, so the *current* bounds are always rooted — the
 /// analog of the C rooting `vb.lb`/`vb.ub` with `JL_GC_PUSH` per frame.
 pub fn set_slot(index: usize, v: Value) {
-    slots()[index] = v;
+    slot_write(index, v);
 }
 
 impl Drop for Frame {
     fn drop(&mut self) {
-        let s = slots();
-        debug_assert_eq!(self.base + self.len, s.len(), "GC frames must be released LIFO");
-        s.truncate(self.base);
+        debug_assert_eq!(self.base + self.len, top_index(), "GC frames must be released LIFO");
+        set_top_index(self.base);
     }
 }
 
@@ -594,7 +660,9 @@ pub fn is_old(v: Value) -> bool {
 // --- mark and sweep ---------------------------------------------------------
 
 fn push_roots(work: &mut Vec<Value>) {
-    work.extend_from_slice(slots()); // shadow stack
+    for i in 0..top_index() {
+        work.push(slot_read(i)); // shadow stack (compiled + interpreted roots)
+    }
     let b = types::builtins();
     for &t in b.types.iter() {
         work.push(Value(t));

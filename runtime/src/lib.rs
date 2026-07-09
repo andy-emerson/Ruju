@@ -44,6 +44,7 @@ fn init_runtime() {
     module::init_main();
     install_methods();
     loader::install_prelude();
+    aot_bootstrap();
 }
 
 // Demo generic functions, installed at startup so the interpreter has something
@@ -241,6 +242,60 @@ pub extern "C" fn rj_declare_generic(len: u32) -> u32 {
 pub extern "C" fn rj_register_compiled(func: u32, sig: u32, fptr1: u32) {
     ensure_init();
     dispatch::add_compiled_method(func, sig as Offset, fptr1);
+}
+
+/// The runtime type the AOT boundary's `%new(Base.RefValue{Int64}, v)`
+/// allocates: a monomorphic mutable struct of the same name and layout (one
+/// inline `Int64` field). Parametric `RefValue` arrives with `base/`;
+/// the stand-in is recorded in `design/implementation.md` (AOT section).
+struct AotRefType(core::cell::Cell<Offset>);
+unsafe impl Sync for AotRefType {}
+static AOT_REF_TYPE: AotRefType = AotRefType(core::cell::Cell::new(0));
+
+fn aot_bootstrap() {
+    let t = types::define_struct_from_source(
+        "RefValue{Int64}",
+        &[("x", types::builtin(id::INT64))],
+        true,
+    )
+    .expect("RefValue{Int64} bootstrap");
+    AOT_REF_TYPE.0.set(t);
+}
+
+/// Allocate a fresh `RefValue{Int64}`-shaped cell holding `v` — the
+/// allocation entry the thin slice's stage-2 compiled code calls for `%new`
+/// of the 1-field Int64 ref (the inline-bits store path of `jl_new_structv`,
+/// `datatype.c:1675`; no re-checks — inference already typed the `:new`, as
+/// with upstream codegen). Allocates, and can therefore collect: the
+/// caller's live refs must sit in shadow-stack slots — the gcframe contract
+/// stage 2 exists to prove.
+#[no_mangle]
+pub extern "C" fn rj_new_ref_int(v: i64) -> u32 {
+    ensure_init();
+    let obj = object::alloc(AOT_REF_TYPE.0.get(), 8);
+    unsafe {
+        *object::data_ptr::<i64>(obj) = v;
+    }
+    obj.0
+}
+
+/// The linear-memory address of the shadow-stack top cell (decision D3): the
+/// u32 at this address holds the address of the next free root slot. A
+/// compiled prologue claims `n` slots by bumping it; the epilogue restores
+/// it; slots hold u32 region offsets (0 = empty). One arena serves compiled
+/// and interpreted code — `Rooted`/`Frame` are veneers over it.
+#[no_mangle]
+pub extern "C" fn rj_gc_shadow_top_addr() -> u32 {
+    gc::shadow_top_addr()
+}
+
+/// The linear-memory address of region offset 0, so compiled code addresses
+/// heap objects as `base + offset` (the "region base kept cheaply reachable"
+/// carry-forward, `design/roadmap.md`). Constant after `rj_init`.
+#[no_mangle]
+pub extern "C" fn rj_region_base() -> u32 {
+    ensure_init();
+    region::base_addr()
 }
 
 /// Toggle allocation-stress mode (a collection per allocation) — the

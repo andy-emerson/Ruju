@@ -585,7 +585,7 @@ strategy's "GC exactness & tuning" frontier item).**
 | Write barrier + remembered set | Done | Faithful | exact `jl_gc_wb` (`gc-wb-stock.h:14`) + `jl_gc_queue_root` (`gc-stock.c:1493`): fires on parent `== GC_OLD_MARKED` with child unMARKED; re-tag 3→1 is the at-most-once guard; remset cleared at mark start with entries restored to 3 and traced (`gc_queue_remset`, `:2828`), then **rebuilt** during marking — any scanned old object with a young-at-scan-time reference is re-pushed (`gc_mark_push_remset`, `:1613`, the `nptr == 0x3` rule). After a quick sweep, entries are put back in the *queued* state, `GC_MARKED` (`:3405–3414`), so the barrier cannot refire on them — slice 2's note claimed duplicates were "tolerated, as in the pin"; the pin in fact *prevents* barrier-after-scan duplicates via this re-queue (corrected, slice A). Full sweeps clear the remset outright (`:3415`). Slices 1–2 + tail A, 2026-06 |
 | Collection trigger | Partial | Faithful | proactive at the heap target, checked at allocation (`heap_size >= heap_target`, `gc-stock.c:356`); the target is live size + `overallocation` growth (`:3032–3050`, ported) floored at `default_collect_interval` scaled to the region (`:33–35`). Julia's MemBalancer rate machinery behind `target_allocs` omitted (GC tail slice A, 2026-06); exhaustion collect-and-retry remains the backstop |
 | Full-vs-quick policy | Done | Faithful | the pin's predicates (`gc-stock.c:3377–3400`): full next when promoted bytes since the last full sweep exceed 0.15 of the heap, or the heap outgrew the post-full baseline by `overallocation`; `user_max`/`under_pressure` omitted — no CLI options (GC tail slice A, 2026-06) |
-| Shadow-stack rooting (`gcframe`) | Done | Faithful | plus an allocation-stress test mode (`gc::set_stress` — a collection per allocation) as the rooting-discipline enforcement vehicle (engine slice 1, 2026-07) |
+| Shadow-stack rooting (`gcframe`) | Done | Faithful | **moved to a linear-memory slot arena** (decision D3, thin-slice stage 2, 2026-07-09): a fixed arena of u32 region-offset slots + a top cell whose address `rj_gc_shadow_top_addr` exports — byte-for-byte specified, so compiled code emits gcframes directly (prologue bumps the top, write-through on ref sets, epilogue restores); `Rooted`/`Frame` are veneers over the same arena, one root set for both execution fronts (the `jl_pgcstack` analog, flattened — no machine stack to link). Adaptation recorded: the top is a memory cell, not a mutable wasm global (rustc cannot export one; a cell is equally reachable and closer to `jl_pgcstack`). Overflow is a loud panic (16384 slots, bss). Plus the allocation-stress mode (`gc::set_stress` — a collection per allocation) as the rooting-discipline enforcement vehicle (engine slice 1, 2026-07) |
 | Machine-stack scanning | n/a | **Divergence** | impossible in WASM; the shadow stack is *mandatory* instead |
 | Safepoints | Partial | Faithful | trivial (single-threaded); multithreaded protocol later |
 | Finalizers | Planned | Faithful | includes `mark_reset_age` (`gc-stock.c:3165–3172`): objects reachable only from `to_finalize` are reset as-if-new — finalizer-only machinery, lands here |
@@ -719,7 +719,7 @@ verify; the following simplifications were live but unrecorded.
 
 ## AOT backend (Phase 1) — replaces removed `codegen.cpp`/`jitlayers.cpp`
 
-**Thin slice (issue #11) landed 2026-07-09 — GO.** The pin carries no JIT to
+**Thin slice (issue #11) stages 1–2 landed 2026-07-09 — GO.** The pin carries no JIT to
 port (no `codegen.cpp`/`jitlayers.cpp` in the vendored subset), so the backend
 is a recorded divergence whose faithfulness targets are *behavior* (Julia
 semantics at the IR level) and upstream's compilation architecture where it
@@ -766,10 +766,31 @@ dispatch path → benchmarked past every go/no-go threshold.
   **0.95× native-Rust-in-wasm** (≤3×), fptr1 dispatch calls 3.8µs vs the
   interpreted twin's 47.2µs (`g`, same body through the pre-lowering
   pipeline).
+- **Stage 2 — the allocating compiled function** (2026-07-09):
+  `g(n) = (r = Ref(0); loop: r = Ref(r[] + i*i))` — the fully-optimized
+  pinned IR *keeps* the loop-carried allocation (SROA cannot scalarize it),
+  so the fixture is the production pipeline's own output, no
+  `optimize_until` needed. Vocabulary grew by `:new` (of the 1-field Int64
+  ref → the imported `rj_new_ref_int`) and `getfield` (→
+  `i64.load(region_base + ref)`, tag-before-object layout). **Gcframe
+  emission**: one shadow-stack slot per ref-typed statement local; prologue
+  claims/zeroes/bumps via the exported top cell, every ref-local set writes
+  through to its slot, every return restores the top. Verified: exact
+  through auto-GC churn (10⁵–10⁶ allocations), exact under a collection per
+  allocation, dispatch path exact under stress, shadow top balanced after.
+  Runtime type for the `%new`: a bootstrap **`RefValue{Int64}` stand-in**
+  (`define_struct_from_source`, same name/layout: one inline Int64 field) —
+  parametric `RefValue` arrives with `base/` (recorded divergence).
+  **The named D2a risk materialized and was caught here**: the first draft
+  read fields at `offset + 8`, assuming header-first layout — Ruju is
+  tag-before-object (`jl_taggedvalue_t`), data at +0 — and the harness
+  returned region offsets as "field values" on first contact. Layout facts
+  must come from the runtime's object model, never assumption; at scale this
+  resolution moves into the backend querying the type registry.
 
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
-| IR → code (thin-slice vocabulary) | Partial | **Divergence** | Julia JITs via LLVM; Ruju compiles at build time to WASM. Landed: the fixture producer/parser, Beyond-Relooper, specsig + fptr1 emission, validation, the whitelisted intrinsic vocabulary. Slice 2 (next): an allocating compiled function — forces the linear-memory shadow stack + gcframe emission and the exception-channel decision (one mechanism shared with the interpreter's `Err` channel). Slice 3: compiled→dispatch fallback calls (abstract argtypes → `rj_dispatch`). Then: the durable serialization producer, `wasm-merge` single-module packaging |
+| IR → code (thin-slice vocabulary) | Partial | **Divergence** | Julia JITs via LLVM; Ruju compiles at build time to WASM. Landed: the fixture producer/parser, Beyond-Relooper, specsig + fptr1 emission, validation, the whitelisted intrinsic vocabulary; stage 2 added `:new`/`getfield` for the 1-field Int64 ref and **gcframe emission** against the linear-memory shadow stack. Remaining: stage 3 — compiled→dispatch fallback calls (abstract argtypes → `rj_dispatch`); the **exception channel** for compiled frames (an open design decision — must be one mechanism shared with the interpreter's `Err` channel; nothing in the current vocabulary throws); field-offset resolution from the type registry (hard-coded for the ref's single field now); the durable serialization producer; `wasm-merge` single-module packaging |
 | Calling convention (fptr1/specsig) | Partial | Faithful | the pin's `CodeInstance` two-entry-point design (`julia.h:460–461`): boxed jlcall wrapper + native-signature specsig; argv is a rooted slice of boxed-value offsets in linear memory (the Rust heap *is* linear memory; caller keeps args rooted) |
 
 ## Platform, profiling & support — `dlload.c`, `sys.c`, `timing.c`, `src/support/`
