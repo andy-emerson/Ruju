@@ -460,6 +460,65 @@ const cases = [
     const N = tvar();
     return [Tuple(), where(N, Tuple(VarargTV(Any, N)))];
   }],
+
+  // --- the Intersect meet node + concrete propagation (engine slice 4,
+  // --- 2026-07): the diagonal family whose bounds cross a union arm
+  // --- (Float64 for String), the cross-bounded existentials from test_3
+  // --- (Box for Ptr; bare Ptr spells `Box{X} where X`), and the
+  // --- abstract-lower-bound guard on diagonal concreteness. ---
+  ["L110 !issub(Tuple{Real,Real}, @UnionAll T<:Real Tuple{T,T})", "notsub", () => {
+    const T = tvar(0, Real);
+    return [Tuple(Real, Real), where(T, Tuple(T, T))];
+  }],
+  ["L115 issub_strict(Tuple{String,Real,Ref{Number}}, @UnionAll T Tuple{Union{T,String},T,Ref{T}})", "strict", () => {
+    const T = tvar();
+    return [Tuple(Float64, Real, Ref(Number)), where(T, Tuple(Union(T, Float64), T, Ref(T)))];
+  }],
+  ["L118 issub_strict(Tuple{String,Real}, @UnionAll T Tuple{Union{T,String},T})", "strict", () => {
+    const T = tvar();
+    return [Tuple(Float64, Real), where(T, Tuple(Union(T, Float64), T))];
+  }],
+  ["L121 !issub(Tuple{Real,Real}, @UnionAll T Tuple{Union{T,String},T})", "notsub", () => {
+    const T = tvar();
+    return [Tuple(Real, Real), where(T, Tuple(Union(T, Float64), T))];
+  }],
+  ["L124 issub_strict(Tuple{Int,Int}, @UnionAll T Tuple{Union{T,String},T})", "strict", () => {
+    const T = tvar();
+    return [Tuple(Int, Int), where(T, Tuple(Union(T, Float64), T))];
+  }],
+  ["L141 isequal_type(Tuple{Vararg{A}} where A>:Integer, Tuple{Vararg{A}} where A>:Integer)", "equal", () => {
+    const A1 = tvar(Integer, 0);
+    const A2 = tvar(Integer, 0);
+    return [where(A1, Tuple(Vararg(A1))), where(A2, Tuple(Vararg(A2)))];
+  }],
+  ["L338 issub_strict(@UnionAll T>:Ptr @UnionAll Ptr<:S<:Ptr Tuple{Ptr{T},Ptr{S}}, @UnionAll T>:Ptr @UnionAll S>:Ptr{T} Tuple{Ptr{T},Ptr{S}})", "strict", () => {
+    const ptrBare = () => {
+      const X = tvar();
+      return where(X, Ref(X));
+    };
+    const T1 = tvar(ptrBare(), 0);
+    const S1 = tvar(ptrBare(), ptrBare());
+    const T2 = tvar(ptrBare(), 0);
+    const S2 = tvar(Ref(T2), 0);
+    return [
+      where(T1, where(S1, Tuple(Ref(T1), Ref(S1)))),
+      where(T2, where(S2, Tuple(Ref(T2), Ref(S2)))),
+    ];
+  }],
+  ["L340 !issub(@UnionAll T>:Ptr @UnionAll S>:Ptr Tuple{Ptr{T},Ptr{S}}, @UnionAll T>:Ptr @UnionAll Ptr{T}<:S<:Ptr Tuple{Ptr{T},Ptr{S}})", "notsub", () => {
+    const ptrBare = () => {
+      const X = tvar();
+      return where(X, Ref(X));
+    };
+    const T1 = tvar(ptrBare(), 0);
+    const S1 = tvar(ptrBare(), 0);
+    const T2 = tvar(ptrBare(), 0);
+    const S2 = tvar(Ref(T2), ptrBare());
+    return [
+      where(T1, where(S1, Tuple(Ref(T1), Ref(S1)))),
+      where(T2, where(S2, Tuple(Ref(T2), Ref(S2)))),
+    ];
+  }],
 ];
 
 // Known divergences (currently none — the union-decision machine healed both

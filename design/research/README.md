@@ -16,24 +16,32 @@ are meant to be worked from, not just read.
 
 ## Next session opens here
 
-**Engine slices 4–5** (issues #4–#5, `research-subtype-engine.md` §6):
-slice 4 (the `Intersect` meet node + `concrete` propagation — verified by
-*targeted new* oracle cases from `test_3`'s cross-bounded existentials, no
-existing case needs it) and slice 5 (`envout` — the doorway to
-`jl_type_intersection` and the M3 spine, verified via a new
-`rj_subtype_env` ABI). Slice 3 landed 2026-07-09 (below). Carried-over
-interleaves: the **paper-and-polish batch** (still timeboxed, unstarted),
-the **exception-channel decision** (#14, the human's call), and
-**thin-slice stage 3** (#13, optional polish).
+**Engine slice 5** (issue #5, `research-subtype-engine.md` §6): `envout` —
+the computed bounds of right-side variables handed to callers, the doorway
+to `jl_type_intersection` and the M3 spine (intersection →
+`type_morespecific` → dispatch hardening). Verified via a new
+`rj_subtype_env` ABI + cases mirroring `jl_subtype_matching`; the subtype
+oracle must stay bit-identical. Carried-over interleaves: the
+**paper-and-polish batch** (still timeboxed, unstarted), the
+**exception-channel decision** (#14, the human's call), and **thin-slice
+stage 3** (#13, optional polish).
 
-*(Executed 2026-07-09, second increment:)*
+*(Executed 2026-07-09, second and third increments:)*
 
 - ~~**Engine slice 3**~~ — the vararg length algebra: the `Loffset`
   channel, typevar-count `Vararg{T,N}` (the `BOUND` kind), the full
   four-kind tuple length classification, `check_vararg_length`, the
   N-equation, the ∃-var-left unwrap guard, and finding 23's expansion
-  guard. Oracle 120→**126/126** (the `NTuple` tranche, `test/subtype.jl:70,
+  guard. Oracle 120→126 (the `NTuple` tranche, `test/subtype.jl:70,
   79–80, 85–86, 632`), all on the first run after the port.
+- ~~**Engine slice 4**~~ — the `Intersect` meet node (#61917): exact
+  existential upper bounds through the three-mode `simple_meet`, the
+  `x <: a ∩ b` rule, `widen_intersect` at the escape point (its consumer
+  is slice 5's envout), and the `concrete` cross-variable propagation
+  (finding 15's tail). Oracle 126→**134/134** (the diagonal-through-union
+  family `:110–124`, the abstract-lower-bound guard `:141`, and `test_3`'s
+  cross-bounded existentials `:338–341`), plus pinned-Julia-verified
+  native cases for the propagation itself.
 
 *(Previous opener executed 2026-07-09:)*
 

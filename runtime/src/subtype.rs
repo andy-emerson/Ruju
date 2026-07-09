@@ -93,6 +93,12 @@ struct VarBinding {
     /// The variable must be integer-valued — it occurs as `N` in `Vararg{_,N}`
     /// (`intvalued`, `subtype.c:94`; set by `subtype_tuple_varargs`).
     intvalued: bool,
+    /// Another variable's diagonal constraint forces this one concrete
+    /// (`concrete`, `subtype.c:85`; set through the binding of a diagonal
+    /// variable's typevar lower bound, `:1411–1415`, and consumed at this
+    /// binding's own pop). Like `intvalued`, not part of the C's saved-env
+    /// record — restores preserve it.
+    concrete: bool,
     /// Maximum positive vararg-length offset seen (`max_offset`,
     /// `subtype.c:86–87`); `-1` once the variable occurs outside a vararg-`N`
     /// slot. Bookkeeping the pin's intersection consumes; carried in the env
@@ -318,11 +324,17 @@ fn re_save_vars(e: &Env, saved: &mut SavedVars) {
 
 /// Restore the environment to a snapshot taken at the same binding depth
 /// (`restore_env`), re-syncing each binding's live bounds mirror and the
-/// right-union bit cursor.
+/// right-union bit cursor. `concrete` and `intvalued` are *not* part of the
+/// C's saved record (`jl_savedenv_t` carries bounds + the four counters,
+/// `subtype.c:319–320`) — they persist through restores, so the live values
+/// are kept.
 fn restore_vars(e: &mut Env, saved: &SavedVars) {
-    e.vars.clear();
-    e.vars.extend_from_slice(&saved.vars);
-    for b in &e.vars {
+    debug_assert_eq!(e.vars.len(), saved.vars.len());
+    for (b, s) in e.vars.iter_mut().zip(saved.vars.iter()) {
+        let (concrete, intvalued) = (b.concrete, b.intvalued);
+        *b = *s;
+        b.concrete = concrete;
+        b.intvalued = intvalued;
         gc::set_slot(b.root_base, Value(b.lb));
         gc::set_slot(b.root_base + 1, Value(b.ub));
     }
@@ -446,6 +458,16 @@ fn sub(mut x: Offset, mut y: Offset, e: &mut Env, param: Param) -> bool {
         }
     }
 
+    // An internal `Intersect` meet node is only ever produced as an
+    // existential upper bound, so it can appear on the right (`x <: a ∩ b`)
+    // but never on the left (`subtype.c:1948–1961`).
+    debug_assert!(!types::is_intersect(x), "Intersect can only appear on the right");
+    if types::is_intersect(y) {
+        // `x <: a ∩ b`  iff  `x <: a` and `x <: b` (dual to Union-left).
+        return sub(x, types::intersect_a(y), e, param)
+            && sub(x, types::intersect_b(y), e, param);
+    }
+
     // Type variables, handled before the ground cases (as in subtype.c).
     if types::is_typevar(x) {
         if types::is_typevar(y) {
@@ -564,6 +586,7 @@ fn subtype_unionall(t: Offset, u: Offset, e: &mut Env, r: bool, param: Param) ->
         body_occurs_inv: var_occurs_invariant(body, var, false),
         depth0: e.invdepth,
         intvalued: false,
+        concrete: false,
         max_offset: 0,
         root_base: mirror.slot_index(0),
     });
@@ -573,19 +596,42 @@ fn subtype_unionall(t: Offset, u: Offset, e: &mut Env, r: bool, param: Param) ->
         sub(body, t, e, param)
     };
 
-    // The diagonal rule: a variable occurring more than once and only in
-    // covariant position (never invariantly in the body) is constrained to
-    // concrete types, so its inferred lower bound must be a leaf type. E.g.
-    // `Tuple{Int,Int} <: Tuple{T,T} where T` but not `Tuple{Int,Float64} <: ...`.
+    // The diagonal rule (`subtype.c:1400–1420`): a variable occurring more
+    // than once and only in covariant position (never invariantly in the
+    // body) is constrained to concrete types, so its inferred lower bound
+    // must be a leaf type. E.g. `Tuple{Int,Int} <: Tuple{T,T} where T` but
+    // not `Tuple{Int,Float64} <: ...`. A variable another variable's
+    // diagonal constraint marked `concrete` faces the same bar at its own
+    // pop, even without being diagonal itself.
     let vb = e.vars[idx];
     let cov = vb.occurs_cov.max(vb.cov_diag); // cov_count
     let diagonal = cov > 1 && !vb.body_occurs_inv;
-    // A typevar lower bound does not reject: each value of the referenced
-    // (universal) variable is a single type, so the diagonal is satisfied.
-    // Julia additionally propagates `concrete = 1` to that variable's binding —
-    // the cross-var propagation `design/implementation.md` records as missing.
-    if ans && diagonal && is_leaf_typevar(var) && !types::is_typevar(vb.lb) && !is_leaf_bound(vb.lb) {
-        ans = false;
+    if ans && (vb.concrete || (diagonal && is_leaf_typevar(var))) {
+        if vb.concrete && !diagonal && !is_leaf_bound(vb.ub) {
+            // A non-diagonal var can only be a subtype of a diagonal var if
+            // its upper bound is concrete (`:1406–1410`).
+            ans = false;
+        } else if types::is_typevar(vb.lb) {
+            // A typevar lower bound does not reject — each value of the
+            // referenced (universal) variable is a single type — but the
+            // concreteness constraint propagates to that variable's binding
+            // (`:1411–1415`; closes the tail of audit finding 15).
+            if let Some(j) = e.lookup(vb.lb) {
+                e.vars[j].concrete = true;
+            }
+        } else if !is_leaf_bound(vb.lb) {
+            ans = false;
+        }
+    }
+
+    // An internal `Intersect` meet node is exact for subtyping but must not
+    // appear in a result type (`subtype.c:1428–1433`); it only ever occurs
+    // as the top layer of an existential `ub`. Nothing consumes the popped
+    // bound yet — the write-through keeps the placement (and the widened
+    // value's rooting) correct for the envout fill that lands with slice 5.
+    if ans && types::is_intersect(e.vars[idx].ub) {
+        let widened = widen_intersect(e.vars[idx].ub);
+        e.set_ub(idx, widened);
     }
 
     e.vars.pop();
@@ -714,7 +760,11 @@ fn var_lt(a: Offset, e: &mut Env, idx: usize, param: Param) -> bool {
     if !ccheck(bb.lb, a, e) {
         return false; // lower bound must already satisfy the constraint
     }
-    let m = simple_meet(e.vars[idx].ub, a);
+    // `simple_meet` in exact mode: when neither `ub` nor `a` subsumes the
+    // other, the bound becomes an `Intersect{ub, a}` node rather than
+    // over-approximating to one side, which would let `b` escape its
+    // declared range (`subtype.c:1059–1066`, #61917).
+    let m = simple_meet(e.vars[idx].ub, a, 1);
     e.set_ub(idx, m);
     true
 }
@@ -890,6 +940,9 @@ fn is_leaf_typevar(var: Offset) -> bool {
 fn is_leaf_bound(v: Offset) -> bool {
     if v == types::builtin(id::BOTTOM) {
         return true;
+    }
+    if types::is_intersect(v) {
+        return false; // an internal meet node is never a concrete leaf (`:1142`)
     }
     if types::is_datatype(v) {
         if types::is_abstract(v) {
@@ -1635,24 +1688,210 @@ fn is_existential_typevar(x: Offset, e: &Env) -> bool {
 /// (subtype-path bias), since there is no `Intersect` node. Crucially, the
 /// ground check uses a *fresh* environment, so it never narrows the existential
 /// variables of the live query.
-fn simple_meet(a: Offset, b: Offset) -> Offset {
+fn simple_meet(a: Offset, b: Offset, overesi: u8) -> Offset {
     let any = types::builtin(id::ANY);
     let bottom = types::builtin(id::BOTTOM);
-    if a == any || b == bottom || a == b {
+    if a == any || b == bottom || obviously_egal(a, b) {
         return b;
     }
     if b == any || a == bottom {
         return a;
     }
-    if !types::is_typevar(a) && !types::is_typevar(b) {
-        if types::issubtype(a, b) {
+    if overesi == 1 && (types::is_intersect(a) || types::is_intersect(b)) {
+        // One operand is already an internal meet node: represent the
+        // combined meet exactly by nesting (`subtype.c:765–768`).
+        return types::intersect_type(a, b);
+    }
+    if !is_type_or_typevar(a) || !is_type_or_typevar(b) {
+        return bottom; // distinct non-type values (equal ones were egal above)
+    }
+    // The C's kind/TypeEq arms (`:771–774`), phrased on our `Type{T}`:
+    // `Kind ∩ Type{X}` where `typeof(X)` is that kind is `Type{X}`.
+    if types::is_kind(a)
+        && types::is_type_type(b)
+        && crate::object::type_of(Value(types::svec_ref(types::parameters_of(b), 0))) == a
+    {
+        return b;
+    }
+    if types::is_kind(b)
+        && types::is_type_type(a)
+        && crate::object::type_of(Value(types::svec_ref(types::parameters_of(a), 0))) == b
+    {
+        return a;
+    }
+    if types::is_typevar(a) && obviously_egal(b, types::tvar_ub(a)) {
+        return a;
+    }
+    if types::is_typevar(b) && obviously_egal(a, types::tvar_ub(b)) {
+        return b;
+    }
+    simple_intersect(a, b, overesi)
+}
+
+/// `jl_is_type(t) || jl_is_typevar(t)` — the operands `simple_meet` can
+/// analyze (everything else is a value, whose meet with anything unequal
+/// is empty).
+fn is_type_or_typevar(t: Offset) -> bool {
+    types::is_datatype(t) || types::is_union(t) || types::is_unionall(t) || types::is_typevar(t)
+}
+
+/// `simple_intersect` (`jltypes.c:864–979`), faithful-partial. Flatten both
+/// unions (UnionAlls deliberately not unwrapped); drop components disjoint
+/// from everything on the other side (our disjointness evidence is
+/// [`obviously_disjoint`] alone — the C additionally consults full
+/// intersection emptiness for ground pairs; weaker evidence only means less
+/// simplification, never a wrong answer, because the fallout is an exact
+/// `Intersect` node or a legal over-approximation); then decide by
+/// componentwise subtyping — full `issubtype` standing in for the C's
+/// typevar-aware `simple_subtype2`, the same recorded substitution as the
+/// union-normalization dedup (audit finding 7) — whether one side subsumes
+/// the other.
+fn simple_intersect(a: Offset, b: Offset, overesi: u8) -> Offset {
+    let bottom = types::builtin(id::BOTTOM);
+    let mut comps: Vec<Offset> = Vec::new();
+    flatten_union(a, &mut comps);
+    let nta = comps.len();
+    flatten_union(b, &mut comps);
+    let nt = comps.len();
+
+    // 1. A component disjoint from every component of the other side is dead.
+    let mut alive = vec![false; nt];
+    for i in 0..nta {
+        for j in nta..nt {
+            if (!alive[i] || !alive[j]) && !obviously_disjoint(comps[i], comps[j]) {
+                alive[i] = true;
+                alive[j] = true;
+            }
+        }
+    }
+    // 2. Componentwise subtyping: stemp[k] = -1 (strictly above some
+    // other-side component), 1 (equal to one), 2 (strictly below one).
+    let mut stemp = vec![0i8; nt];
+    let mut all_disjoint = true;
+    for i in 0..nta {
+        if !alive[i] {
+            continue;
+        }
+        all_disjoint = false;
+        for j in nta..nt {
+            if !alive[j] {
+                continue;
+            }
+            let subab = types::issubtype(comps[i], comps[j]);
+            let subba = types::issubtype(comps[j], comps[i]);
+            if subba && !subab {
+                stemp[i] = -1;
+                if stemp[j] >= 0 {
+                    stemp[j] = 2;
+                }
+            } else if subab && !subba {
+                stemp[j] = -1;
+                if stemp[i] >= 0 {
+                    stemp[i] = 2;
+                }
+            } else if subab && subba {
+                if stemp[i] == 0 {
+                    stemp[i] = 1;
+                }
+                if stemp[j] == 0 {
+                    stemp[j] = 1;
+                }
+            }
+        }
+    }
+    let mut subs = [true, true];
+    let mut rs = [true, true];
+    if !all_disjoint {
+        for k in 0..nt {
+            let side = (k >= nta) as usize;
+            subs[side] &= !alive[k] || stemp[k] > 0;
+            rs[side] &= alive[k] && stemp[k] > 0;
+        }
+        // Every component of one side sits at-or-below the other: that side
+        // *is* the meet.
+        if rs[0] {
             return a;
         }
-        if types::issubtype(b, a) {
+        if rs[1] {
             return b;
         }
     }
-    b
+    if all_disjoint || (overesi == 0 && !subs[0] && !subs[1]) {
+        return bottom;
+    }
+    if !subs[0] && !subs[1] && overesi == 1 {
+        // Neither side subsumes the other and they are not provably
+        // disjoint: the meet is not expressible as a single existing type.
+        // Keep it exact as `Intersect{a, b}` rather than over-approximating
+        // to one side, which would silently drop the other (#61917).
+        return types::intersect_type(a, b);
+    }
+    // One side's surviving components all sit below the other — union them —
+    // or over-approximate (mode 2): strictly-below `a` components plus all
+    // surviving `b` components (`jl_typeintersect` may over-approximate, so
+    // this is sound).
+    let keep: Vec<Offset> = if subs[0] {
+        (0..nta).filter(|&k| alive[k]).map(|k| comps[k]).collect()
+    } else if subs[1] {
+        (nta..nt).filter(|&k| alive[k]).map(|k| comps[k]).collect()
+    } else {
+        (0..nt)
+            .filter(|&k| alive[k] && stemp[k] >= if k < nta { 2 } else { 0 })
+            .map(|k| comps[k])
+            .collect()
+    };
+    if keep.is_empty() {
+        return bottom;
+    }
+    // The C isorts and right-nests without re-deduping; we rebuild through
+    // the normalized union constructor — consistent with our union model
+    // (recorded with finding 7's family).
+    types::union_of(&keep)
+}
+
+/// Flatten a union spine into its non-union components (`flatten_type_union`
+/// without the `UnionAll` unwrap, as `simple_intersect` requires).
+fn flatten_union(t: Offset, out: &mut Vec<Offset>) {
+    if types::is_union(t) {
+        flatten_union(types::union_a(t), out);
+        flatten_union(types::union_b(t), out);
+    } else {
+        out.push(t);
+    }
+}
+
+/// A conservative subset of the C's `obviously_disjoint`: `true` only when
+/// the two types provably share no instance. Nominal single inheritance
+/// makes incomparable ground non-tuple, non-`Type{}` datatypes disjoint —
+/// a common subtype's supertype chain would have to pass through both.
+/// Tuples (covariant), `Type{}`s, typevars, `UnionAll`s, and anything with
+/// free typevars conservatively report `false`.
+fn obviously_disjoint(x: Offset, y: Offset) -> bool {
+    if x == y || !types::is_datatype(x) || !types::is_datatype(y) {
+        return false;
+    }
+    if types::is_tuple(x) || types::is_tuple(y) || types::is_type_type(x) || types::is_type_type(y)
+    {
+        return false;
+    }
+    if has_free_typevars(x) || has_free_typevars(y) {
+        return false;
+    }
+    !types::issubtype(x, y) && !types::issubtype(y, x)
+}
+
+/// Over-approximate an internal `Intersect` spine by a real type
+/// (`widen_intersect`, `subtype.c:786–800`), so it cannot escape subtyping
+/// into a result type: peel recursively, re-meeting in mode 2.
+fn widen_intersect(t: Offset) -> Offset {
+    if !types::is_intersect(t) {
+        return t;
+    }
+    let a = widen_intersect(types::intersect_a(t));
+    let _ra = Rooted::new(Value(a));
+    let b = widen_intersect(types::intersect_b(t));
+    let _rb = Rooted::new(Value(b));
+    simple_meet(a, b, 2)
 }
 
 /// Least upper bound (`simple_join`, `simple_union`). Defers to the normalized
@@ -1701,6 +1940,11 @@ fn obviously_egal(a: Offset, b: Offset) -> bool {
         return obviously_egal(types::union_a(a), types::union_a(b))
             && obviously_egal(types::union_b(a), types::union_b(b));
     }
+    if types::is_intersect(a) && types::is_intersect(b) {
+        // The meet node shares the union pair's structural arm (`subtype.c:520`).
+        return obviously_egal(types::intersect_a(a), types::intersect_a(b))
+            && obviously_egal(types::intersect_b(a), types::intersect_b(b));
+    }
     if types::is_unionall(a) && types::is_unionall(b) {
         return types::unionall_var(a) == types::unionall_var(b)
             && obviously_egal(types::unionall_body(a), types::unionall_body(b));
@@ -1716,6 +1960,11 @@ fn obviously_egal(a: Offset, b: Offset) -> bool {
         return na != NULL
             && nb != NULL
             && crate::builtins::egal(crate::object::Value(na), crate::object::Value(nb));
+    }
+    // The C's tail (`subtype.c:538`): non-type values compare by egal — two
+    // equal boxed vararg lengths are obviously egal.
+    if types::is_boxed_long(a) && types::is_boxed_long(b) {
+        return unbox_long(a) == unbox_long(b);
     }
     false
 }
@@ -1758,6 +2007,12 @@ fn has_free_var_where(
         }
         let n = types::vararg_num(t);
         return n != NULL && has_free_var_where(n, bound, pred);
+    }
+    if types::is_intersect(t) {
+        // A meet node can carry typevars in either operand (it appears in
+        // existential upper bounds, which `has_existential_typevar` walks).
+        return has_free_var_where(types::intersect_a(t), bound, pred)
+            || has_free_var_where(types::intersect_b(t), bound, pred);
     }
     if types::is_unionall(t) {
         let v = types::unionall_var(t);

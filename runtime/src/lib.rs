@@ -1175,6 +1175,38 @@ mod tests {
     }
 
     #[test]
+    fn concrete_propagation_through_typevar_lower_bounds() {
+        // Engine slice 4's `concrete` flag (`subtype.c:1405–1420`): a
+        // diagonal variable whose lower bound is a typevar propagates the
+        // concreteness constraint to *that* variable's binding, which then
+        // faces the leaf-bound bar at its own pop. Expected answers verified
+        // against the pinned Julia binary (not test/subtype.jl — recorded):
+        //   (Tuple{S,S} where S<:Int)            <: (Tuple{T,T} where T)  — true
+        //   (Tuple{S,S} where Integer<:S<:Real)  <: (Tuple{T,T} where T)  — false
+        //   (Tuple{S,Int} where S<:Int)          <: (Tuple{T,T} where T)  — true
+        //   (Tuple{S,Real} where S<:Real)        <: (Tuple{T,T} where T)  — false
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+        let (int, integer, real, any, bot) =
+            (t(types::id::INT64), t(types::id::INTEGER), t(types::id::REAL), t(types::id::ANY), t(types::id::BOTTOM));
+        let sub = |a, b| types::issubtype(a, b);
+        let diag = |lb, ub, second: Option<Offset>| {
+            let s = types::make_typevar("S", lb, ub);
+            let body = types::tuple_type(&[s, second.unwrap_or(s)]);
+            let lhs = types::unionall_type(s, body);
+            let tv = types::make_typevar("T", bot, any);
+            let rhs = types::unionall_type(tv, types::tuple_type(&[tv, tv]));
+            sub(lhs, rhs)
+        };
+        assert!(diag(bot, int, None), "S<:Int is concrete-satisfiable");
+        assert!(!diag(integer, real, None), "abstract-lower-bounded S is not");
+        assert!(diag(bot, int, Some(int)), "S<:Int against a ground Int");
+        assert!(!diag(bot, real, Some(real)), "S<:Real against a ground Real");
+        assert_eq!(gc::root_count(), 0, "roots released");
+    }
+
+    #[test]
     fn subtype_queries_survive_stress_collection() {
         let _g = serial();
         rj_init();
