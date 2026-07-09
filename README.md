@@ -63,20 +63,33 @@ need rewriting — it needs a runtime that can carry it to the web.
 
 A working runtime exists and runs via WebAssembly:
 
-- a tagged object model and a generational, pooled mark-sweep GC with
-  shadow-stack rooting;
-- the type system — DataTypes, tuples (incl. varargs), unions, parametrics,
-  `Type{T}` kinds, and the `where` machinery (`UnionAll`/`TypeVar`) — with a
-  subtype algorithm — including Julia's global union-decision machine —
-  checked against 120 assertions from JuliaLang/julia's `test/subtype.jl`;
+- a tagged object model and a generational, pooled mark-sweep GC whose
+  shadow stack lives in linear memory (compiled and interpreted code share
+  one root set);
+- the type system — DataTypes, tuples (incl. varargs with typevar counts,
+  `NTuple`), unions, parametrics, `Type{T}` kinds, and the `where` machinery
+  (`UnionAll`/`TypeVar`) — with the complete researched port of Julia's
+  subtype engine (the global union-decision machine, the vararg length
+  algebra, exact existential bounds, and `jl_subtype_env`-style variable
+  matching), checked against 134 assertions from JuliaLang/julia's
+  `test/subtype.jl`;
 - multiple dispatch and a tree-walking interpreter over lowered IR, with
   exception handling (`try`/`catch`/`finally`, reified exception objects);
+- **the pinned Julia's own lowering, executed as data** (M2): a build-time
+  tool serializes upstream's `CodeInfo`, and a lowering oracle pins
+  same-source agreement;
+- **the beginnings of the AOT compiler** (the go/no-go thin slice, passed):
+  `ruju-aotc` compiles the pinned compiler's typed IR to WASM functions that
+  link against the runtime's exported memory and function table, register in
+  dispatch, allocate through the GC, and run at native-Rust-in-wasm speed
+  (~400× the interpreter on the benchmark loop);
 - `GenericMemory`/`Array` buffers living in linear memory, with growth;
 - a `Main` module with global bindings that persist across evaluations;
 - a hand-written bootstrap front-end that runs a subset of real Julia source.
 
-The AOT compiler that will turn the Julia-written layers into WASM is the next
-major phase and is not yet built. See `design/strategy.md` for the plan and
+The full phase-1 AOT backend (compiling the Julia-written layers wholesale)
+waits on dispatch hardening — the type-intersection → `type_morespecific` →
+dispatch spine now in progress. See `design/strategy.md` for the plan and
 `design/implementation.md` for per-subsystem status and fidelity.
 
 ## Repository layout
@@ -88,6 +101,8 @@ tests against is vendored under `reference/`.
 | - | - |
 | `runtime/` | the Rust runtime (object model, GC, types, subtyping, dispatch, interpreter, the `rj_` WASM ABI) |
 | `intrinsics/` | pure arithmetic/comparison intrinsics |
+| `aotc/` | `ruju-aotc`, the build-time typed-IR → WASM backend (host-side; the thin slice) |
+| `tools/` | build-time tooling: fetch the pinned Julia binary, pre-lower source, serialize typed-IR fixtures |
 | `design/` | `strategy.md` (where we are going), `implementation.md` (where we are), `methodology.md` (how we get there) — see `design/README.md` |
 | `reference/julia/` | a pinned, verbatim subset of JuliaLang/julia used as the porting reference and oracle: `src/` (the C runtime we reimplement) plus `base/`, `stdlib/`, `Compiler/`, `JuliaSyntax/`, `JuliaLowering/`, and `test/` |
 
@@ -100,10 +115,11 @@ Ruju is a Cargo workspace. The unit tests run natively; building for
 load and exercise through a JavaScript host.
 
 ```sh
-cargo test  -p ruju-runtime                                    # native unit tests
+cargo test  --workspace                                        # native unit tests
 cargo build -p ruju-runtime --target wasm32-unknown-unknown --release
 node runtime/harness.mjs               # wasm -> JS end-to-end checks
-node runtime/verify_julia_subtype.mjs  # subtype answers vs JuliaLang/julia
+node runtime/verify_julia_subtype.mjs  # subtype + env answers vs JuliaLang/julia
+node runtime/harness_aot.mjs           # the AOT thin slice (emit with ruju-aotc first)
 node runtime/repl.mjs                  # interactive: type Julia at the runtime
 ```
 

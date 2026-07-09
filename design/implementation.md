@@ -148,8 +148,10 @@ replacement for `reference/julia/src/`.
 ```mermaid
 flowchart TD
     LIB["lib.rs — rj_ WASM ABI + init"]
-    LIB --> FE["frontend.rs — lex / parse / lower"]
-    FE --> INTERP["interp.rs — eval lowered IR"]
+    LIB --> FE["frontend.rs — lex / parse / lower (dev convenience)"]
+    LIB --> LOAD["loader.rs — pre-lowered CodeInfo + the prelude"]
+    LOAD --> INTERP["interp.rs — eval lowered IR"]
+    FE --> INTERP
     INTERP --> DISP["dispatch.rs — multiple dispatch"]
     INTERP --> VAL["value.rs — boxing"]
     INTERP --> INTR["intrinsics crate — arithmetic / comparison"]
@@ -172,7 +174,8 @@ flowchart TD
 | Module | Role |
 | - | - |
 | `lib.rs` | the `rj_`-prefixed WASM ABI and runtime initialization |
-| `frontend.rs` | hand-written bootstrap lexer / parser / lowering for a subset of Julia source |
+| `frontend.rs` | hand-written bootstrap lexer / parser / lowering for a subset of Julia source (a dev convenience since M2 — decision D1) |
+| `loader.rs` | the pre-lowered `CodeInfo` loader (`rj_load_lowered`, M2) and the operator/Core-builtin prelude |
 | `interp.rs` | tree-walking interpreter over lowered IR |
 | `dispatch.rs` | multiple dispatch — method table, applicability, specificity |
 | `subtype.rs` | subtyping, including the `where` machinery (`UnionAll` / `TypeVar`) |
@@ -325,12 +328,12 @@ flowchart LR
         CV["var_lt / var_gt — ccheck at PARAM_NONE,<br/>simple_meet→Intersect (#61917)"]
         CF --> CE --> CSUB --> CV
     end
-    subgraph R["Ruju Rust (~1.1k lines)"]
+    subgraph R["Ruju Rust (~2.3k lines)"]
         direction TB
         RF["forall_exists_subtype — ∀ loop over<br/>Lunions states, re_save between (slice 1)"]
-        RE["exists_subtype — ∃ loop over Runions<br/>states, restore (incl. rdepth) between"]
-        RSUB["sub() — pick_union_element per machine bits;<br/>typevar/UnionAll priority over union split"]
-        RV["var_lt / var_gt — ccheck at Param::None,<br/>simple_meet over-estimates"]
+        RE["exists_subtype — ∃ loop over Runions<br/>states, restore (incl. rdepth, envout) between"]
+        RSUB["sub() — pick_union_element per machine bits;<br/>typevar/UnionAll priority; Loffset leaf compare"]
+        RV["var_lt / var_gt — ccheck at Param::None,<br/>simple_meet→Intersect (#61917), offset guards"]
         RF --> RE --> RSUB --> RV
     end
     C ~~~ R
@@ -358,10 +361,10 @@ mapping is real: per-var `lb`/`ub` narrowing through
 13. ~~`forall_exists_equal` reverse direction at Invariant~~ — **fixed**:
     reverse at `Param::None` + the same-name-datatype fast path; the
     two-union greedy path is still absent.
-14. **The pinned C has moved past the port (open).** The vendored
-    `subtype.c` carries the `Intersect` meet node (#61917),
-    `push_forall_bound_scope`, and `Loffset` — machinery absent from
-    `subtype.rs`.
+14. ~~The pinned C has moved past the port~~ — **closed (engine slices 2–4,
+    2026-07)**: all three pieces the 2026-06 audit found ahead of the port
+    landed — `push_forall_bound_scope` (slice 2), `Loffset` (slice 3), and
+    the `Intersect` meet node #61917 (slice 4).
 15. Oracle coverage: 24 → 53 assertions (post-audit expansion), which
     immediately caught a fourth bug — the diagonal rule rejected typevar
     lower bounds, breaking UnionAll alpha-equivalence (**fixed** per

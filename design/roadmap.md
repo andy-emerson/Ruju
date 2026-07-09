@@ -94,7 +94,10 @@ Three increments carry nearly all the uncertainty. Every wave estimate past
   promises kept by a different runtime — layout folding vs 4-byte refs,
   method-table divergence, intrinsic-folding vs recorded divergences.
   Mitigation regime: whitelisted IR vocabulary → `AbstractInterpreter`
-  overlay → self-hosted `base/`; probed by the **early thin slice**.
+  overlay → self-hosted `base/`. **Probed — the thin slice passed (GO,
+  2026-07-09) and caught one live instance of exactly this class** (a
+  header-layout assumption), validating the regime; the risk stays named
+  for the backend at scale.
 - **The base/ bootstrap grind**: the long tail of runtime surface `base/`
   needs before it loads — large but enumerable, not research.
 - **Pin coupling**: serialized `CodeInfo`/`IRCode` formats tie to the pin;

@@ -148,9 +148,9 @@ flowchart TD
     DISPX{"dispatch hardening: cache, ambiguity, MethodError"}
     ARRAYS["arrays & GenericMemory [done: 1-D subset]"]
     MODULES["modules & bindings [done: subset —<br/>toplevel scoping rides with real lowering]"]
-    BOOTPIPE("build-time pipeline: pinned Julia offline →<br/>serialized compiler artifacts (frontier)")
+    BOOTPIPE["build-time pipeline [done: prelower + typed-IR<br/>fixtures; the durable producer rides M4]"]
     THINSLICE["AOT thin slice: go/no-go experiment [done: GO 2026-07]"]
-    LOWER("real CodeInfo: build-time pre-lowering +<br/>full interpreter statement set (frontier)")
+    LOWER["real CodeInfo [done: M2 reached 2026-07-08;<br/>depth rides the corpus]"]
     EVAL{"in-browser eval: pre-lowered<br/>JuliaSyntax/JuliaLowering interpreted"}
     AOT{"phase-1 AOT backend"}
     BASE{"base/ & stdlib/ AOT-compiled"}
@@ -227,21 +227,17 @@ When several frontier items are available:
 
 ## Later phases (blocked, in dependency order)
 
-**The subtype engine** (the global union-decision machine that heals the
-oracle's known divergence, `Intersect`/`Loffset` from the newer pin,
-cross-var `concrete` propagation) deliberately waits for the expressibility
-slices: an engine rewrite verified against today's 53 oracle cases would be
-unverified exactly where engines go wrong — the measuring instrument is
-built first. The working cadence interleaves hardening slices between other
-frontier items (GC exactness → varargs → arrays → `Type{T}`/`UnionAll`
-instantiation → engine), so the type vocabulary and the engine grow together
-and no retrofit cliff accumulates. Then: type intersection →
-`type_morespecific` → dispatch hardening (typemap cache,
-world age, ambiguity, `MethodError`). Arrays and modules behind structs. Real
-`CodeInfo` via build-time pre-lowering (see Key design decisions) now that
-structs, intrinsics breadth, and exceptions hold; a separate **in-browser
+**The subtype engine is complete as researched** (all five slices,
+2026-07): the strategy of building the measuring instrument first — growing
+the oracle through the expressibility slices before rewriting the engine
+against it — paid out as designed (every slice's tranche passed on its
+first run). What remains behind it is the M3 spine: type intersection (now
+frontier) → `type_morespecific` → dispatch hardening (typemap cache,
+world age, ambiguity, `MethodError`). A separate **in-browser
 eval** milestone (pre-lowering JuliaSyntax/JuliaLowering themselves and
-interpreting them) follows `base/`. The phase-1 AOT backend once dispatch and GC are hardened.
+interpreting them) follows `base/`. The phase-1 AOT backend once dispatch
+is hardened (its go/no-go thin slice passed 2026-07; GC exactness and the
+gcframe ABI already hold).
 Then `base`/`stdlib` AOT — at which point **BLAS/LAPACK Phase A** (Julia's
 generic fallbacks) arrives free, making linear algebra a performance problem,
 not a correctness one:
