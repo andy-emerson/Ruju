@@ -45,6 +45,7 @@ const Tuple = (...ts) => {
 };
 const Vararg = (t) => x.rj_vararg(t); // unbounded Vararg{t}
 const VarargN = (t, n) => x.rj_vararg_n(t, BigInt(n)); // Vararg{t, n}
+const VarargTV = (t, v) => x.rj_vararg_tv(t, v); // Vararg{t, N} with typevar N
 const Pair = (a, b) => x.rj_pair_type(a, b); // two-parameter invariant type
 const TypeT = (t) => x.rj_type_type(t); // Type{t}
 const Union = (a, b) => x.rj_union_type(a, b);
@@ -426,6 +427,38 @@ const cases = [
     const S = tvar();
     return [where(T, Ref(Tuple(Union(Int, Int8), Int16, T))),
             where(S, Ref(Union(Tuple(Int, Int16, S), Tuple(Int8, Int16, S))))];
+  }],
+
+  // --- the vararg length algebra (engine slice 3, 2026-07): typevar-count
+  // --- Vararg{T,N} (the BOUND kind), the Loffset channel, the N-equation,
+  // --- and check_vararg_length. NTuple{N,T} spells Tuple{Vararg{T,N}}. ---
+  ["L70 (@UnionAll N Tuple{Int,Vararg{Int,N}}) == (@UnionAll N Tuple{Int,Vararg{Int,N}})", "equal", () => {
+    const N1 = tvar();
+    const N2 = tvar();
+    return [where(N1, Tuple(Int, VarargTV(Int, N1))), where(N2, Tuple(Int, VarargTV(Int, N2)))];
+  }],
+  ["L79 issub_strict(Tuple{Tuple{Int,Int},Tuple{Int,Int}}, Tuple{NTuple{N,Int},NTuple{N,Int}} where N)", "strict", () => {
+    const N = tvar();
+    return [Tuple(Tuple(Int, Int), Tuple(Int, Int)),
+            where(N, Tuple(Tuple(VarargTV(Int, N)), Tuple(VarargTV(Int, N))))];
+  }],
+  ["L80 !issub(Tuple{Tuple{Int,Int},Tuple{Int}}, Tuple{NTuple{N,Int},NTuple{N,Int}} where N)", "notsub", () => {
+    const N = tvar();
+    return [Tuple(Tuple(Int, Int), Tuple(Int)),
+            where(N, Tuple(Tuple(VarargTV(Int, N)), Tuple(VarargTV(Int, N))))];
+  }],
+  ["L85 issub_strict(Tuple{Int,Int}, Tuple{Int,Int,Vararg{Int,N}} where N)", "strict", () => {
+    const N = tvar();
+    return [Tuple(Int, Int), where(N, Tuple(Int, Int, VarargTV(Int, N)))];
+  }],
+  ["L86 issub_strict(Tuple{Int,Int}, Tuple{E,E,Vararg{E,N}} where E where N)", "strict", () => {
+    const N = tvar();
+    const E = tvar();
+    return [Tuple(Int, Int), where(N, where(E, Tuple(E, E, VarargTV(E, N))))];
+  }],
+  ["L632 issub(Tuple{}, @UnionAll N NTuple{N})", "sub", () => {
+    const N = tvar();
+    return [Tuple(), where(N, Tuple(VarargTV(Any, N)))];
   }],
 ];
 

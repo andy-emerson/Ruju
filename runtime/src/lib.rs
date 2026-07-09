@@ -244,6 +244,16 @@ pub extern "C" fn rj_register_compiled(func: u32, sig: u32, fptr1: u32) {
     dispatch::add_compiled_method(func, sig as Offset, fptr1);
 }
 
+/// Allocate `Vararg{elem, N}` with a **typevar** count `n` — the C's
+/// `JL_VARARG_BOUND` kind (engine slice 3). Unlike a ground count, it stays
+/// unexpanded through tuple construction; the subtype engine's length
+/// algebra owns its `N`.
+#[no_mangle]
+pub extern "C" fn rj_vararg_tv(elem: u32, n: u32) -> u32 {
+    ensure_init();
+    types::vararg_type_with(elem as Offset, n as Offset)
+}
+
 /// The runtime type the AOT boundary's `%new(Base.RefValue{Int64}, v)`
 /// allocates: a monomorphic mutable struct of the same name and layout (one
 /// inline `Int64` field). Parametric `RefValue` arrives with `base/`;
@@ -1114,6 +1124,54 @@ mod tests {
         assert!(!sub(tup(&[integer, va(real)]), tup(&[integer, va(integer)])));
 
         assert_eq!(gc::root_count(), 0, "roots released after subtype queries");
+    }
+
+    #[test]
+    fn vararg_length_algebra_typevar_n() {
+        // Engine slice 3 (`test/subtype.jl:70,79-80,85-86,632` ride the
+        // oracle; these pin the machinery natively): the BOUND vararg kind,
+        // check_vararg_length's N-discharge, the N-equation under Loffset,
+        // and finding 23's expansion guard.
+        let _g = serial();
+        rj_init();
+        let t = |i| types::builtin(i);
+        let int = t(types::id::INT64);
+        let any = t(types::id::ANY);
+        let bot = t(types::id::BOTTOM);
+        let sub = |a, b| types::issubtype(a, b);
+
+        // Tuple{Int,Int} <: Tuple{Int,Int,Vararg{Int,N}} where N  (N = 0).
+        let n1 = types::make_typevar("N", bot, any);
+        let va = types::vararg_type_with(int, n1);
+        let rhs = types::unionall_type(n1, types::tuple_type(&[int, int, va]));
+        assert!(sub(types::tuple_type(&[int, int]), rhs));
+        assert!(!sub(rhs, types::tuple_type(&[int, int])), "strict");
+        // Tuple{Int} pins N = -1: impossible.
+        assert!(!sub(types::tuple_type(&[int]), rhs));
+
+        // NTuple{N,Int} used twice: the length propagates across elements.
+        let n2 = types::make_typevar("N", bot, any);
+        let nt = |n| types::tuple_type(&[types::vararg_type_with(int, n)]);
+        let pair_rhs = types::unionall_type(n2, types::tuple_type(&[nt(n2), nt(n2)]));
+        let t2 = types::tuple_type(&[int, int]);
+        let t1 = types::tuple_type(&[int]);
+        assert!(sub(types::tuple_type(&[t2, t2]), pair_rhs));
+        assert!(!sub(types::tuple_type(&[t2, t1]), pair_rhs), "mismatched lengths");
+
+        // Finding 23's guard: Vararg{T,2} with a free T does NOT expand at
+        // construction (`jltypes.c:2361`) — the engine's classification
+        // handles the INT kind instead.
+        let tv = types::make_typevar("T", bot, any);
+        let va2 = types::vararg_type_n(tv, 2);
+        let tup_free = types::tuple_type(&[va2]);
+        let p = types::parameters_of(tup_free);
+        assert_eq!(types::svec_len(p), 1, "free-element fixed-count vararg stays unexpanded");
+        assert!(types::is_vararg(types::svec_ref(p, 0)));
+        // ...and a ground element still expands.
+        let ground = types::tuple_type(&[types::vararg_type_n(int, 2)]);
+        assert_eq!(ground, types::tuple_type(&[int, int]), "ground fixed-count vararg expands");
+
+        assert_eq!(gc::root_count(), 0, "roots released after vararg queries");
     }
 
     #[test]

@@ -16,15 +16,24 @@ are meant to be worked from, not just read.
 
 ## Next session opens here
 
-**Engine slices 3–5** (issues #3–#5, `research-subtype-engine.md` §6) are
-now the front of the queue — the M3 spine (intersection →
-`type_morespecific` → dispatch hardening), which is also what the `AOT`
-node waits on. Two carried-over small items to interleave: the
-**paper-and-polish batch** (below, still timeboxed and unstarted) and the
-**exception-channel decision** for compiled frames (research-aot-backend §6.3
-— a design decision for the human; nothing in the compiled vocabulary
-throws yet). **Thin-slice stage 3** (compiled→dispatch fallback calls) is
-optional polish on a proven pipeline — it can wait for the backend proper.
+**Engine slices 4–5** (issues #4–#5, `research-subtype-engine.md` §6):
+slice 4 (the `Intersect` meet node + `concrete` propagation — verified by
+*targeted new* oracle cases from `test_3`'s cross-bounded existentials, no
+existing case needs it) and slice 5 (`envout` — the doorway to
+`jl_type_intersection` and the M3 spine, verified via a new
+`rj_subtype_env` ABI). Slice 3 landed 2026-07-09 (below). Carried-over
+interleaves: the **paper-and-polish batch** (still timeboxed, unstarted),
+the **exception-channel decision** (#14, the human's call), and
+**thin-slice stage 3** (#13, optional polish).
+
+*(Executed 2026-07-09, second increment:)*
+
+- ~~**Engine slice 3**~~ — the vararg length algebra: the `Loffset`
+  channel, typevar-count `Vararg{T,N}` (the `BOUND` kind), the full
+  four-kind tuple length classification, `check_vararg_length`, the
+  N-equation, the ∃-var-left unwrap guard, and finding 23's expansion
+  guard. Oracle 120→**126/126** (the `NTuple` tranche, `test/subtype.jl:70,
+  79–80, 85–86, 632`), all on the first run after the port.
 
 *(Previous opener executed 2026-07-09:)*
 
