@@ -1,0 +1,6 @@
+# The runtime's funcref table is shared with AOT-compiled modules (decision
+# D2c): the loader places compiled functions into it, and dispatch reaches
+# them by `call_indirect` (the fptr1 path). LLD exports it as
+# `__indirect_function_table`.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-args=--export-table --growable-table"]

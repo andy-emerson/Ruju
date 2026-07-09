@@ -16,16 +16,30 @@ are meant to be worked from, not just read.
 
 ## Next session opens here
 
-**The AOT thin slice** (issue #11; spec in `research-aot-backend.md` — its
-stage 2 forces the linear-memory shadow stack + region-base export) is the
-priority: the go/no-go experiment behind every D2 decision, and the top
-named risk while it stays unstarted. During its natural waits
-(builds, think time), interleave the **paper-and-polish batch**, timeboxed:
-a `design/` note on the language choice and threat model (why manual
-rooting; what the stress test buys; the branded-lifetime alternative),
-`linguist-vendored` on `reference/julia/` in `.gitattributes`, and the
-pinned-Julia release relocation decision. Engine slices 3–5
-(issues #3–#5, `research-subtype-engine.md` §6) are the M3 spine behind it.
+**Thin-slice stage 2** (the second half of issue #11): an allocating
+compiled function, which forces decision D3's hardening — the
+**linear-memory shadow stack** (slot arena + `rj_gc_shadow_top` global,
+`Rooted`/`Frame` as veneers; research §6.2), the **region-base export**,
+and the exception-channel decision (§6.3). **Engine slices 3–5**
+(issues #3–#5, `research-subtype-engine.md` §6) are the parallel track —
+the M3 spine. The **paper-and-polish batch** (below) carries over,
+still timeboxed and unstarted.
+
+*(Previous opener executed 2026-07-09:)*
+
+- ~~**The AOT thin slice**, stage 1 (issue #11)~~ — **GO** on every
+  threshold: exact correctness incl. Int64 wrap-around, both call paths
+  (specsig export + real dispatch driven by the pinned Julia's own lowering
+  of `f(10)`, under GC stress), 401.8× the interpreter, 0.95×
+  native-Rust-in-wasm, fptr1 3.8µs vs interpreted 47.2µs per call. Evidence:
+  `implementation.md` (AOT section); the fixture pipeline doubles as the
+  D2a probe (the fetched pinned binary produced its own `code_ircode`
+  fixture; the stock-Julia `Compiler/`-as-package path stays unprobed,
+  recorded). The **paper-and-polish batch** was *not* reached — no long
+  waits materialized: a `design/` note on the language choice and threat
+  model (why manual rooting; what the stress test buys; the
+  branded-lifetime alternative), `linguist-vendored` on `reference/julia/`
+  in `.gitattributes`, and the pinned-Julia release relocation decision.
 
 *(Previous opener executed 2026-07-07/08 — kept as the record of what this
 corpus fed:)*

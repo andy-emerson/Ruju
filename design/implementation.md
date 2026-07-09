@@ -443,6 +443,7 @@ flowchart LR
 | Applicability | Partial | Faithful | `argtuple <: sig` — matches Julia's concrete-tuple dispatch (`jl_typemap_assoc_exact`, `gf.c:3259`; intersection serves match queries/guards, `gf.c:1149`); missing: typemap cache, world age |
 | Specificity | Partial | Faithful | subtype-based |
 | Function values | Partial | Faithful | generic functions and native builtins are singleton values under the abstract `Function`, resolved by `typeof(f)` (`dispatch::FnKind`); the operator prelude (`loader.rs`) binds `+ - * / ÷ % == < <= > >= ===` in `Main` as generic functions whose methods wrap the typed intrinsics — the faithful shape (Julia's operators are `base/` generic functions), Int64/Float64 coverage for now |
+| Compiled-method entries (`fptr1`) | Partial | Faithful | AOT thin slice 2026-07: `Entry` gains an optional `fptr1` funcref-table index (the `CodeInstance.invoke` analog); `invoke` prefers it over interpreting `body` — selection unchanged, one method table serves both execution fronts. The call is a `call_indirect` via transmute (a Rust fn pointer is a table index on wasm32 — verified by `harness_aot.mjs`). Compiled code cannot throw in this vocabulary; the shared exception channel is thin-slice stage 2's recorded decision |
 | Method cache (`typemap`) | Planned | Faithful | linear scan per call now |
 | World age | Planned | Faithful | — |
 | Ambiguity / `MethodError` | Planned | Faithful | first match; `NULL` on miss |
@@ -718,9 +719,58 @@ verify; the following simplifications were live but unrecorded.
 
 ## AOT backend (Phase 1) — replaces removed `codegen.cpp`/`jitlayers.cpp`
 
+**Thin slice (issue #11) landed 2026-07-09 — GO.** The pin carries no JIT to
+port (no `codegen.cpp`/`jitlayers.cpp` in the vendored subset), so the backend
+is a recorded divergence whose faithfulness targets are *behavior* (Julia
+semantics at the IR level) and upstream's compilation architecture where it
+exists as data: the two-entry-point convention is `CodeInstance`'s
+`invoke`/`specptr` split (`julia.h:219–221,460–461,523–535`). The full chain
+was proven end to end: typed IR (data) → Rust backend → wasm function →
+registered in dispatch → called through both the specsig export and the
+dispatch path → benchmarked past every go/no-go threshold.
+
+- **Producer** (`tools/aot_fixture.jl`, runs under the fetched pinned Julia —
+  whose sysimage compiler *is* the pinned `Compiler/`, so inference and
+  optimization are never reimplemented, decision D2a): serializes
+  `Base.code_ircode` output — blocks, statements, per-statement types — into
+  the pin-versioned `ruju-aotc-fixture-1` JSON format
+  (`aotc/fixtures/f_sumsq.json`). D2a's stock-Julia + `Compiler/`-as-package
+  loading path remains unprobed (unneeded while the build-time Julia is the
+  pinned binary itself — recorded).
+- **Backend** (`aotc/`, the host-side `ruju-aotc` crate): a deliberately dumb
+  translator. "Beyond Relooper" structured control flow (reverse postorder +
+  Cooper–Harvey–Kennedy dominators + the dominator-tree walk; irreducible
+  CFGs rejected loudly), `wasm-encoder` emission of the **specsig** function
+  (isbits values unboxed in `i64`/`i32` locals; φs deconstructed to per-edge
+  moves, swap hazards rejected loudly) and the **boxed fptr1 wrapper**
+  (`(argv, nargs) → ret` over `rj_unbox_int`/`rj_box_int` imports; `nargs`
+  unchecked — arity is dispatch's signature check, recorded), `wasmparser`
+  validation on every emit. The intrinsic vocabulary is a 12-op i64 whitelist
+  (D2a mitigation 1); everything else fails loudly.
+- **Linking (decision D2c) proven**: the compiled module imports `env.memory`
+  + box/unbox and defines no memory/table/globals of its own; the harness
+  instantiates the runtime first, grows its exported
+  `__indirect_function_table` (`--export-table --growable-table`,
+  `.cargo/config.toml`), places the wrapper, and registers the index — the
+  first real exercise of the composable-memory commitment.
+- **Dispatch**: `Entry.fptr1` + `add_compiled_method` (see Method dispatch);
+  on wasm32 a Rust fn pointer *is* a table index, so `invoke`'s compiled path
+  is a plain `call_indirect` — verified end to end by the harness, retiring
+  research §6.5's low-risk assumption.
+- **Verified** (`runtime/harness_aot.mjs`): exact equality with the
+  interpreter on {0, 1, 10, 10⁶} and the Int64 wrap-around case at 10⁷; the
+  dispatch path executes the pinned Julia's own lowering of `f(10)`
+  (`aotc/fixtures/call_f_10.lowered`) through the compiled fptr1, including
+  under allocation stress (`rj_gc_stress`), roots balanced after; benchmarks
+  at n=10⁷ (5 reps, median): **401.8× the interpreter** (threshold ≥100×),
+  **0.95× native-Rust-in-wasm** (≤3×), fptr1 dispatch calls 3.8µs vs the
+  interpreted twin's 47.2µs (`g`, same body through the pre-lowering
+  pipeline).
+
 | Piece | Status | Fidelity | Notes |
 | - | - | - | - |
-| IR → code | Planned | **Divergence** | Julia JITs via LLVM; Ruju plans a build-time IR → WASM compiler |
+| IR → code (thin-slice vocabulary) | Partial | **Divergence** | Julia JITs via LLVM; Ruju compiles at build time to WASM. Landed: the fixture producer/parser, Beyond-Relooper, specsig + fptr1 emission, validation, the whitelisted intrinsic vocabulary. Slice 2 (next): an allocating compiled function — forces the linear-memory shadow stack + gcframe emission and the exception-channel decision (one mechanism shared with the interpreter's `Err` channel). Slice 3: compiled→dispatch fallback calls (abstract argtypes → `rj_dispatch`). Then: the durable serialization producer, `wasm-merge` single-module packaging |
+| Calling convention (fptr1/specsig) | Partial | Faithful | the pin's `CodeInstance` two-entry-point design (`julia.h:460–461`): boxed jlcall wrapper + native-signature specsig; argv is a rooted slice of boxed-value offsets in linear memory (the Rust heap *is* linear memory; caller keeps args rooted) |
 
 ## Platform, profiling & support — `dlload.c`, `sys.c`, `timing.c`, `src/support/`
 

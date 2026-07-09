@@ -195,6 +195,77 @@ pub extern "C" fn rj_load_lowered(len: u32) -> i64 {
     }
 }
 
+// ---- the AOT boundary (thin slice, issue #11) ----
+
+/// Box an `Int64` — the jlcall boundary for compiled code (a boxed wrapper
+/// unboxes its argv, runs the specsig body, and boxes the result back).
+/// Allocates; the caller's argv entries must already be rooted.
+#[no_mangle]
+pub extern "C" fn rj_box_int(x: i64) -> u32 {
+    ensure_init();
+    box_int(x).0
+}
+
+/// Unbox an `Int64` value at region offset `v`.
+#[no_mangle]
+pub extern "C" fn rj_unbox_int(v: u32) -> i64 {
+    unbox_int(Value(v as Offset))
+}
+
+/// Declare a fresh generic function named by the first `len` bytes of the
+/// source buffer and bind it in `Main` (the `jl_declare_const_gf` shape the
+/// `:method` statement also uses). Returns the function id for method
+/// registration (0 on a bad name or binding failure).
+#[no_mangle]
+pub extern "C" fn rj_declare_generic(len: u32) -> u32 {
+    ensure_init();
+    let bytes = unsafe { core::slice::from_raw_parts(SOURCE.0.get() as *const u8, len as usize) };
+    let name = match core::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let func = dispatch::fresh_func_id();
+    let fnval = dispatch::make_function(name, func);
+    let main = Value(module::main_offset());
+    match module::set_global(main, symbol::intern(types::builtin(id::SYMBOL), name), fnval) {
+        Ok(()) => func,
+        Err(_) => 0,
+    }
+}
+
+/// Register a compiled method: function id `func`, signature tuple type at
+/// region offset `sig`, boxed entry point `fptr1` (the funcref-table index
+/// the loader placed the compiled wrapper at). Selection is unchanged — one
+/// method table serves interpreted and compiled methods alike.
+#[no_mangle]
+pub extern "C" fn rj_register_compiled(func: u32, sig: u32, fptr1: u32) {
+    ensure_init();
+    dispatch::add_compiled_method(func, sig as Offset, fptr1);
+}
+
+/// Toggle allocation-stress mode (a collection per allocation) — the
+/// rooting-discipline enforcement vehicle (engine slice 1), exposed so the
+/// harness can drive the AOT boundary under stress.
+#[no_mangle]
+pub extern "C" fn rj_gc_stress(on: u32) {
+    ensure_init();
+    gc::set_stress(on != 0);
+}
+
+/// The thin slice's benchmark reference point: the fixture's loop
+/// hand-written in Rust inside the runtime module — the "what wasm can do"
+/// line the compiled function is measured against (within 3×, or no go).
+#[no_mangle]
+pub extern "C" fn rj_bench_native(n: i64) -> i64 {
+    let mut acc: i64 = 0;
+    let mut i: i64 = 1;
+    while i <= n {
+        acc = acc.wrapping_add(i.wrapping_mul(i));
+        i = i.wrapping_add(1);
+    }
+    acc
+}
+
 /// Ensure the runtime is initialized.
 fn ensure_init() {
     if !region::is_initialized() {
