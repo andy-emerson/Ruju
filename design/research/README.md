@@ -16,19 +16,28 @@ are meant to be worked from, not just read.
 
 ## Next session opens here
 
-*(Executed 2026-07-07/08 — kept as the record of what this corpus fed.)*
+**The AOT thin slice** (issue #11; spec in `research-aot-backend.md` — its
+stage 2 forces the linear-memory shadow stack + region-base export) is the
+priority: the go/no-go experiment behind every D2 decision, and the top
+named risk while it stays unstarted. During its natural waits
+(builds, think time), interleave the **paper-and-polish batch**, timeboxed:
+a `design/` note on the language choice and threat model (why manual
+rooting; what the stress test buys; the branded-lifetime alternative),
+`linguist-vendored` on `reference/julia/` in `.gitattributes`, and the
+pinned-Julia release relocation decision. Engine slices 3–5
+(issues #3–#5, `research-subtype-engine.md` §6) are the M3 spine behind it.
+
+*(Previous opener executed 2026-07-07/08 — kept as the record of what this
+corpus fed:)*
 
 1. ~~**Session-start audit** of the M1 additions~~ — done (findings 22–28,
    `implementation.md`).
 2. ~~**Engine slice 1**~~ (rooting fix, then the union-decision machine —
    both pre-mapped divergences healed on first run) and ~~**slice 2**~~ (the
-   `forall_exists_equal` tail) — done; slices 3–5 remain per
-   `research-subtype-engine.md` §6. **M2 C-0** opened (operands, calls
-   through values); the pinned-Julia artifact (D1's distribution decision)
-   builds via `.github/workflows/build-pinned-julia.yml`. The **AOT thin
-   slice** (spec in `research-aot-backend.md`; its stage 2 forces the
-   linear-memory shadow stack + region-base export) is still unstarted —
-   the frontier's next untouched item.
+   `forall_exists_equal` tail) — done. ~~**M2**~~ — REACHED 2026-07-08
+   (C-0 vocabulary, C-1 pre-lowering pipeline, lowering oracle 4/4; the
+   pinned-Julia artifact builds via
+   `.github/workflows/build-pinned-julia.yml`).
 
 The faer track proceeds independently in its own repository
 (starter kit + roadmap delivered 2026-07); Ruju-side work for it (the LBT
